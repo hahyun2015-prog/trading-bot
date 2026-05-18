@@ -1,0 +1,105 @@
+{
+  "total_balance": 2956526,
+  "budget_day": 1773915,
+  "budget_swing": 1182610,
+  "daily_realized_loss": 0,
+  "portfolio": {
+    "0148J0": {
+      "name": "TIGER 코리아휴머노이드로봇산업",
+      "strategy": "SWING",
+      "buy_price": 14024,
+      "current_price": 13495,
+      "qty": 97,
+      "max_price": 13495,
+      "open_price": null,
+      "super_trend_mode": false,
+      "ma_10": 0,
+      "ma_20": 0
+    },
+    "030200": {
+      "name": "KT",
+      "strategy": "SWING",
+      "buy_price": 59400,
+      "current_price": 57000,
+      "qty": 8,
+      "max_price": 57000,
+      "open_price": null,
+      "super_trend_mode": false,
+      "ma_10": 0,
+      "ma_20": 0
+    },
+    "047040": {
+      "name": "대우건설",
+      "strategy": "SWING",
+      "buy_price": 29150,
+      "current_price": 29300,
+      "qty": 33,
+      "max_price": 29300,
+      "open_price": null,
+      "super_trend_mode": false,
+      "ma_10": 0,
+      "ma_20": 0
+    },
+    "050890": {
+      "name": "쏠리드",
+      "strategy": "SWING",
+      "buy_price": 16730,
+      "current_price": 15400,
+      "qty": 42,
+      "max_price": 15400,
+      "open_price": null,
+      "super_trend_mode": false,
+      "ma_10": 0,
+      "ma_20": 0
+    },
+    "336260": {
+      "name": "두산퓨얼셀",
+      "strategy": "SWING",
+      "buy_price": 88100,
+      "current_price": 82600,
+      "qty": 13,
+      "max_price": 82600,
+      "open_price": null,
+      "super_trend_mode": false,
+      "ma_10": 0,
+      "ma_20": 0
+    },
+    "440110": {
+      "name": "파두",
+      "strategy": "SWING",
+      "buy_price": 96800,
+      "current_price": 98900,
+      "qty": 8,
+      "max_price": 98900,
+      "open_price": null,
+      "super_trend_mode": false,
+      "ma_10": 0,
+      "ma_20": 0
+    },
+    "454910": {
+      "name": "두산로보틱스",
+      "strategy": "SWING",
+      "buy_price": 101600,
+      "current_price": 117900,
+      "qty": 5,
+      "max_price": 117900,
+      "open_price": null,
+      "super_trend_mode": false,
+      "ma_10": 0,
+      "ma_20": 0
+    },
+    "459580": {
+      "name": "KODEX CD금리액티브(합성)",
+      "strategy": "SWING",
+      "buy_price": 1074527,
+      "current_price": 1074945,
+      "qty": 1,
+      "max_price": 1074945,
+      "open_price": null,
+      "super_trend_mode": false,
+      "ma_10": 0,
+      "ma_20": 0
+    }
+  },
+  "last_updated": "2026-05-18 20:24:13"
+}
