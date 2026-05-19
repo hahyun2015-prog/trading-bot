@@ -135,7 +135,7 @@ class FuturesStrategyEngine:
 
         # 핫-리로드: active_strategy.json에서 승인된 K값 읽어오기
         K = 0.5 # 기본값
-        strategy_file = "active_strategy.json"
+        strategy_file = r"G:\내 드라이브\AI_Trading_Data\active_strategy.json"
         if os.path.exists(strategy_file):
             try:
                 with open(strategy_file, "r", encoding="utf-8") as f:

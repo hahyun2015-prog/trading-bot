@@ -7,7 +7,7 @@ from datetime import datetime
 import time
 
 # 텔레그램 컨트롤러와 공유할 결과 파일 경로
-CONTROLLER_DIR = r"c:\antigravity\노트븍활용\telegram_controller"
+CONTROLLER_DIR = r"G:\내 드라이브\AI_Trading_Data"
 RESULTS_FILE = os.path.join(CONTROLLER_DIR, "optimization_results.json")
 
 def load_data():

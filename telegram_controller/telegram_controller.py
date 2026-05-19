@@ -277,7 +277,7 @@ def execute_command(cmd_text, current_offset=None):
 
     elif cmd_text == "!최적화결과":
         try:
-            with open(r"c:\antigravity\노트븍활용\telegram_controller\optimization_results.json", "r", encoding="utf-8") as f:
+            with open(r"G:\내 드라이브\AI_Trading_Data\optimization_results.json", "r", encoding="utf-8") as f:
                 res_data = json.load(f)
             
             top_strats = res_data.get('top_strategies', [])
@@ -302,7 +302,7 @@ def execute_command(cmd_text, current_offset=None):
 
     elif cmd_text == "!전략승인":
         try:
-            with open(r"c:\antigravity\노트븍활용\telegram_controller\optimization_results.json", "r", encoding="utf-8") as f:
+            with open(r"G:\내 드라이브\AI_Trading_Data\optimization_results.json", "r", encoding="utf-8") as f:
                 res_data = json.load(f)
                 
             top_strats = res_data.get('top_strategies', [])
@@ -316,7 +316,7 @@ def execute_command(cmd_text, current_offset=None):
                     "approved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "cagr": best_strat.get('cagr')
                 }
-                with open(r"c:\antigravity\노트븍활용\futures_trader\active_strategy.json", "w", encoding="utf-8") as af:
+                with open(r"G:\내 드라이브\AI_Trading_Data\active_strategy.json", "w", encoding="utf-8") as af:
                     json.dump(active_data, af, ensure_ascii=False, indent=4)
                     
                 send_message(f"✅ <b>전략 핫-리로드 완료!</b>\n\n실전 봇(PC 1)에 새로운 파라미터(K={new_k})가 즉시 주입되었습니다. 봇을 껐다 켤 필요가 없습니다.")
