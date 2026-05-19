@@ -39,17 +39,17 @@ if __name__ == "__main__":
         # 장 시작 전(08:50)부터 15:30까지만 루프를 돌도록 설정
         current_time_val = now.hour * 100 + now.minute
         
-        if 850 <= current_time_val <= 1530:
-            try:
+        try:
+            if 850 <= current_time_val <= 1530:
                 run_loop()
                 time.sleep(WAIT_SECONDS)
-            except KeyboardInterrupt:
-                print("\n[시스템 종료] 사용자 요청으로 루프를 정지합니다.")
-                sys.exit(0)
-            except Exception as e:
-                print(f"\n[오류 발생] 루프 실행 중 에러: {e}")
-                print("1분 후 재시도합니다.")
-                time.sleep(60)
-        else:
-            print(f"[{now.strftime('%H:%M:%S')}] 정규 장 시간이 아닙니다 (오전 9시 ~ 오후 3시 30분). 3분 대기합니다...")
-            time.sleep(WAIT_SECONDS)
+            else:
+                print(f"[{now.strftime('%H:%M:%S')}] 정규 장 시간이 아닙니다 (오전 9시 ~ 오후 3시 30분). 3분 대기합니다...")
+                time.sleep(WAIT_SECONDS)
+        except KeyboardInterrupt:
+            print("\n[시스템 종료] 사용자 요청으로 루프를 정지합니다.")
+            sys.exit(0)
+        except Exception as e:
+            print(f"\n[오류 발생] 루프 실행 중 에러: {e}")
+            print("1분 후 재시도합니다.")
+            time.sleep(60)

@@ -20,12 +20,13 @@ def load_intraday_data(code, conn):
 
 def calculate_vwap(df):
     """당일 기준 VWAP (Volume Weighted Average Price) 계산"""
-    # 날짜별로 그룹화하여 VWAP 계산
     df['date_only'] = df.index.date
     df['typ_price'] = (df['high'] + df['low'] + df['close']) / 3
-    df['vwap'] = df.groupby('date_only').apply(
-        lambda x: (x['typ_price'] * x['volume']).cumsum() / x['volume'].cumsum()
-    ).reset_index(level=0, drop=True)
+    def _group_vwap(x):
+        cum_vol = x['volume'].cumsum()
+        cum_vol = cum_vol.where(cum_vol > 0, 1)  # volume=0 봉으로 인한 ZeroDivision 방지
+        return (x['typ_price'] * x['volume']).cumsum() / cum_vol
+    df['vwap'] = df.groupby('date_only').apply(_group_vwap).reset_index(level=0, drop=True)
     return df
 
 def apply_rsi(df, window=14):

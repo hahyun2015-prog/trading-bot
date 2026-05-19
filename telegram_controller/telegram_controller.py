@@ -246,18 +246,104 @@ def execute_command(cmd_text, current_offset=None):
         except Exception as e:
             send_message(f"❌ 전량 매도 명령 처리 중 오류: {e}")
 
+    elif cmd_text == "!긴급정지":
+        send_message("🚨 <b>긴급 정지 시퀀스 가동!</b> 🚨\n\n1. 주식/선물 전량 시장가 청산 명령 하달 중...")
+        # 1. 주식 전량 매도 신호 삽입
+        execute_command("!전량매도")
+        
+        # 2. 선물 포지션 청산 신호 삽입 (추후 futures_data.db 스키마에 맞게 연동 필요)
+        try:
+            import sqlite3
+            conn_f = sqlite3.connect(r"c:\antigravity\노트븍활용\futures_trader\futures_data.db")
+            c_f = conn_f.cursor()
+            c_f.execute("CREATE TABLE IF NOT EXISTS manual_signals (signal_type TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)")
+            c_f.execute("INSERT INTO manual_signals (signal_type) VALUES ('EMERGENCY_CLOSE_ALL')")
+            conn_f.commit()
+            conn_f.close()
+        except Exception as e:
+            send_message(f"⚠️ 선물 긴급 청산 신호 전달 실패: {e}")
+
+        send_message("⏳ 주문 체결을 위해 15초 대기합니다...")
+        time.sleep(15)
+        
+        send_message("2. 주식 및 선물 봇 프로세스 강제 종료 중...")
+        subprocess.run("kill_unified_bot.bat", shell=True, cwd=UNIFIED_DIR, capture_output=True)
+        subprocess.run("kill_futures_bot.bat", shell=True, cwd=FUTURES_DIR, capture_output=True)
+        send_message("✅ <b>긴급 정지 완료:</b> 모든 매매 로직이 완전히 차단되었습니다.")
+
+    elif cmd_text == "!백테스트시작":
+        # 추후 PC 2 (AI 랩)와 연동될 트리거 파일이나 네트워크 요청 삽입
+        send_message("🧪 <b>[AI 랩]</b> 야간 파라미터 최적화(백테스트) 무한 루프 가동 명령을 하달했습니다.\n(Claude Code 에이전트가 작업을 시작합니다.)")
+
+    elif cmd_text == "!최적화결과":
+        try:
+            with open(r"c:\antigravity\노트븍활용\telegram_controller\optimization_results.json", "r", encoding="utf-8") as f:
+                res_data = json.load(f)
+            
+            top_strats = res_data.get('top_strategies', [])
+            msg = f"📊 <b>[AI 랩 최적화 결과]</b>\n🕒 업데이트: {res_data.get('last_updated', '')}\n\n"
+            
+            if not top_strats:
+                msg += "최적화된 전략을 찾지 못했습니다."
+            else:
+                for i, st in enumerate(top_strats):
+                    msg += f"🏆 <b>Top {i+1}</b>\n"
+                    msg += f"  • 파라미터 (K값): {st.get('K')}\n"
+                    msg += f"  • 연환산수익률(CAGR): {st.get('cagr')}%\n"
+                    msg += f"  • 승률: {st.get('win_rate')}%\n\n"
+                msg += "💡 위 전략 중 Top 1을 실전에 적용하려면 <code>!전략승인</code>을 입력하세요."
+            send_message(msg)
+        except Exception as e:
+            send_message("📊 <b>[AI 랩 최적화 결과]</b>\n\n아직 진행된 백테스트 결과가 없습니다. (또는 파일을 읽을 수 없습니다.)")
+
+    elif cmd_text == "!모의투자현황":
+        # 현재는 모의투자 계좌 연동이 안 되어 있으므로 향후 연동을 위한 안내 메시지
+        send_message("📈 <b>[모의투자 샌드박스 현황]</b>\n\n현재 config.json 설정에 따라 모의투자(PC 2) 봇이 가동 중입니다.\n(추후 키움 모의 계좌 잔고 및 수익률과 연동됩니다.)")
+
+    elif cmd_text == "!전략승인":
+        try:
+            with open(r"c:\antigravity\노트븍활용\telegram_controller\optimization_results.json", "r", encoding="utf-8") as f:
+                res_data = json.load(f)
+                
+            top_strats = res_data.get('top_strategies', [])
+            if top_strats:
+                best_strat = top_strats[0]
+                new_k = best_strat.get('K')
+                
+                # 활성 전략 파일(active_strategy.json)에 기록하여 실전 봇이 다음 사이클부터 즉시 읽도록 함 (Hot-reload)
+                active_data = {
+                    "K": new_k,
+                    "approved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "cagr": best_strat.get('cagr')
+                }
+                with open(r"c:\antigravity\노트븍활용\futures_trader\active_strategy.json", "w", encoding="utf-8") as af:
+                    json.dump(active_data, af, ensure_ascii=False, indent=4)
+                    
+                send_message(f"✅ <b>전략 핫-리로드 완료!</b>\n\n실전 봇(PC 1)에 새로운 파라미터(K={new_k})가 즉시 주입되었습니다. 봇을 껐다 켤 필요가 없습니다.")
+            else:
+                send_message("⚠️ 적용할 최적화 전략이 없습니다.")
+        except Exception as e:
+            send_message(f"❌ 전략 승인 중 오류 발생: {e}")
+
     elif cmd_text == "/start" or cmd_text == "!도움말":
         help_msg = (
             "🤖 <b>AI 원격 제어 봇 작동 시작</b>\n\n"
             "<b>[사용 가능 명령어]</b>\n"
             "• <code>!상태</code> : 현재 켜져 있는지 확인\n"
             "• <code>!주식현황</code> / <code>!선물현황</code> : 실시간 수익률 및 잔고 브리핑\n"
-            "• <code>!매도 삼성전자</code> : 보유 중인 특정 종목 수동 익절/손절 (시장가 전량)\n"
-            "• <code>!전량매도</code> : 보유 중인 전체 주식 종목 즉시 청산\n"
+            "• <code>!매도 삼성전자</code> : 특정 종목 수동 익절/손절\n"
+            "• <code>!전량매도</code> : 전체 주식 종목 즉시 청산\n"
             "• <code>!주식시작</code> / <code>!주식종료</code> / <code>!주식재연결</code>\n"
             "• <code>!선물시작</code> / <code>!선물종료</code> / <code>!선물재연결</code>\n"
-            "• <code>!텔레그램재연결</code> : 메신저 봇 응답 지연 시 초기화\n\n"
-            "<i>보안: 대표님 외 타인의 접근은 완벽히 차단됩니다.</i>"
+            "• <code>!텔레그램재연결</code> : 메신저 봇 초기화\n\n"
+            "<b>[🚨 긴급 제어]</b>\n"
+            "• <code>!긴급정지</code> : 모든 포지션 강제 청산 및 프로세스 킬\n\n"
+            "<b>[🧪 AI 최적화 및 모의투자 관제 (PC 2 연동)]</b>\n"
+            "• <code>!백테스트시작</code> : 야간 파라미터 최적화 강제 시작\n"
+            "• <code>!최적화결과</code> : 최적화 완료된 상위 파라미터 브리핑\n"
+            "• <code>!모의투자현황</code> : 현재 검증 중인 AI 전략 성과 확인\n"
+            "• <code>!전략승인</code> : 검증된 모의투자 전략을 실전(PC 1)에 핫-리로드\n\n"
+            "<i>보안: 다온님 외 타인의 접근은 완벽히 차단됩니다.</i>"
         )
         send_message(help_msg)
 

@@ -1,8 +1,11 @@
+import os
 import requests
 
-# 사용자 제공 텔레그램 봇 토큰 및 챗 아이디
-BOT_TOKEN = "8710417841:AAGm1AZxo-u9RTQX_MeRRDpz_ggvS4mvexk"
-CHAT_ID = "8578720404"
+# 실행 전 환경변수 설정 필요:
+#   set TELEGRAM_BOT_TOKEN=<your_token>
+#   set TELEGRAM_CHAT_ID=<your_chat_id>
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 def send_message(text):
     """
@@ -16,6 +19,9 @@ def send_message(text):
         "parse_mode": "HTML" # HTML 태그 지원 (예: <b>굵게</b>)
     }
     
+    if not BOT_TOKEN or not CHAT_ID:
+        print("[텔레그램 알림] TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 환경변수가 설정되지 않았습니다.")
+        return
     try:
         response = requests.post(url, json=payload, timeout=5)
         response.raise_for_status()

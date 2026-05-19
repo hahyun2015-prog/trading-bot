@@ -6,8 +6,8 @@ import notifier
 
 def load_intraday_data(code, conn):
     """SQLite DB에서 특정 종목의 분봉 데이터를 불러옵니다."""
-    query = f"SELECT date, open, high, low, close, volume FROM intraday_ohlcv WHERE code = '{code}' ORDER BY date ASC"
-    df = pd.read_sql_query(query, conn)
+    query = "SELECT date, open, high, low, close, volume FROM intraday_ohlcv WHERE code = ? ORDER BY date ASC"
+    df = pd.read_sql_query(query, conn, params=(code,))
     if not df.empty:
         # 키움증권 일자 필드(예: 20260511132000 등)를 datetime으로 파싱 (형식에 따라 다를 수 있으나 pandas가 자동 인식)
         # 문자열 형식을 명확히 하기 위해 errors='coerce' 사용
@@ -21,12 +21,13 @@ def load_intraday_data(code, conn):
 
 def calculate_vwap(df):
     """당일 기준 VWAP (Volume Weighted Average Price) 계산"""
-    # 날짜별로 그룹화하여 VWAP 계산
     df['date_only'] = df.index.date
     df['typ_price'] = (df['high'] + df['low'] + df['close']) / 3
-    df['vwap'] = df.groupby('date_only').apply(
-        lambda x: (x['typ_price'] * x['volume']).cumsum() / x['volume'].cumsum()
-    ).reset_index(level=0, drop=True)
+    def _group_vwap(x):
+        cum_vol = x['volume'].cumsum()
+        cum_vol = cum_vol.where(cum_vol > 0, 1)  # volume=0 봉으로 인한 ZeroDivision 방지
+        return (x['typ_price'] * x['volume']).cumsum() / cum_vol
+    df['vwap'] = df.groupby('date_only').apply(_group_vwap).reset_index(level=0, drop=True)
     return df
 
 def apply_rsi(df, window=14):

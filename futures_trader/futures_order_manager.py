@@ -293,6 +293,11 @@ class FuturesOrderManager:
                 
                 qty = int(safe_budget // margin_per_contract)
                 
+                # 최소 1계약 보장 로직: 30% 캡에는 미달하지만, 전체 예수금이 실제 1계약 증거금의 1.2배 이상이라면 예외적 허용
+                if qty == 0 and self.available_balance >= (margin_per_contract * 1.2):
+                    qty = 1
+                    print("  => [안전 마진 예외] 전체 예수금이 충분하여 최소 1계약 진입을 보장합니다.")
+                
                 print(f"  => 1계약 추정 증거금: {margin_per_contract:,.0f} 원")
                 print(f"  => 산출된 진입 계약 수: {qty} 계약")
                 

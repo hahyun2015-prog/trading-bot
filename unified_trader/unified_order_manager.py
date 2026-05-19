@@ -1,9 +1,19 @@
 import os
 import sys
 import sqlite3
-import time
 import json
 from datetime import datetime
+
+def _load_config():
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'config.json')
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {"environment": "mock"}
+
+_CONFIG = _load_config()
+IS_LIVE = _CONFIG.get("environment") == "live"
 
 # PyQt5 환경 변수 에러 방지 (경로 절대 지정)
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -11,7 +21,7 @@ qt_plugin_path = os.path.abspath(os.path.join(current_dir, "..", "ai_trader", "v
 os.environ['QT_PLUGIN_PATH'] = qt_plugin_path
 os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = os.path.join(qt_plugin_path, "platforms")
 
-from PyQt5.QtWidgets import QApplication, QMainWindow
+from PyQt5.QtWidgets import QApplication
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import QTimer
 
@@ -49,6 +59,10 @@ class UnifiedOrderManager:
         self.max_day_positions = 5
         self.max_swing_positions = 3
         
+        env_label = "실전매매" if IS_LIVE else "모의투자"
+        print(f"[UnifiedOrderManager] 환경: {env_label} (config.json: environment={_CONFIG.get('environment')})")
+        server_code = "1" if IS_LIVE else "2"
+        self.kiwoom.dynamicCall("KOA_Functions(QString, QString)", "SetServerGBCode", server_code)
         print("[UnifiedOrderManager] 키움증권 서버 로그인 대기 중...")
         self.kiwoom.dynamicCall("CommConnect()")
         
@@ -74,9 +88,25 @@ class UnifiedOrderManager:
         self.conn_check_timer = QTimer()
         self.conn_check_timer.timeout.connect(self.check_connection_status)
         self.conn_check_timer.start(60000)
+
+        # 매일 09:00 kill switch 자동 해제
+        self.kill_switch_reset_timer = QTimer()
+        self.kill_switch_reset_timer.timeout.connect(self._check_daily_reset)
+        self.kill_switch_reset_timer.start(60000)
         
         self.pending_5ma_checks = []
         self.was_disconnected = False
+        self.today_5ma_checked = False  # 당일 15:14 스윙 5MA 체크 완료 여부
+
+    def _check_daily_reset(self):
+        now = datetime.now()
+        if now.hour == 9 and now.minute == 0:
+            if self.system_halted or self.daily_realized_loss > 0:
+                self.system_halted = False
+                self.daily_realized_loss = 0
+                print("[Kill Switch 해제] 새 거래일 09:00 - 시스템 재가동, 일일 손실 초기화")
+                if notifier:
+                    notifier.send_message("🔄 <b>[Kill Switch 자동 해제]</b>\n새 거래일이 시작되어 시스템이 재가동됩니다.")
 
     def check_connection_status(self):
         state = self.kiwoom.dynamicCall("GetConnectState()")
@@ -167,7 +197,7 @@ class UnifiedOrderManager:
                 theme, leader_code, leader_name, follower_code, follower_name = row
                 leader_code = str(leader_code).strip().replace('A', '')
                 follower_code = str(follower_code).strip().replace('A', '')
-                
+
                 if leader_code not in self.theme_mapping_dict:
                     self.theme_mapping_dict[leader_code] = {
                         'theme': theme, 'leader_name': leader_name,
@@ -178,7 +208,7 @@ class UnifiedOrderManager:
                     print(f"📡 [전략1] 대장주 감시 시작: {leader_name} -> 상한가 시 {follower_name} 매수 대기")
             conn.close()
         except Exception as e:
-            pass
+            print(f"[update_theme_mapping 오류] {e}")
 
     def run_day_collection_cycle(self):
         now = datetime.now()
@@ -221,8 +251,8 @@ class UnifiedOrderManager:
             cursor.execute("UPDATE signals SET status = 'EXPIRED' WHERE status = 'PENDING' AND timestamp <= datetime('now', '-10 minutes', 'localtime')")
             conn.commit()
             conn.close()
-        except:
-            pass
+        except Exception as e:
+            print(f"[cleanup_old_signals 오류] {e}")
 
     def _on_receive_msg(self, screen_no, rqname, trcode, msg):
         print(f"[Kiwoom System Msg] {msg}")
@@ -264,7 +294,7 @@ class UnifiedOrderManager:
                         'current_price': current_price,
                         'qty': qty,
                         'max_price': current_price,
-                        'open_price': None,
+                        'open_price': buy_price,  # 재시작 복원 시 매입가를 기준봉 시가로 대체 (None이면 하드스탑 미발동)
                         'super_trend_mode': False,
                         'ma_10': 0, 'ma_20': 0
                     }
@@ -312,8 +342,8 @@ class UnifiedOrderManager:
         try:
             with open(r"c:\antigravity\노트븍활용\telegram_controller\unified_status.json", "w", encoding="utf-8") as f:
                 json.dump(status_data, f, ensure_ascii=False, indent=2)
-        except:
-            pass
+        except Exception as e:
+            print(f"[export_status 오류] {e}")
 
     def update_day_ma_data(self):
         """단타 종목들의 실시간 10MA 업데이트"""
@@ -325,7 +355,7 @@ class UnifiedOrderManager:
             conn = sqlite3.connect("unified_data.db")
             cursor = conn.cursor()
             for code in day_codes:
-                cursor.execute(f"SELECT close FROM intraday_ohlcv WHERE code = '{code}' ORDER BY date DESC LIMIT 20")
+                cursor.execute("SELECT close FROM intraday_ohlcv WHERE code = ? ORDER BY date DESC LIMIT 20", (code,))
                 rows = cursor.fetchall()
                 if len(rows) >= 10:
                     closes = [row[0] for row in reversed(rows)]
@@ -337,17 +367,22 @@ class UnifiedOrderManager:
                     
                     if len(rows) >= 20:
                         self.portfolio[code]['ma_20'] = sum(closes[-20:]) / 20
-        except:
-            pass
+        except Exception as e:
+            print(f"[update_day_ma_data 오류] {e}")
         finally:
             conn.close()
 
     def check_swing_close_time(self):
         now = datetime.now()
-        if now.hour == 15 and now.minute == 14 and now.second == 0:
-            print("\n[⏰ 종가 익절 감시] 15:14 스윙 종목 5MA 체크를 시작합니다.")
+        # second==0 조건만 쓰면 타이머 오차로 영구 스킵 가능 → 범위 조건 + 당일 1회 플래그로 보호
+        if now.hour == 15 and now.minute >= 14 and not self.today_5ma_checked:
+            self.today_5ma_checked = True
+            print("\n[⏰ 종가 익절 감시] 15:14+ 스윙 종목 5MA 체크를 시작합니다.")
             self.pending_5ma_checks = [c for c, p in self.portfolio.items() if p['strategy'] == 'SWING']
             self._request_next_5ma()
+        # 익일 09:00 이전 플래그 리셋
+        elif now.hour < 9:
+            self.today_5ma_checked = False
 
     def _request_next_5ma(self):
         if not self.pending_5ma_checks: return
@@ -491,10 +526,12 @@ class UnifiedOrderManager:
                         profit = (exec_price - pos['buy_price']) * exec_qty
                         profit_pct = ((exec_price - pos['buy_price']) / pos['buy_price']) * 100
                         
-                        # [실시간 복리 적용] 실현 손익을 총 자본금에 더하고 예산을 재분배합니다.
-                        self.total_balance += profit
-                        self.budget_day = int(self.total_balance * 0.6)
-                        self.budget_swing = int(self.total_balance * 0.4)
+                        # 매도 체결 후 실제 예수금 재조회로 정확한 잔고 반영
+                        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.account_num)
+                        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "비밀번호", "")
+                        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", "00")
+                        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "조회구분", "2")
+                        self.kiwoom.dynamicCall("CommRqData(QString, QString, int, QString)", "예수금조회", "opw00001", 0, "0201")
                         
                         if profit < 0:
                             self.daily_realized_loss += abs(profit)

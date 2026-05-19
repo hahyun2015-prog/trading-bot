@@ -1,6 +1,18 @@
 import os
 import sys
 import sqlite3
+import json
+
+def _load_config():
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'config.json')
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {"environment": "mock"}
+
+_CONFIG = _load_config()
+IS_LIVE = _CONFIG.get("environment") == "live"
 
 # PyQt5 환경 변수 에러 방지 (항상 PyQt5 임포트 전에 실행되어야 함)
 if 'venv32' in sys.executable or 'venv64' in sys.executable:
@@ -32,6 +44,11 @@ class OrderManager:
         self.initial_balance = 0
         self.max_positions = 8
         
+        env_label = "실전매매" if IS_LIVE else "모의투자"
+        print(f"[OrderManager] 환경: {env_label} (config.json: environment={_CONFIG.get('environment')})")
+        # 실전(1) / 모의투자(2) 서버 선택
+        server_code = "1" if IS_LIVE else "2"
+        self.kiwoom.dynamicCall("KOA_Functions(QString, QString)", "SetServerGBCode", server_code)
         print("[OrderManager] 키움증권 서버 로그인 대기 중...")
         self.kiwoom.dynamicCall("CommConnect()")
         
@@ -48,6 +65,11 @@ class OrderManager:
         self.report_timer = QTimer()
         self.report_timer.timeout.connect(self.send_portfolio_report)
         self.report_timer.start(1800000) # 30분 (1800000ms)
+
+        # 매일 09:00 kill switch 자동 해제 (1분 주기로 시각 감시)
+        self.kill_switch_reset_timer = QTimer()
+        self.kill_switch_reset_timer.timeout.connect(self._check_daily_reset)
+        self.kill_switch_reset_timer.start(60000)
         
     def update_ma_data(self):
         if not self.portfolio:
@@ -134,6 +156,15 @@ class OrderManager:
         import notifier
         notifier.send_message(msg)
 
+    def _check_daily_reset(self):
+        now = datetime.now()
+        if now.hour == 9 and now.minute == 0:
+            if self.system_halted or self.daily_realized_loss > 0:
+                self.system_halted = False
+                self.daily_realized_loss = 0
+                print("[Kill Switch 해제] 새 거래일 09:00 - 시스템 재가동, 일일 손실 초기화")
+                notifier.send_message("🔄 <b>[Kill Switch 자동 해제]</b>\n새 거래일이 시작되어 시스템이 재가동됩니다.")
+
     def _on_login(self, err_code):
         if err_code == 0:
             print("[OrderManager] 로그인 성공!")
@@ -206,8 +237,8 @@ class OrderManager:
                         continue
                         
                     print(f" => [자금 관리] 할당 예산: {budget_per_stock:,}원 / 산출 수량: {qty}주 (시장가 증거금 고려)")
-                    # 체결 전 가결제 처리로 중복 초과 매수 방지
-                    self.available_balance -= (qty * price)
+                    # 체결 전 가결제: qty 산출에 사용한 safe_price 기준으로 차감해야 초과 매수 방지
+                    self.available_balance -= int(qty * safe_price_for_margin)
                     self.pending_orders[code] = {'qty': qty, 'price': price, 'type': 'BUY'}
                     
                 else: # SELL

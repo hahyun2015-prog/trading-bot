@@ -30,8 +30,8 @@ def cleanup_old_signals():
         cursor.execute("UPDATE signals SET status = 'EXPIRED' WHERE status = 'PENDING' AND timestamp <= datetime('now', '-10 minutes', 'localtime')")
         conn.commit()
         conn.close()
-    except:
-        pass
+    except Exception as e:
+        print(f"[cleanup_old_signals 오류] {e}")
 
 if __name__ == "__main__":
     print("===================================================")

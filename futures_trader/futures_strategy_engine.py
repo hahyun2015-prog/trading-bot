@@ -5,6 +5,8 @@ import ta
 import time
 from datetime import datetime
 import sys
+import json
+import os
 sys.path.append(r"..\ai_trader")
 try:
     import notifier
@@ -131,8 +133,18 @@ class FuturesStrategyEngine:
             print("전일 변동폭 데이터가 아직 수집되지 않았습니다.")
             return
 
-        # 상수 K = 0.5 적용
-        K = 0.5
+        # 핫-리로드: active_strategy.json에서 승인된 K값 읽어오기
+        K = 0.5 # 기본값
+        strategy_file = "active_strategy.json"
+        if os.path.exists(strategy_file):
+            try:
+                with open(strategy_file, "r", encoding="utf-8") as f:
+                    strat_data = json.load(f)
+                    K = strat_data.get("K", 0.5)
+            except Exception as e:
+                print(f"전략 파일 읽기 에러: {e}")
+                
+        print(f" -> 적용 파라미터: K = {K}")
         target_price_long = day_open + (prev_range * K)
         target_price_short = day_open - (prev_range * K)
         
