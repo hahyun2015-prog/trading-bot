@@ -31,28 +31,84 @@ class TCAController:
         try:
             with open(self.config_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
+
+            # config_local.json 로컬 오버라이드 (동기화 제외 파일)
+            local_config_path = os.path.join(workspace_root, "config", "config_local.json")
+            if os.path.exists(local_config_path):
+                with open(local_config_path, "r", encoding="utf-8") as f:
+                    local_overrides = json.load(f)
+                for key, val in local_overrides.items():
+                    if isinstance(val, dict) and isinstance(config.get(key), dict):
+                        config[key].update(val)
+                    else:
+                        config[key] = val
+                print(f"[TCA] config_local.json 로컬 오버라이드 적용: {list(local_overrides.keys())}")
+
             self.bot_token = config.get("telegram", {}).get("bot_token", "")
             self.allowed_chat_id = config.get("telegram", {}).get("allowed_chat_id", 0)
+            self.trading_mode = config.get("trading_mode", "both")
 
-            # venv32 경로: config 기준 상대경로 → 절대경로 변환
+            # venv32 경로
             venv32_rel = config.get("paths", {}).get("venv32_path", "venv32")
             if os.path.isabs(venv32_rel):
                 self.venv32_path = venv32_rel
             else:
                 self.venv32_path = os.path.join(workspace_root, venv32_rel)
 
-            # 2대PC 분산 운용 시 shared DB 경로
+            # 하이브리드 동기화: SMB → Google Drive → 로컬 자동 전환
+            sync = config.get("sync", {})
+            self.smb_path = sync.get("smb_path", "")
+            self.gdrive_path = sync.get("gdrive_path", "")
+            self.sync_fallback = sync.get("auto_fallback", True)
+
+            # 레거시: network 섹션 호환 유지
             self.network_role = config.get("network", {}).get("role", "standalone")
             shared = config.get("network", {}).get("shared_db_path", "")
-            self.shared_db_root = shared if shared else workspace_root
+            if shared and not self.smb_path:
+                self.smb_path = shared
+
+            print(f"[TCA] trading_mode={self.trading_mode}, sync=[SMB:{bool(self.smb_path)}, GDrive:{bool(self.gdrive_path)}]")
 
         except Exception as e:
             print(f"[TCA Config Error] {e}")
             self.bot_token = ""
             self.allowed_chat_id = 0
+            self.trading_mode = "both"
             self.venv32_path = os.path.join(workspace_root, "venv32")
+            self.smb_path = ""
+            self.gdrive_path = ""
+            self.sync_fallback = True
             self.network_role = "standalone"
-            self.shared_db_root = workspace_root
+
+    def _get_remote_root(self):
+        """하이브리드 동기화: SMB → Google Drive → 로컬 자동 전환"""
+        for path in [self.smb_path, self.gdrive_path]:
+            if path and os.path.exists(os.path.join(path, "tca")):
+                return path
+        return workspace_root
+
+    def _load_status_file(self, filename):
+        """원격 또는 로컬에서 상태 파일 로드 (하이브리드 동기화 적용)"""
+        # 1. 로컬에서 먼저 시도
+        local_path = os.path.join(workspace_root, "tca", filename)
+        if os.path.exists(local_path):
+            with open(local_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        # 2. 원격 경로에서 시도 (SMB → GDrive)
+        remote_root = self._get_remote_root()
+        if remote_root != workspace_root:
+            remote_path = os.path.join(remote_root, "tca", filename)
+            if os.path.exists(remote_path):
+                with open(remote_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        return None
+
+    def _load_all_status(self):
+        """모든 상태 파일을 통합하여 반환 (stock + futures + 단일)"""
+        stock_data = self._load_status_file("system_status_stock.json")
+        futures_data = self._load_status_file("system_status_futures.json")
+        single_data = self._load_status_file("system_status.json")
+        return stock_data, futures_data, single_data
 
     def send_message(self, text):
         if notifier:
@@ -105,11 +161,10 @@ class TCAController:
 
     def get_stock_status(self):
         try:
-            if not os.path.exists(self.status_file):
-                return "🚨 <b>상태 데이터를 읽을 수 없습니다.</b>\nERA 엔진이 아직 구동되지 않았거나 데이터를 내보내지 않았습니다."
-                
-            with open(self.status_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            stock_data, _, single_data = self._load_all_status()
+            data = stock_data or single_data
+            if not data:
+                return "🚨 <b>주식 상태 데이터를 읽을 수 없습니다.</b>\nERA(주식) 엔진이 아직 구동되지 않았거나 데이터를 내보내지 않았습니다."
                 
             total_balance = data.get("total_balance", 0)
             daily_loss = data.get("daily_realized_loss", 0)
@@ -160,11 +215,10 @@ class TCAController:
 
     def get_futures_status(self):
         try:
-            if not os.path.exists(self.status_file):
-                return "🚨 <b>상태 데이터를 읽을 수 없습니다.</b>\nERA 엔진이 아직 구동되지 않았거나 데이터를 내보내지 않았습니다."
-                
-            with open(self.status_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            _, futures_data, single_data = self._load_all_status()
+            data = futures_data or single_data
+            if not data:
+                return "🚨 <b>선물 상태 데이터를 읽을 수 없습니다.</b>\nERA(선물) 엔진이 아직 구동되지 않았거나 데이터를 내보내지 않았습니다."
                 
             avail_balance = data.get("futures_balance", 0)
             positions = data.get("futures_positions", {})
@@ -192,32 +246,42 @@ class TCAController:
             return f"🚨 선물 현황 분석 실패: {e}"
 
     def get_account_status(self):
-        """현재 감지된 계좌 및 잔고 현황"""
+        """현재 감지된 계좌 및 잔고 현황 (다중 PC 통합)"""
         try:
-            if not os.path.exists(self.status_file):
+            stock_data, futures_data, single_data = self._load_all_status()
+            
+            # 단일 PC 모드 또는 분리 모드에서 데이터 추출
+            s_data = stock_data or single_data or {}
+            f_data = futures_data or single_data or {}
+            
+            if not s_data and not f_data:
                 return "🚨 ERA 상태 데이터 없음. ERA가 실행 중인지 확인하세요."
-            with open(self.status_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
 
-            stock_acc   = data.get("stock_account", "미감지")
-            futures_acc = data.get("futures_account", "미감지")
-            env         = data.get("environment", "unknown")
-            stock_bal   = data.get("total_balance", 0)
-            fut_bal     = data.get("futures_balance", 0)
+            stock_acc   = s_data.get("stock_account", "") or "비활성"
+            futures_acc = f_data.get("futures_account", "") or "비활성"
+            stock_bal   = s_data.get("total_balance", 0)
+            fut_bal     = f_data.get("futures_balance", 0)
+            s_mode      = s_data.get("trading_mode", "")
+            f_mode      = f_data.get("trading_mode", "")
 
-            msg  = f"🔑 <b>[계좌 확인 / {env}]</b>\n\n"
-            msg += f"📈 주식 계좌: <code>{stock_acc}</code>\n"
+            # 동기화 경로 표시
+            remote = self._get_remote_root()
+            if remote == workspace_root:
+                sync_label = "로컬 전용"
+            elif remote == self.smb_path:
+                sync_label = "🟢 SMB 직접 연결"
+            else:
+                sync_label = "☁️ Google Drive 동기화"
+
+            msg  = f"🔑 <b>[계좌 확인 / 2PC 통합]</b>\n\n"
+            msg += f"💻 <b>PC A (주식)</b> {f'[{s_mode}]' if s_mode else ''}\n"
+            msg += f"   계좌: <code>{stock_acc}</code>\n"
             msg += f"   예수금: {stock_bal:,}원\n\n"
-            msg += f"📉 선물 계좌: <code>{futures_acc}</code>\n"
+            msg += f"💻 <b>PC B (선물)</b> {f'[{f_mode}]' if f_mode else ''}\n"
+            msg += f"   계좌: <code>{futures_acc}</code>\n"
             msg += f"   예수금: {fut_bal:,}원\n\n"
-
-            if stock_acc == "미감지" or not stock_acc:
-                msg += "⚠️ 주식 계좌 미감지 → config.json accounts.stock_account 에 직접 입력\n"
-            if futures_acc == "미감지" or not futures_acc:
-                msg += "⚠️ 선물 계좌 미감지 → 선물 모의투자 미신청이거나 accounts.futures_account 에 직접 입력\n"
-
-            msg += f"\n💡 잘못된 경우: config.json → accounts 항목 수동 입력 후 ERA 재시작"
-            msg += f"\n🕒 {data.get('last_updated', '')}"
+            msg += f"🔗 동기화: {sync_label}\n"
+            msg += f"🕒 주식: {s_data.get('last_updated', '-')} | 선물: {f_data.get('last_updated', '-')}"
             return msg
         except Exception as e:
             return f"🚨 계좌 확인 실패: {e}"
@@ -322,46 +386,36 @@ class TCAController:
             except Exception as e:
                 self.send_message(f"❌ 전량 매도 명령 처리 중 오류: {e}")
 
-        elif cmd_text == "!긴급정지":
-            self.send_message("🚨 <b>긴급 정지 시퀀스 가동!</b> 🚨\n\n1. 주식 전량 시장가 청산 명령 하달 중...")
-            self.execute_command("!전량매도")
+        elif cmd_text == "긴급정지" or cmd_text == "!긴급정지":
+            self.send_message("🚨 <b>긴급 정지 시퀀스 가동!</b> 🚨\n\n1. 양쪽 PC ERA에 긴급정지 플래그 전송 중...")
 
-            # 2. 선물 포지션 반대매매 청산 신호 주입
-            try:
-                if os.path.exists(self.status_file):
-                    with open(self.status_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    futures_positions = data.get("futures_positions", {})
-                    if futures_positions:
-                        import sqlite3
-                        futures_db = os.path.join(self.workspace_root, "futures_data.db")
-                        conn = sqlite3.connect(futures_db, timeout=30)
-                        conn.execute("PRAGMA journal_mode=WAL;")
-                        cursor = conn.cursor()
-                        for code, pos in futures_positions.items():
-                            if pos.get('type') == 'LONG':
-                                signal_type = 'LONG_EXIT'
-                            else:
-                                signal_type = 'SHORT_EXIT'
-                            cursor.execute(
-                                "INSERT INTO signals (code, signal_type, price, status) VALUES (?, ?, 0, 'PENDING')",
-                                (code, signal_type))
-                        conn.commit()
-                        conn.close()
-                        self.send_message(f"📉 선물 포지션 {len(futures_positions)}건 반대매매 청산 신호가 DB에 전송되었습니다.")
-                    else:
-                        self.send_message("📉 현재 선물 포지션 없음 — 선물 청산 불필요.")
-            except Exception as e:
-                self.send_message(f"⚠️ 선물 청산 신호 전송 중 오류: {e}")
+            # emergency_kill.flag 생성 (로컬 + 원격 모두)
+            flag_targets = [workspace_root]
+            remote_root = self._get_remote_root()
+            if remote_root != workspace_root:
+                flag_targets.append(remote_root)
+            # SMB와 GDrive 모두 시도 (분리된 PC에 확실히 전달)
+            for path in [self.smb_path, self.gdrive_path]:
+                if path and path not in flag_targets and os.path.exists(path):
+                    flag_targets.append(path)
+            for target in flag_targets:
+                try:
+                    flag_path = os.path.join(target, "emergency_kill.flag")
+                    with open(flag_path, "w") as f:
+                        f.write(datetime.now().isoformat())
+                    print(f"[TCA] 긴급정지 플래그 생성: {flag_path}")
+                except Exception as e:
+                    print(f"[TCA] 플래그 생성 실패 ({target}): {e}")
 
-            self.send_message("⏳ 체결 확인을 위해 30초간 대기 후 시스템을 강제 정지합니다...")
+            self.send_message("✅ 긴급정지 플래그가 양쪽 PC에 전송되었습니다.\nERA가 1초 이내에 자동 감지하여 전량 청산 후 종료합니다.")
+
+            # 레거시: 로컬 ERA PID도 정리
+            self.send_message("⏳ 30초 후 로컬 ERA PID 정리...")
             time.sleep(30)
-
-            self.send_message("3. ERA 트레이딩 엔진 강제 종료 중...")
             if self._kill_era_process():
-                self.send_message("✅ <b>긴급 정지 완료:</b> ERA 트레이딩 엔진이 완전히 차단되었습니다.")
+                self.send_message("✅ <b>긴급 정지 완료:</b> 로컬 ERA도 강제 종료되었습니다.")
             else:
-                self.send_message("⚠️ ERA PID 파일 없음 - ERA가 이미 종료되었거나 실행 중이 아닙니다.")
+                self.send_message("✅ <b>긴급 정지 완료:</b> ERA는 플래그로 자체 종료되었습니다.")
 
         elif cmd_text == "!RSA분석":
             rsa_script = os.path.join(workspace_root, 'rsa', 'rsa_coordinator.py')

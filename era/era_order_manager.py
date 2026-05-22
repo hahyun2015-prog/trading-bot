@@ -91,23 +91,25 @@ class ERAOrderManager:
         self.signal_timer = QTimer()
         self.signal_timer.timeout.connect(self.poll_signals)
         
-        # 2. 주식 10MA/20MA 실시간 이평 갱신 (10초 주기)
+        # 2. 주식 10MA/20MA 실시간 이평 갱신 (10초 주기) — stock/both만
         self.ma_timer = QTimer()
         self.ma_timer.timeout.connect(self.update_day_ma_data)
-        self.ma_timer.start(10000)
+        if self.trading_mode in ('stock', 'both'):
+            self.ma_timer.start(10000)
         
-        # 3. 스윙 15:14 종가 5일선 이탈 감시 및 일일 복구 타이머 (1초 주기)
+        # 3. 스윙 15:14 종가 5일선 이탈 감시 (1초 주기) — stock/both만
         self.swing_time_timer = QTimer()
         self.swing_time_timer.timeout.connect(self.check_swing_close_time)
-        self.swing_time_timer.start(1000)
+        if self.trading_mode in ('stock', 'both'):
+            self.swing_time_timer.start(1000)
         
-        # 4. 키움 서버 통신 끊김 검사 (60초 주기)
+        # 4. 키움 서버 통신 끊김 검사 (60초 주기) — 항상
         self.conn_check_timer = QTimer()
         self.conn_check_timer.timeout.connect(self.check_connection_status)
         self.conn_check_timer.start(60000)
         self.was_disconnected = False
         
-        # 5. 매일 09:00 시스템 상태 일일 리셋 타이머
+        # 5. 매일 시스템 상태 일일 리셋 타이머 — 항상
         self.reset_timer = QTimer()
         self.reset_timer.timeout.connect(self._check_daily_reset)
         self.reset_timer.start(60000)
@@ -115,10 +117,16 @@ class ERAOrderManager:
         self.pending_5ma_checks = []
         self.today_5ma_checked = False
 
-        # 6. 단타 신호 스캔 (5분 주기, 09:00~14:00)
+        # 6. 단타 신호 스캔 (5분 주기, 09:00~14:00) — stock/both만
         self.day_scan_timer = QTimer()
         self.day_scan_timer.timeout.connect(self._run_day_screening)
-        self.day_scan_timer.start(300000)  # 5분
+        if self.trading_mode in ('stock', 'both'):
+            self.day_scan_timer.start(300000)  # 5분
+
+        # 9. 긴급정지 플래그 감시 (1초 주기) — 항상
+        self.kill_flag_timer = QTimer()
+        self.kill_flag_timer.timeout.connect(self._check_kill_flag)
+        self.kill_flag_timer.start(1000)
 
         # ── 선물 실시간 K값 변동성 돌파 전략 ─────────────────────────────
         self.futures_strategy_active = False
@@ -148,15 +156,17 @@ class ERAOrderManager:
         self.ohlcv_buffer = {}        # {code: {period_str: {o,h,l,c,v}}}
         self.theme_crawl_date = ""    # 크롤링 완료 날짜 (YYYY-MM-DD), 날짜 바뀌면 재실행
 
-        # 7. 장전 테마 크롤링 체크 (1분 주기, 08:50 자동 실행)
+        # 7. 장전 테마 크롤링 체크 (1분 주기, 08:50) — stock/both만
         self.morning_timer = QTimer()
         self.morning_timer.timeout.connect(self._check_morning_prep)
-        self.morning_timer.start(60000)
+        if self.trading_mode in ('stock', 'both'):
+            self.morning_timer.start(60000)
 
-        # 8. OHLCV 버퍼 → DB 30초 주기 동기화
+        # 8. OHLCV 버퍼 → DB 30초 주기 동기화 — stock/both만
         self.ohlcv_flush_timer = QTimer()
         self.ohlcv_flush_timer.timeout.connect(self._flush_ohlcv_buffer)
-        self.ohlcv_flush_timer.start(30000)
+        if self.trading_mode in ('stock', 'both'):
+            self.ohlcv_flush_timer.start(30000)
 
 
     def load_config(self):
@@ -319,62 +329,61 @@ class ERAOrderManager:
             for i, acc in enumerate(accounts):
                 print(f"    [{i}] {acc}")
 
-            # ── 주식 계좌 감지 ──────────────────────────────────────────
-            self.stock_account = self.config_stock_acc  # config 우선
-            if not self.stock_account:
-                if is_mock:
-                    # 모의투자: 첫 번째 계좌 (모의계좌는 끝자리 패턴이 다름)
-                    self.stock_account = accounts[0] if accounts else ""
-                else:
-                    # 실전: 끝자리 '11' → 없으면 첫 번째
-                    for acc in accounts:
-                        if acc.endswith('11'):
-                            self.stock_account = acc
-                            break
-                    if not self.stock_account and accounts:
-                        self.stock_account = accounts[0]
+            # ── 주식 계좌 감지 (stock/both 모드에서만) ────────────────────
+            if self.trading_mode in ('stock', 'both'):
+                self.stock_account = self.config_stock_acc
+                if not self.stock_account:
+                    if is_mock:
+                        self.stock_account = accounts[0] if accounts else ""
+                    else:
+                        for acc in accounts:
+                            if acc.endswith('11'):
+                                self.stock_account = acc
+                                break
+                        if not self.stock_account and accounts:
+                            self.stock_account = accounts[0]
+            else:
+                self.stock_account = ""
+                print("[ERA] 선물 전용 모드 — 주식 계좌 비활성화")
 
-            # ── 선물 계좌 감지 ──────────────────────────────────────────
-            self.futures_account = self.config_futures_acc  # config 우선
-            if not self.futures_account:
-                if is_mock:
-                    # 모의투자: 두 번째 계좌 (주식 모의계좌와 다른 경우)
-                    for acc in accounts:
-                        if acc != self.stock_account:
-                            self.futures_account = acc
-                            break
-                else:
-                    # 실전: 끝자리 '11' 아닌 첫 계좌
-                    for acc in accounts:
-                        if not acc.endswith('11'):
-                            self.futures_account = acc
-                            break
-                    if not self.futures_account and len(accounts) > 1:
-                        self.futures_account = accounts[1]
+            # ── 선물 계좌 감지 (futures/both 모드에서만) ──────────────────
+            if self.trading_mode in ('futures', 'both'):
+                self.futures_account = self.config_futures_acc
+                if not self.futures_account:
+                    if is_mock:
+                        for acc in accounts:
+                            if acc != self.stock_account:
+                                self.futures_account = acc
+                                break
+                    else:
+                        for acc in accounts:
+                            if not acc.endswith('11'):
+                                self.futures_account = acc
+                                break
+                        if not self.futures_account and len(accounts) > 1:
+                            self.futures_account = accounts[1]
+            else:
+                self.futures_account = ""
+                print("[ERA] 주식 전용 모드 — 선물 계좌 비활성화")
 
             mode_tag = "모의투자" if is_mock else "실전매매"
-            print(f"\n => [계좌 셋업 / {mode_tag}]")
-            print(f"    주식 계좌: {self.stock_account or '미감지'}")
-            print(f"    선물 계좌: {self.futures_account or '미감지 (선물 모의투자 미신청 가능)'}")
+            trading_label = {'stock': '주식 전용', 'futures': '선물 전용', 'both': '주식+선물'}[self.trading_mode]
+            print(f"\n => [계좌 셋업 / {mode_tag} / {trading_label}]")
+            print(f"    주식 계좌: {self.stock_account or '비활성'}")
+            print(f"    선물 계좌: {self.futures_account or '비활성'}")
 
             # ── 계좌 감지 결과 텔레그램 알림 ────────────────────────────
             acc_list_str = "\n".join(f"  [{i}] <code>{a}</code>" for i, a in enumerate(accounts))
-            warn = ""
-            if not self.stock_account:
-                warn += "\n⚠️ 주식 계좌를 찾지 못했습니다. config.json에 직접 입력하세요."
-            if not self.futures_account:
-                warn += "\n⚠️ 선물 계좌 없음 (선물 모의투자 미신청이거나 실계좌 없음)"
             if notifier:
                 notifier.send_message(
-                    f"🔑 <b>[계좌 감지 결과 / {mode_tag}]</b>\n\n"
+                    f"🔑 <b>[계좌 감지 / {mode_tag} / {trading_label}]</b>\n\n"
                     f"<b>전체 계좌 목록:</b>\n{acc_list_str}\n\n"
-                    f"✅ 주식: <code>{self.stock_account or '미감지'}</code>\n"
-                    f"✅ 선물: <code>{self.futures_account or '미감지'}</code>"
-                    + warn +
-                    "\n\n💡 <i>계좌가 틀렸다면 config.json → accounts 항목에 직접 입력 후 재시작</i>"
+                    f"{'✅' if self.stock_account else '⬜'} 주식: <code>{self.stock_account or '비활성'}</code>\n"
+                    f"{'✅' if self.futures_account else '⬜'} 선물: <code>{self.futures_account or '비활성'}</code>\n\n"
+                    f"💡 <i>모드: {trading_label} (config_local.json으로 변경 가능)</i>"
                 )
 
-            # ── 예수금 조회 ─────────────────────────────────────────────
+            # ── 예수금 조회 (활성 계좌만) ──────────────────────────────
             if self.stock_account:
                 self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.stock_account)
                 self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "비밀번호", "")
@@ -388,7 +397,7 @@ class ERAOrderManager:
                 self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", "00")
                 self.kiwoom.dynamicCall("CommRqData(QString, QString, int, QString)", "선물예수금조회", "opw20010", 0, "2001")
 
-            # ── 기존 주식 보유 종목 조회 ────────────────────────────────
+            # ── 기존 주식 보유 종목 조회 (stock/both만) ─────────────────
             if self.stock_account:
                 self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.stock_account)
                 self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "비밀번호", "")
@@ -396,10 +405,12 @@ class ERAOrderManager:
                 self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "조회구분", "2")
                 self.kiwoom.dynamicCall("CommRqData(QString, QString, int, QString)", "계좌평가잔고내역요청", "opw00018", 0, "0202")
 
-            # 선물 K값 변동성 돌파 전략 초기화
-            QTimer.singleShot(3000, self._init_futures_strategy)
-            # 테마 대장주 실시간 구독 등록 (이미 크롤링된 경우 즉시, 아직이면 09:00 이후 _check_morning_prep이 처리)
-            QTimer.singleShot(6000, self._register_theme_realtime)
+            # 선물 K값 전략 초기화 (futures/both만)
+            if self.trading_mode in ('futures', 'both'):
+                QTimer.singleShot(3000, self._init_futures_strategy)
+            # 테마 대장주 실시간 구독 (stock/both만)
+            if self.trading_mode in ('stock', 'both'):
+                QTimer.singleShot(6000, self._register_theme_realtime)
             
         else:
             desc = self._LOGIN_ERRORS.get(err_code, "알 수 없는 오류")
@@ -1053,9 +1064,10 @@ class ERAOrderManager:
             print(f"[ERA 단타 스캔 오류] {e}")
 
     def export_status(self):
-        """TCA 에이전트와 상태를 실시간으로 공유하기 위해 JSON 저장"""
+        """TCA 에이전트와 상태를 실시간으로 공유하기 위해 JSON 저장 (모드별 파일 분리)"""
         status_data = {
             "environment": self.environment,
+            "trading_mode": self.trading_mode,
             "stock_account": self.stock_account,
             "futures_account": self.futures_account,
             "total_balance": self.stock_total_balance,
@@ -1075,11 +1087,18 @@ class ERAOrderManager:
             },
             "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
+        # 모드별 파일명 분리 (2대PC 동기화 충돌 방지)
+        filenames = {
+            "stock": "system_status_stock.json",
+            "futures": "system_status_futures.json",
+            "both": "system_status.json",
+        }
+        filename = filenames.get(self.trading_mode, "system_status.json")
         try:
             status_dir = os.path.join(self.workspace_root, "tca")
             if not os.path.exists(status_dir):
                 os.makedirs(status_dir)
-            with open(os.path.join(status_dir, "system_status.json"), "w", encoding="utf-8") as f:
+            with open(os.path.join(status_dir, filename), "w", encoding="utf-8") as f:
                 json.dump(status_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"[ERA status 내보내기 오류] {e}")
@@ -1137,16 +1156,16 @@ class ERAOrderManager:
             QTimer.singleShot(1000, self._request_next_5ma)
 
     def poll_signals(self):
-        """DB 시그널 테이블(주식 & 선물) 통합 감시 및 라우팅"""
+        """DB 시그널 테이블(주식 & 선물) 통합 감시 및 라우팅 (trading_mode 기반 분기)"""
         if self.system_halted:
             return
             
-        # 1. 주식 시그널 감시 (unified_data.db)
-        if os.path.exists(self.unified_db_path):
+        # 1. 주식 시그널 감시 (stock/both만)
+        if self.trading_mode in ('stock', 'both') and os.path.exists(self.unified_db_path):
             self._poll_stock_signals()
             
-        # 2. 선물 시그널 감시 (futures_data.db)
-        if os.path.exists(self.futures_db_path):
+        # 2. 선물 시그널 감시 (futures/both만)
+        if self.trading_mode in ('futures', 'both') and os.path.exists(self.futures_db_path):
             self._poll_futures_signals()
 
     def _poll_stock_signals(self):
@@ -1422,8 +1441,10 @@ class ERAOrderManager:
                             self.persist_positions() # 가상 파티셔닝 구조 보존
 
     def _on_receive_real_data(self, code, real_type, real_data):
-        # 선물 실시간 틱 처리
+        # 선물 실시간 틱 처리 (futures/both만)
         if real_type == "선물시세" or real_type == "선물체결":
+            if self.trading_mode not in ('futures', 'both'):
+                return
             raw = self.kiwoom.dynamicCall("GetCommRealData(QString, int)", code, 10).strip()
             if raw:
                 try:
@@ -1433,6 +1454,8 @@ class ERAOrderManager:
             return
 
         if real_type == "주식체결":
+            if self.trading_mode not in ('stock', 'both'):
+                return
             current_price = abs(int(self.kiwoom.dynamicCall("GetCommRealData(QString, int)", code, 10)))
 
             # 테마 대장주 실시간 OHLCV 갱신 (포트폴리오 편입 전 모니터링)
@@ -1490,6 +1513,39 @@ class ERAOrderManager:
                         "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
                         ["[ERA_Auto_Sell]", "0103", self.stock_account, 2, code, pos['qty'], 0, "03", ""]
                     )
+
+    def _check_kill_flag(self):
+        """긴급정지 플래그 감시 — TCA가 생성한 emergency_kill.flag 감지 시 전량 청산 후 종료"""
+        flag_path = os.path.join(self.workspace_root, "emergency_kill.flag")
+        if os.path.exists(flag_path):
+            print("\n🚨 [ERA] 긴급정지 플래그 감지! 전 포지션 청산 후 종료합니다.")
+            if notifier:
+                mode_label = {'stock': '주식', 'futures': '선물', 'both': '주식+선물'}[self.trading_mode]
+                notifier.send_message(f"🚨 <b>[{mode_label} ERA 긴급정지 발동]</b>\n플래그 감지 → 전량 청산 + 종료")
+            try:
+                os.remove(flag_path)
+            except:
+                pass
+            # 전량 청산 시도
+            self.system_halted = True
+            # 선물 포지션 청산
+            for pos_key in list(self.futures_positions.keys()):
+                pos = self.futures_positions[pos_key]
+                order_code = self.real_night_code if 'NIGHT' in pos_key else self.real_day_code
+                self._execute_futures_direct(
+                    "LONG_EXIT" if pos['type'] == 'LONG' else "SHORT_EXIT",
+                    0, order_code, pos_key
+                )
+            # 주식 포지션 청산
+            for code in list(self.portfolio.keys()):
+                pos = self.portfolio[code]
+                if not pos.get('sell_ordered'):
+                    self.kiwoom.dynamicCall(
+                        "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
+                        ["[ERA_KILL]", "0103", self.stock_account, 2, code, pos['qty'], 0, "03", ""]
+                    )
+            print("[ERA] 긴급정지 청산 주문 완료. 5초 후 종료합니다.")
+            QTimer.singleShot(5000, lambda: sys.exit(0))
 
 if __name__ == "__main__":
     try:
