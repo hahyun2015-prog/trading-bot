@@ -1,0 +1,36 @@
+# 민감 정보 - API 키, 텔레그램 봇 토큰 등 포함
+config/config.json
+
+# PC별 로컬 설정 (동기화 제외)
+config/config_local.json
+
+# ERA 실행 중 생성되는 PID 파일
+era/era.pid
+
+# 시스템 상태 파일 (런타임 데이터)
+tca/system_status.json
+tca/system_status_stock.json
+tca/system_status_futures.json
+era/era_positions.json
+config/active_strategy.json
+
+# 긴급정지 플래그
+emergency_kill.flag
+
+# 데이터베이스 파일
+*.db
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+
+# 가상환경
+venv*/
+.venv/
+
+# 로그 파일
+*.log
+
+# 동기화 임시 파일
+sync_dump/
