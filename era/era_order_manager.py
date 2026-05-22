@@ -128,6 +128,11 @@ class ERAOrderManager:
         self.kill_flag_timer.timeout.connect(self._check_kill_flag)
         self.kill_flag_timer.start(1000)
 
+        # 10. 키움 세션 킵얼라이브 (5분 주기) — 자동 로그아웃 방지
+        self.keepalive_timer = QTimer()
+        self.keepalive_timer.timeout.connect(self._keepalive_ping)
+        self.keepalive_timer.start(300000)  # 5분
+
         # ── 선물 실시간 K값 변동성 돌파 전략 ─────────────────────────────
         self.futures_strategy_active = False
         self.futures_best_k = 0.5
@@ -1514,6 +1519,20 @@ class ERAOrderManager:
                         ["[ERA_Auto_Sell]", "0103", self.stock_account, 2, code, pos['qty'], 0, "03", ""]
                     )
 
+    def _keepalive_ping(self):
+        """키움 세션 킵얼라이브 — 10분 자동 로그아웃 방지 (5분 주기)"""
+        try:
+            state = self.kiwoom.dynamicCall("GetConnectState()")
+            if state == 1:
+                # 가벼운 API 호출로 세션 유지
+                self.kiwoom.dynamicCall("GetLoginInfo(QString)", "ACCNO")
+            else:
+                print("[ERA] ⚠️ 키움 연결 끊김 감지 (keepalive)")
+                if notifier:
+                    notifier.send_message("⚠️ <b>[ERA]</b> 키움 서버 연결 끊김 감지됨")
+        except Exception as e:
+            print(f"[ERA] keepalive 오류: {e}")
+
     def _check_kill_flag(self):
         """긴급정지 플래그 감시 — TCA가 생성한 emergency_kill.flag 감지 시 전량 청산 후 종료"""
         flag_path = os.path.join(self.workspace_root, "emergency_kill.flag")
@@ -1568,6 +1587,20 @@ if __name__ == "__main__":
     print("==========================================================")
     print("   ERA Order Manager (day 60% & swing 40% Unified)")
     print("==========================================================")
-    app = QApplication(sys.argv)
-    manager = ERAOrderManager()
-    sys.exit(app.exec_())
+
+    try:
+        app = QApplication(sys.argv)
+        manager = ERAOrderManager()
+        sys.exit(app.exec_())
+    except Exception as e:
+        import traceback
+        err_msg = traceback.format_exc()
+        print(f"\n[ERA 치명적 오류] {e}\n{err_msg}")
+        # 에러 로그 파일 저장
+        try:
+            with open(os.path.join(current_dir, "era_crash.log"), "w", encoding="utf-8") as f:
+                f.write(err_msg)
+            print(f"[ERA] 에러 로그 저장: {os.path.join(current_dir, 'era_crash.log')}")
+        except:
+            pass
+        input("[ERA] 종료하려면 Enter 키를 누르세요...")
