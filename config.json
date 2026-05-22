@@ -1,0 +1,13 @@
+{
+    "environment": "live",
+    "description": "live(실전 매매) 또는 mock(모의투자 및 AI 랩) 모드로 설정",
+    "kiwoom_server": {
+        "live": 1,
+        "mock": 2
+    },
+    "features": {
+        "auto_trading": true,
+        "ai_optimization": false,
+        "telegram_alerts": true
+    }
+}
