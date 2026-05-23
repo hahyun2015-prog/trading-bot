@@ -281,23 +281,67 @@ class ERAOrderManager:
             self.futures_night_entry_price  = 0.0
             print("[ERA 야간선물] 18:00 세션 시작 대기 — 상태 초기화")
 
+    def _is_trading_day(self):
+        """오늘이 거래일인지 확인 (주말 + KRX 휴장일)"""
+        now = datetime.now()
+        if now.weekday() >= 5:  # 토(5), 일(6)
+            return False
+
+        # krx_holidays.json에서 휴장일 로드 (캐시, 연도별 1회)
+        year = str(now.year)
+        cache_year = getattr(self, '_krx_holidays_year', '')
+        if cache_year != year:
+            self._krx_holidays_cache = set()
+            self._krx_holidays_year = year
+            self._holiday_warning_sent = False
+            try:
+                holidays_path = os.path.join(self.workspace_root, "config", "krx_holidays.json")
+                if os.path.exists(holidays_path):
+                    with open(holidays_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if year in data:
+                        for h in data[year]:
+                            self._krx_holidays_cache.add(h["date"])
+                        print(f"[ERA] {year}년 KRX 휴장일 {len(self._krx_holidays_cache)}일 로드 완료")
+                    else:
+                        # 새해 휴장일 데이터 없음 → 알림
+                        print(f"[ERA] ⚠️ {year}년 KRX 휴장일 데이터 없음!")
+                        if notifier and not self._holiday_warning_sent:
+                            notifier.send_message(
+                                f"⚠️ <b>[ERA 알림]</b> {year}년 KRX 휴장일 데이터가 없습니다.\n\n"
+                                f"📁 config/krx_holidays.json 에 \"{year}\" 항목을 추가해주세요.\n"
+                                f"휴장일 미등록 시 휴장일에도 불필요한 알림이 발송됩니다."
+                            )
+                            self._holiday_warning_sent = True
+            except Exception as e:
+                print(f"[ERA] 휴장일 로드 실패: {e}")
+
+        today = now.strftime("%Y-%m-%d")
+        if today in self._krx_holidays_cache:
+            return False
+        return True
+
     def check_connection_status(self):
         state = self.kiwoom.dynamicCall("GetConnectState()")
         now = datetime.now()
+        is_trading = self._is_trading_day()
 
         if state == 0:
             if not self.was_disconnected:
                 print("🚨 [ERA] 키움증권 서버 통신 끊김 감지!")
-                if notifier:
+                # 거래일에만 텔레그램 알림 발송
+                if notifier and is_trading:
                     notifier.send_message(
                         "🚨 <b>[통신 끊김]</b> 키움증권 서버 연결이 끊어졌습니다.\n"
                         "새벽 서버 점검 중이라면 07:00 이후 자동 재연결합니다."
                     )
+                elif not is_trading:
+                    print("[ERA] 휴장일 — 텔레그램 알림 생략")
                 self.was_disconnected = True
                 self._reconnect_attempts = 0
 
-            # 07:00 이후 자동 재연결 시도 (점검 종료 후)
-            elif now.hour >= 7:
+            # 거래일 07:00 이후에만 자동 재연결 시도
+            elif is_trading and now.hour >= 7:
                 self._reconnect_attempts = getattr(self, '_reconnect_attempts', 0) + 1
                 print(f"[ERA] 자동 재연결 시도 #{self._reconnect_attempts}...")
                 self.kiwoom.dynamicCall("CommConnect()")
@@ -1616,9 +1660,11 @@ class ERAOrderManager:
         try:
             state = self.kiwoom.dynamicCall("GetConnectState()")
             if state == 1:
-                # 가벼운 API 호출로 세션 유지
                 self.kiwoom.dynamicCall("GetLoginInfo(QString)", "ACCNO")
             else:
+                # 휴장일에는 텔레그램 알림 생략
+                if not self._is_trading_day():
+                    return
                 print("[ERA] ⚠️ 키움 연결 끊김 감지 (keepalive)")
                 if notifier:
                     notifier.send_message("⚠️ <b>[ERA]</b> 키움 서버 연결 끊김 감지됨")
