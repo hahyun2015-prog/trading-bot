@@ -409,13 +409,15 @@ class TCAController:
 
             self.send_message("✅ 긴급정지 플래그가 양쪽 PC에 전송되었습니다.\nERA가 1초 이내에 자동 감지하여 전량 청산 후 종료합니다.")
 
-            # 레거시: 로컬 ERA PID도 정리
-            self.send_message("⏳ 30초 후 로컬 ERA PID 정리...")
-            time.sleep(30)
-            if self._kill_era_process():
-                self.send_message("✅ <b>긴급 정지 완료:</b> 로컬 ERA도 강제 종료되었습니다.")
-            else:
-                self.send_message("✅ <b>긴급 정지 완료:</b> ERA는 플래그로 자체 종료되었습니다.")
+            # ERA 플래그 감지 후 10초 내 자체 종료 → 비동기 PID 정리 (루프 블로킹 방지)
+            import threading
+            def _cleanup_pid():
+                time.sleep(10)
+                if self._kill_era_process():
+                    self.send_message("✅ <b>긴급 정지 완료:</b> 로컬 ERA 강제 종료 확인.")
+                else:
+                    self.send_message("✅ <b>긴급 정지 완료:</b> ERA 플래그 수신 후 자체 종료.")
+            threading.Thread(target=_cleanup_pid, daemon=True).start()
 
         elif cmd_text == "!RSA분석":
             rsa_script = os.path.join(workspace_root, 'rsa', 'rsa_coordinator.py')

@@ -43,7 +43,7 @@ if exist "%~dp0venv32\Scripts\python.exe" (
 echo.
 
 if "%CHOICE%"=="1" (
-    echo   %MGT%[실행]%R%  K값 최적화 시작...  %GRY%(완료까지 수 분 소요)%R%
+    echo   %MGT%[실행]%R%  K값 최적화 시작...  %GRY%(ERA 실전 로직 반영, 완료까지 수 분 소요)%R%
     echo %GRY%  ────────────────────────────────────────────────────%R%
     echo.
     "%PYTHON%" "%~dp0bqa\batch_optimizer.py"
@@ -52,8 +52,13 @@ if "%CHOICE%"=="1" (
     echo %GRY%  ────────────────────────────────────────────────────%R%
     echo.
     "%PYTHON%" "%~dp0bqa\backtester.py"
+) else if "%CHOICE%"=="3" (
+    echo   %CYN%[실행]%R%  주식 데이터 수집 + 스윙 백테스트 시작...  %GRY%(Kiwoom 불필요)%R%
+    echo %GRY%  ────────────────────────────────────────────────────%R%
+    echo.
+    python "%~dp0bqa\collect_stock_data.py"
 ) else (
-    echo   %RED%[오류]%R%  잘못된 입력입니다. (1, 2 중 선택)
+    echo   %RED%[오류]%R%  잘못된 입력입니다. (1, 2, 3 중 선택)
 )
 
 echo.

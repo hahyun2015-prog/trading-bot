@@ -116,6 +116,12 @@ class ERAOrderManager:
         
         self.pending_5ma_checks = []
         self.today_5ma_checked = False
+        self._daily_reset_done_date = ""   # 09:00 일일 리셋 중복 실행 방지
+        self._night_reset_done_date = ""   # 18:00/05:00 야간 리셋 중복 실행 방지
+
+        # 월간 MDD 자동 중단 (월간 손실 25% 초과 시 Kill Switch)
+        self.stock_monthly_loss = 0
+        self.stock_monthly_initial = 0  # 월초 잔고 기준선
 
         # 6. 단타 신호 스캔 (5분 주기, 09:00~14:00) — stock/both만
         self.day_scan_timer = QTimer()
@@ -231,9 +237,12 @@ class ERAOrderManager:
 
     def _check_daily_reset(self):
         now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
 
         # ── 05:00 야간선물 세션 종료 리셋 ──────────────────────────────
-        if now.hour == 5 and now.minute == 0:
+        night_reset_key = f"{today}_0500"
+        if now.hour == 5 and now.minute == 0 and self._night_reset_done_date != night_reset_key:
+            self._night_reset_done_date = night_reset_key
             self.futures_night_open         = 0.0
             self.futures_night_target_long  = float('inf')
             self.futures_night_target_short = float('-inf')
@@ -242,7 +251,13 @@ class ERAOrderManager:
             print("[ERA 야간선물] 05:00 세션 종료 — 상태 초기화")
 
         # ── 09:00 주간선물 세션 시작 리셋 + Kill Switch 해제 ───────────
-        if now.hour == 9 and now.minute == 0:
+        if now.hour == 9 and now.minute == 0 and self._daily_reset_done_date != today:
+            self._daily_reset_done_date = today
+            # 월초: 월간 MDD 기준 리셋
+            if now.day == 1:
+                self.stock_monthly_loss = 0
+                self.stock_monthly_initial = self.stock_total_balance if self.stock_total_balance > 0 else self.stock_monthly_initial
+                print(f"[ERA 월간MDD 리셋] 월초 — 기준잔고 {self.stock_monthly_initial:,}원")
             if self.system_halted or self.stock_daily_loss > 0:
                 self.system_halted = False
                 self.stock_daily_loss = 0
@@ -256,7 +271,9 @@ class ERAOrderManager:
             print("[ERA 주간선물] 09:00 세션 준비 — 전일 Range 갱신")
 
         # ── 18:00 야간선물 세션 시작 리셋 ──────────────────────────────
-        if now.hour == 18 and now.minute == 0:
+        night_start_key = f"{today}_1800"
+        if now.hour == 18 and now.minute == 0 and self._night_reset_done_date != night_start_key:
+            self._night_reset_done_date = night_start_key
             self.futures_night_open         = 0.0
             self.futures_night_target_long  = float('inf')
             self.futures_night_target_short = float('-inf')
@@ -438,6 +455,8 @@ class ERAOrderManager:
                 self.stock_total_balance = int(d2_deposit)
                 if self.stock_initial_balance == 0:
                     self.stock_initial_balance = self.stock_total_balance
+                if self.stock_monthly_initial == 0:
+                    self.stock_monthly_initial = self.stock_total_balance
                     
                 # 60대 40 기계적 가상 자금 파티셔닝
                 self.budget_day = int(self.stock_total_balance * self.ratio_day)
@@ -671,27 +690,81 @@ class ERAOrderManager:
             c['c'] = price
             c['v'] += tick_vol
 
+    def _update_futures_ohlcv(self, code, price):
+        """선물 실시간 틱 → 5분봉 OHLCV 인메모리 버퍼 갱신 (30초마다 DB 동기화)
+        야간 세션 데이터를 futures_ohlcv 테이블에 축적해서 향후 야간 백테스트 가능하게 함"""
+        now = datetime.now()
+        period_min = (now.minute // 5) * 5
+        period_str = now.strftime(f"%Y%m%d{now.hour:02d}") + f"{period_min:02d}00"
+        if code not in self.ohlcv_buffer:
+            self.ohlcv_buffer[code] = {}
+        buf = self.ohlcv_buffer[code]
+        if period_str not in buf:
+            buf[period_str] = {'o': price, 'h': price, 'l': price, 'c': price, 'v': 1}
+        else:
+            c = buf[period_str]
+            if price > c['h']:
+                c['h'] = price
+            if price < c['l']:
+                c['l'] = price
+            c['c'] = price
+            c['v'] += 1
+
     def _flush_ohlcv_buffer(self):
-        """30초마다 인메모리 OHLCV 버퍼를 DB에 일괄 동기화"""
+        """30초마다 인메모리 OHLCV 버퍼를 DB에 일괄 동기화
+        - 주식 코드 (6자리 이하): unified_data.db intraday_ohlcv
+        - 선물 코드 (8자리+): futures_data.db futures_ohlcv (야간 데이터 축적용)
+        """
         if not self.ohlcv_buffer:
             return
+
+        futures_codes = {getattr(self, 'real_day_code', '10100000'),
+                         getattr(self, 'real_night_code', '10500000')}
+
+        stock_rows   = []
+        futures_rows = []
+        for code, periods in self.ohlcv_buffer.items():
+            is_futures = (code in futures_codes or len(code) > 6)
+            for period_str, c in periods.items():
+                row = (code, period_str, c['o'], c['h'], c['l'], c['c'], c['v'])
+                if is_futures:
+                    futures_rows.append(row)
+                else:
+                    stock_rows.append(row)
+
         try:
-            conn = sqlite3.connect(self.unified_db_path, timeout=30)
-            conn.execute("PRAGMA journal_mode=WAL;")
-            cursor = conn.cursor()
-            cursor.execute("""CREATE TABLE IF NOT EXISTS intraday_ohlcv
-                              (code TEXT, date TEXT, open INTEGER, high INTEGER,
-                               low INTEGER, close INTEGER, volume INTEGER, UNIQUE(code, date))""")
-            for code, periods in self.ohlcv_buffer.items():
-                for period_str, c in periods.items():
-                    cursor.execute(
-                        "REPLACE INTO intraday_ohlcv (code,date,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?)",
-                        (code, period_str, c['o'], c['h'], c['l'], c['c'], c['v'])
-                    )
-            conn.commit()
-            conn.close()
+            if stock_rows:
+                conn = sqlite3.connect(self.unified_db_path, timeout=30)
+                conn.execute("PRAGMA journal_mode=WAL;")
+                cursor = conn.cursor()
+                cursor.execute("""CREATE TABLE IF NOT EXISTS intraday_ohlcv
+                                  (code TEXT, date TEXT, open INTEGER, high INTEGER,
+                                   low INTEGER, close INTEGER, volume INTEGER, UNIQUE(code, date))""")
+                cursor.executemany(
+                    "REPLACE INTO intraday_ohlcv (code,date,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?)",
+                    stock_rows
+                )
+                conn.commit()
+                conn.close()
         except Exception as e:
-            print(f"[ERA OHLCV 플러시 오류] {e}")
+            print(f"[ERA 주식 OHLCV 플러시 오류] {e}")
+
+        try:
+            if futures_rows:
+                conn = sqlite3.connect(self.futures_db_path, timeout=30)
+                conn.execute("PRAGMA journal_mode=WAL;")
+                cursor = conn.cursor()
+                cursor.execute("""CREATE TABLE IF NOT EXISTS futures_ohlcv
+                                  (code TEXT, date TEXT, open REAL, high REAL,
+                                   low REAL, close REAL, volume INTEGER, UNIQUE(code, date))""")
+                cursor.executemany(
+                    "REPLACE INTO futures_ohlcv (code,date,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?)",
+                    futures_rows
+                )
+                conn.commit()
+                conn.close()
+        except Exception as e:
+            print(f"[ERA 선물 OHLCV 플러시 오류] {e}")
 
     # ── 선물 K값 변동성 돌파 전략 ────────────────────────────────────────
 
@@ -1079,6 +1152,8 @@ class ERAOrderManager:
             "budget_day": self.budget_day,
             "budget_swing": self.budget_swing,
             "daily_realized_loss": self.stock_daily_loss,
+            "monthly_realized_loss": self.stock_monthly_loss,
+            "monthly_initial_balance": self.stock_monthly_initial,
             "portfolio": self.portfolio,
             "futures_balance": self.futures_available_balance,
             "futures_positions": self.futures_positions,
@@ -1244,9 +1319,8 @@ class ERAOrderManager:
                     cursor.execute("SELECT score FROM research_reports WHERE code = ? ORDER BY id DESC LIMIT 1", (code,))
                     rep = cursor.fetchone()
                     if rep is None:
-                        print(f" => [보류] RSA 종합 리서치 미평가 종목 — 무검증 진입 차단")
-                        cursor.execute("UPDATE signals SET status = 'SKIPPED_RSA_NOT_EVALUATED' WHERE id = ?", (signal_id,))
-                        continue
+                        print(f" => [보류] RSA 미평가 — PENDING 유지, 장전 RSA 분석 완료 후 자동 처리됨")
+                        continue  # status 변경 없음 → 2초 후 재시도, RSA 완료되면 자동 통과
                     if rep[0] < 70:
                         print(f" => [거절] RSA 종합 리서치 점수 부족 ({rep[0]}점 / 기준 70점)")
                         cursor.execute("UPDATE signals SET status = 'SKIPPED_RSA_SCORE_LOW' WHERE id = ?", (signal_id,))
@@ -1408,8 +1482,9 @@ class ERAOrderManager:
                         
                     self.portfolio[code]['qty'] += exec_qty
                     self.kiwoom.dynamicCall("SetRealReg(QString, QString, QString, QString)", "0102", code, "10", "1")
-                    self.persist_positions() # 가상 파티셔닝 구조 보존
-                    
+                    self.persist_positions()
+                    self.export_status()
+
                     if notifier:
                         strat_name = "단타(가상)" if self.portfolio[code]['strategy'] == 'DAY' else "스윙(가상)"
                         notifier.send_message(f"💰 <b>[{strat_name} 매수 체결] {name}</b>\n• 체결가: {exec_price:,.0f}원\n• 수량: {exec_qty}주\n• 계좌: {self.stock_account}")
@@ -1431,8 +1506,22 @@ class ERAOrderManager:
                         self.kiwoom.dynamicCall("CommRqData(QString, QString, int, QString)", "주식예수금조회", "opw00001", 0, "0201")
                         
                         if profit < 0:
-                            self.stock_daily_loss += abs(profit)
+                            loss_amt = abs(profit)
+                            self.stock_daily_loss += loss_amt
+                            self.stock_monthly_loss += loss_amt
                             icon = "✂️"
+                            # 월간 MDD 25% 초과 시 Kill Switch 자동 발동
+                            if self.stock_monthly_initial > 0 and not self.system_halted:
+                                monthly_loss_ratio = self.stock_monthly_loss / self.stock_monthly_initial
+                                if monthly_loss_ratio >= 0.25:
+                                    self.system_halted = True
+                                    print(f"[ERA Kill Switch] 월간 MDD {monthly_loss_ratio:.1%} 초과 — 자동 매매 중단!")
+                                    if notifier:
+                                        notifier.send_message(
+                                            f"🚨 <b>[월간 MDD 자동 중단]</b>\n"
+                                            f"월간 손실: {monthly_loss_ratio:.1%} (한도 25%)\n"
+                                            f"신규 진입이 중단됩니다. 수동 검토 후 <code>!시스템시작</code>으로 재개하세요."
+                                        )
                         else:
                             icon = "🚀"
                             
@@ -1443,7 +1532,8 @@ class ERAOrderManager:
                         if pos['qty'] <= 0:
                             del self.portfolio[code]
                             self.kiwoom.dynamicCall("SetRealRemove(QString, QString)", "0102", code)
-                            self.persist_positions() # 가상 파티셔닝 구조 보존
+                            self.persist_positions()
+                        self.export_status()
 
     def _on_receive_real_data(self, code, real_type, real_data):
         # 선물 실시간 틱 처리 (futures/both만)
@@ -1453,7 +1543,9 @@ class ERAOrderManager:
             raw = self.kiwoom.dynamicCall("GetCommRealData(QString, int)", code, 10).strip()
             if raw:
                 try:
-                    self._process_futures_tick(code, abs(float(raw)))
+                    price = abs(float(raw))
+                    self._process_futures_tick(code, price)
+                    self._update_futures_ohlcv(code, price)  # 야간 포함 선물 틱 → 5분봉 DB 축적
                 except ValueError:
                     pass
             return
