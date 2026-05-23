@@ -419,6 +419,59 @@ class TCAController:
                     self.send_message("✅ <b>긴급 정지 완료:</b> ERA 플래그 수신 후 자체 종료.")
             threading.Thread(target=_cleanup_pid, daemon=True).start()
 
+        elif cmd_text == "!버전확인":
+            try:
+                log = subprocess.check_output(
+                    ['git', '-C', workspace_root, 'log', '--oneline', '-5'],
+                    text=True, stderr=subprocess.STDOUT, timeout=10
+                ).strip()
+                branch = subprocess.check_output(
+                    ['git', '-C', workspace_root, 'rev-parse', '--abbrev-ref', 'HEAD'],
+                    text=True, timeout=5
+                ).strip()
+                mode_label = {'stock': '주식 전용', 'futures': '선물 전용', 'both': '주식+선물'}.get(self.trading_mode, self.trading_mode)
+                self.send_message(
+                    f"📋 <b>[AMATS 버전 정보]</b>\n\n"
+                    f"🖥 모드: {mode_label} | 브랜치: {branch}\n\n"
+                    f"<b>최근 커밋 5개:</b>\n<code>{log}</code>\n\n"
+                    f"💡 다른 PC와 버전이 다르면 <code>!코드업데이트</code> 를 실행하세요."
+                )
+            except Exception as e:
+                self.send_message(f"⚠️ 버전 확인 실패: {e}")
+
+        elif cmd_text == "!코드업데이트":
+            self.send_message(
+                "🔄 <b>[코드 업데이트 시작]</b>\n"
+                "GitHub origin/main 에서 최신 코드를 가져옵니다...\n"
+                "<i>(ERA 실행 중이면 업데이트 후 수동 재시작 필요)</i>"
+            )
+            try:
+                result = subprocess.check_output(
+                    ['git', '-C', workspace_root, 'pull', 'origin', 'main'],
+                    text=True, stderr=subprocess.STDOUT, timeout=30
+                ).strip()
+                commit_info = subprocess.check_output(
+                    ['git', '-C', workspace_root, 'log', '--oneline', '-1'],
+                    text=True, timeout=5
+                ).strip()
+                if 'Already up to date' in result or 'already up to date' in result.lower():
+                    self.send_message(
+                        f"✅ <b>[코드 업데이트]</b> 이미 최신 버전입니다.\n"
+                        f"<code>{commit_info}</code>"
+                    )
+                else:
+                    self.send_message(
+                        f"✅ <b>[코드 업데이트 완료]</b>\n\n"
+                        f"<code>{result}</code>\n\n"
+                        f"현재 버전: <code>{commit_info}</code>\n"
+                        f"⚠️ 변경사항 적용을 위해 ERA/TCA 를 재시작하세요.\n"
+                        f"(<code>!시스템종료</code> → <code>!시스템시작</code>)"
+                    )
+            except subprocess.TimeoutExpired:
+                self.send_message("⚠️ git pull 타임아웃 (30초). 네트워크 상태를 확인하세요.")
+            except Exception as e:
+                self.send_message(f"❌ 코드 업데이트 실패: {e}")
+
         elif cmd_text == "!RSA분석":
             rsa_script = os.path.join(workspace_root, 'rsa', 'rsa_coordinator.py')
             py32_path = os.path.join(self.venv32_path, "Scripts", "python.exe")
@@ -497,7 +550,10 @@ class TCAController:
                 "<b>[🧪 BQA 퀀트 최적화]</b>\n"
                 "• <code>!백테스트시작</code> : K값 스위핑 백테스트 강제 구동\n"
                 "• <code>!최적화결과</code> : 최적화 완료된 상위 CAGR 매개변수 브리핑\n"
-                "• <code>!전략승인</code> : 최적 K값 파라미터 실전 즉시 적용 승인"
+                "• <code>!전략승인</code> : 최적 K값 파라미터 실전 즉시 적용 승인\n\n"
+                "<b>[🔁 2PC 코드 동기화]</b>\n"
+                "• <code>!버전확인</code> : 이 PC 의 현재 코드 버전 및 최근 커밋 확인\n"
+                "• <code>!코드업데이트</code> : GitHub 최신 코드를 이 PC 에 즉시 적용 (git pull)"
             )
             self.send_message(help_msg)
 

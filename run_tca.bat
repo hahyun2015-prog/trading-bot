@@ -26,6 +26,22 @@ echo.
 echo %GRY%  ────────────────────────────────────────────────────%R%
 echo.
 
+:: ── 코드 자동 업데이트 (git pull) ───────────────────────────────
+where git >nul 2>&1
+if %errorlevel% equ 0 (
+    echo   %CYN%[동기화]%R%  GitHub 최신 코드 확인 중...
+    git -C "%~dp0" pull origin main --quiet 2>&1
+    if %errorlevel% equ 0 (
+        echo   %GRN%[동기화]%R%  코드 최신 상태 확인 완료
+        for /f %%v in ('git -C "%~dp0" log --oneline -1') do echo   %GRY%         버전: %%v%R%
+    ) else (
+        echo   %YLW%[동기화]%R%  git pull 실패 — 현재 버전으로 계속 실행합니다.
+    )
+) else (
+    echo   %GRY%[동기화]%R%  git 미설치 — 코드 동기화 건너뜀
+)
+echo.
+
 if exist "%~dp0venv32\Scripts\python.exe" (
     echo   %GRN%[확인]%R%  venv32 환경으로 실행합니다.
     echo   %YLW%[시작]%R%  TCA 관제 에이전트 구동 중...

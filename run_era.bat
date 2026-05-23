@@ -28,6 +28,24 @@ if not exist "%~dp0venv32\Scripts\python.exe" (
 )
 
 echo   %GRN%[확인]%R%  venv32 가상환경 감지됨
+echo.
+
+:: ── 코드 자동 업데이트 (git pull) ───────────────────────────────
+where git >nul 2>&1
+if %errorlevel% equ 0 (
+    echo   %CYN%[동기화]%R%  GitHub 최신 코드 확인 중...
+    git -C "%~dp0" pull origin main --quiet 2>&1
+    if %errorlevel% equ 0 (
+        echo   %GRN%[동기화]%R%  코드 최신 상태 확인 완료
+        for /f %%v in ('git -C "%~dp0" log --oneline -1') do echo   %GRY%         버전: %%v%R%
+    ) else (
+        echo   %YLW%[동기화]%R%  git pull 실패 — 현재 버전으로 계속 실행합니다.
+    )
+) else (
+    echo   %GRY%[동기화]%R%  git 미설치 — 코드 동기화 건너뜀
+)
+echo.
+
 echo   %YLW%[시작]%R%  ERA 엔진 구동 중...
 echo   %GRY%         종료: Ctrl+C 또는 창 닫기%R%
 echo.
