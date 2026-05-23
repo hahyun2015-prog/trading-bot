@@ -145,8 +145,8 @@ class ERAOrderManager:
         self.futures_prev_range = 20.0
 
         # 선물 손절/익절 설정 (고정 pt)
-        self.futures_stop_loss_pt = 2.0   # 고정 손절: 진입가 대비 2.0pt
-        self.futures_take_profit_pt = 5.0  # 고정 익절: 진입가 대비 5.0pt
+        self.futures_stop_loss_pt = 3.0   # 고정 손절: 진입가 대비 3.0pt
+        self.futures_take_profit_pt = 6.0  # 고정 익절: 진입가 대비 6.0pt
 
         # 주간 선물 (09:00 ~ 익일 08:45)
         self.futures_day_open     = 0.0
@@ -205,7 +205,12 @@ class ERAOrderManager:
             self.config_stock_acc = config.get("accounts", {}).get("stock_account", "")
             self.config_futures_acc = config.get("accounts", {}).get("futures_account", "")
 
-            print(f"[ERA] trading_mode = {self.trading_mode}")
+            # 선물 손절/익절 설정 로드 (고정 pt)
+            futures_settings = config.get("futures_settings", {})
+            self.futures_stop_loss_pt = float(futures_settings.get("stop_loss_pt", 3.0))
+            self.futures_take_profit_pt = float(futures_settings.get("take_profit_pt", 6.0))
+
+            print(f"[ERA] trading_mode = {self.trading_mode} | 손절 = {self.futures_stop_loss_pt}pt | 익절 = {self.futures_take_profit_pt}pt")
         except Exception as e:
             print(f"[ERA Config Error] {e}")
             self.environment = "mock"
@@ -214,6 +219,8 @@ class ERAOrderManager:
             self.ratio_swing = 0.40
             self.config_stock_acc = ""
             self.config_futures_acc = ""
+            self.futures_stop_loss_pt = 3.0
+            self.futures_take_profit_pt = 6.0
 
     def load_persisted_positions(self):
         """가상 파티셔닝(단타 vs 스윙) 정보가 담긴 JSON 복원"""
