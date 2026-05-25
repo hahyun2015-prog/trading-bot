@@ -407,7 +407,12 @@ class ERAOrderManager:
                 self.stock_account = self.config_stock_acc
                 if not self.stock_account:
                     if is_mock:
-                        self.stock_account = accounts[0] if accounts else ""
+                        for acc in accounts:
+                            if acc.endswith('11'):
+                                self.stock_account = acc
+                                break
+                        if not self.stock_account and accounts:
+                            self.stock_account = accounts[0]
                     else:
                         for acc in accounts:
                             if acc.endswith('11'):
@@ -425,9 +430,14 @@ class ERAOrderManager:
                 if not self.futures_account:
                     if is_mock:
                         for acc in accounts:
-                            if acc != self.stock_account:
+                            if acc != self.stock_account and not acc.endswith('11'):
                                 self.futures_account = acc
                                 break
+                        if not self.futures_account:
+                            for acc in accounts:
+                                if acc != self.stock_account:
+                                    self.futures_account = acc
+                                    break
                     else:
                         for acc in accounts:
                             if not acc.endswith('11'):
