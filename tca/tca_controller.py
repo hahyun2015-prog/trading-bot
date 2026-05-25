@@ -246,7 +246,7 @@ class TCAController:
             return f"🚨 선물 현황 분석 실패: {e}"
 
     def get_account_status(self):
-        """현재 감지된 계좌 및 잔고 현황 (다중 PC 통합)"""
+        """현재 감지된 계좌 및 잔고 현황"""
         try:
             stock_data, futures_data, single_data = self._load_all_status()
             
@@ -261,27 +261,15 @@ class TCAController:
             futures_acc = f_data.get("futures_account", "") or "비활성"
             stock_bal   = s_data.get("total_balance", 0)
             fut_bal     = f_data.get("futures_balance", 0)
-            s_mode      = s_data.get("trading_mode", "")
-            f_mode      = f_data.get("trading_mode", "")
 
-            # 동기화 경로 표시
-            remote = self._get_remote_root()
-            if remote == workspace_root:
-                sync_label = "로컬 전용"
-            elif remote == self.smb_path:
-                sync_label = "🟢 SMB 직접 연결"
-            else:
-                sync_label = "☁️ Google Drive 동기화"
-
-            msg  = f"🔑 <b>[계좌 확인 / 2PC 통합]</b>\n\n"
-            msg += f"💻 <b>PC A (주식)</b> {f'[{s_mode}]' if s_mode else ''}\n"
+            msg  = f"🔑 <b>[AMATS 통합 계좌 확인]</b>\n\n"
+            msg += f"📈 <b>주식 계좌 (Stock Account)</b>\n"
             msg += f"   계좌: <code>{stock_acc}</code>\n"
             msg += f"   예수금: {stock_bal:,}원\n\n"
-            msg += f"💻 <b>PC B (선물)</b> {f'[{f_mode}]' if f_mode else ''}\n"
+            msg += f"📉 <b>선물 계좌 (Futures Account)</b>\n"
             msg += f"   계좌: <code>{futures_acc}</code>\n"
             msg += f"   예수금: {fut_bal:,}원\n\n"
-            msg += f"🔗 동기화: {sync_label}\n"
-            msg += f"🕒 주식: {s_data.get('last_updated', '-')} | 선물: {f_data.get('last_updated', '-')}"
+            msg += f"🕒 업데이트: {s_data.get('last_updated', '-')}"
             return msg
         except Exception as e:
             return f"🚨 계좌 확인 실패: {e}"
@@ -304,7 +292,7 @@ class TCAController:
             self.send_message(msg)
             
         elif cmd_text == "!주식시작" or cmd_text == "!선물시작" or cmd_text == "!시스템시작":
-            self.send_message("⏳ ERA 주문/리스크 관리 엔진을 구동합니다...")
+            self.send_message("⏳ AMATS 통합 주문/리스크 엔진을 구동합니다...")
             # Kiwoom 버전 업데이트(opstarter) 충돌 방지: KOA Studio 선제 종료
             subprocess.run("taskkill /f /im KOA_STARTER.exe 2>nul", shell=True)
             # 기존 ERA 프로세스가 좀비로 남아있을 경우 정리
@@ -320,12 +308,12 @@ class TCAController:
                 return
             era_script = os.path.join(workspace_root, "era", "era_order_manager.py")
             subprocess.Popen(f'start cmd /k "{py32_path} {era_script}"', shell=True)
-            self.send_message("✅ ERA 주문/리스크 엔진 가동 시작 명령이 하달되었습니다.")
+            self.send_message("✅ AMATS 통합 주문/리스크 엔진 가동 시작 명령이 전달되었습니다.")
             
         elif cmd_text == "!주식종료" or cmd_text == "!선물종료" or cmd_text == "!시스템종료":
-            self.send_message("⏳ ERA 트레이딩 엔진 종료 중...")
+            self.send_message("⏳ AMATS 통합 트레이딩 엔진 종료 중...")
             if self._kill_era_process():
-                self.send_message("✅ ERA 트레이딩 엔진이 정상 종료되었습니다.")
+                self.send_message("✅ AMATS 통합 트레이딩 엔진이 정상 종료되었습니다.")
             else:
                 self.send_message("⚠️ ERA PID 파일을 찾을 수 없습니다. ERA가 실행 중이지 않거나 이미 종료되었습니다.")
             
@@ -387,7 +375,7 @@ class TCAController:
                 self.send_message(f"❌ 전량 매도 명령 처리 중 오류: {e}")
 
         elif cmd_text == "긴급정지" or cmd_text == "!긴급정지":
-            self.send_message("🚨 <b>긴급 정지 시퀀스 가동!</b> 🚨\n\n1. 양쪽 PC ERA에 긴급정지 플래그 전송 중...")
+            self.send_message("🚨 <b>긴급 정지 시퀀스 가동!</b> 🚨\n\n1. ERA 주문 엔진에 긴급정지 플래그 전송 중...")
 
             # emergency_kill.flag 생성 (로컬 + 원격 모두)
             flag_targets = [workspace_root]
@@ -407,7 +395,7 @@ class TCAController:
                 except Exception as e:
                     print(f"[TCA] 플래그 생성 실패 ({target}): {e}")
 
-            self.send_message("✅ 긴급정지 플래그가 양쪽 PC에 전송되었습니다.\nERA가 1초 이내에 자동 감지하여 전량 청산 후 종료합니다.")
+            self.send_message("✅ 긴급정지 플래그가 전송되었습니다.\nERA가 1초 이내에 자동 감지하여 전량 청산 후 종료합니다.")
 
             # ERA 플래그 감지 후 10초 내 자체 종료 → 비동기 PID 정리 (루프 블로킹 방지)
             import threading
@@ -434,7 +422,7 @@ class TCAController:
                     f"📋 <b>[AMATS 버전 정보]</b>\n\n"
                     f"🖥 모드: {mode_label} | 브랜치: {branch}\n\n"
                     f"<b>최근 커밋 5개:</b>\n<code>{log}</code>\n\n"
-                    f"💡 다른 PC와 버전이 다르면 <code>!코드업데이트</code> 를 실행하세요."
+                    f"💡 <code>!코드업데이트</code> 를 실행하면 최신 버전으로 즉시 패치됩니다."
                 )
             except Exception as e:
                 self.send_message(f"⚠️ 버전 확인 실패: {e}")
@@ -551,9 +539,9 @@ class TCAController:
                 "• <code>!백테스트시작</code> : K값 스위핑 백테스트 강제 구동\n"
                 "• <code>!최적화결과</code> : 최적화 완료된 상위 CAGR 매개변수 브리핑\n"
                 "• <code>!전략승인</code> : 최적 K값 파라미터 실전 즉시 적용 승인\n\n"
-                "<b>[🔁 2PC 코드 동기화]</b>\n"
-                "• <code>!버전확인</code> : 이 PC 의 현재 코드 버전 및 최근 커밋 확인\n"
-                "• <code>!코드업데이트</code> : GitHub 최신 코드를 이 PC 에 즉시 적용 (git pull)"
+                "<b>[🔁 시스템 코드 업데이트]</b>\n"
+                "• <code>!버전확인</code> : 현재 코드 버전 및 최근 커밋 확인\n"
+                "• <code>!코드업데이트</code> : GitHub 최신 코드를 시스템에 즉시 적용 (git pull)"
             )
             self.send_message(help_msg)
 
