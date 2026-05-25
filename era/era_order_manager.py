@@ -478,6 +478,10 @@ class ERAOrderManager:
                 self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "조회구분", "2")
                 self.kiwoom.dynamicCall("CommRqData(QString, QString, int, QString)", "계좌평가잔고내역요청", "opw00018", 0, "0202")
 
+            # 로그인 직후 신호 폴링 즉시 개시 (예수금 미조회 시 poll 내부에서 skip)
+            if not self.signal_timer.isActive():
+                self.signal_timer.start(2000)
+
             # 선물 K값 전략 초기화 (futures/both만)
             if self.trading_mode in ('futures', 'both'):
                 QTimer.singleShot(3000, self._init_futures_strategy)
@@ -517,9 +521,6 @@ class ERAOrderManager:
             print(f"   - 총 실예수금: {self.stock_total_balance:,}원")
             print(f"   - 단타용(60%): {self.budget_day:,}원 (최대 {self.max_day_positions}종목)")
             print(f"   - 스윙용(40%): {self.budget_swing:,}원 (최대 {self.max_swing_positions}종목)")
-            
-            # 주식 자금 갱신 시 신호 폴링 개시
-            self.signal_timer.start(2000)
             
         elif rqname == "선물예수금조회":
             available_cash = self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, 0, "주문가능현금").strip()
@@ -1300,6 +1301,9 @@ class ERAOrderManager:
             self._poll_futures_signals()
 
     def _poll_stock_signals(self):
+        # 예수금 조회 완료 전까지는 자금 기준이 없어 주문 불가 → skip
+        if self.stock_total_balance == 0:
+            return
         conn = sqlite3.connect(self.unified_db_path, timeout=30)
         conn.execute("PRAGMA journal_mode=WAL;")
         cursor = conn.cursor()
@@ -1524,13 +1528,19 @@ class ERAOrderManager:
                         pending = self.pending_orders.get(code, {})
                         strat = pending.get('strategy', 'SWING')
                         open_p = pending.get('open_price', exec_price)
-                        
                         self.portfolio[code] = {
                             'name': name, 'strategy': strat, 'buy_price': exec_price, 'qty': 0,
                             'current_price': exec_price, 'max_price': exec_price, 'open_price': open_p,
-                            'super_trend_mode': False, 'ma_10': 0, 'ma_20': 0
+                            'super_trend_mode': False, 'ma_10': 0, 'ma_20': 0,
+                            'entry_date': datetime.now().strftime('%Y-%m-%d'),
                         }
-                        
+                    else:
+                        # 부분체결 평균단가 재계산
+                        pos = self.portfolio[code]
+                        prev_qty = pos['qty']
+                        if prev_qty > 0:
+                            pos['buy_price'] = (pos['buy_price'] * prev_qty + exec_price * exec_qty) / (prev_qty + exec_qty)
+
                     self.portfolio[code]['qty'] += exec_qty
                     self.kiwoom.dynamicCall("SetRealReg(QString, QString, QString, QString)", "0102", code, "10", "1")
                     self.persist_positions()
@@ -1650,8 +1660,10 @@ class ERAOrderManager:
                                     
                 # --- 스윙 로직 (가상 격리) ---
                 elif strat == 'SWING':
-                    # 장대양봉 시가 이탈 시 즉시 기계적 손절 (하드 스탑)
-                    if pos['open_price'] and current_price < pos['open_price']:
+                    # 장대양봉 시가 이탈 시 즉시 기계적 손절 (하드 스탑) — 진입 당일에만 적용
+                    _today = datetime.now().strftime('%Y-%m-%d')
+                    _entry_date = pos.get('entry_date', _today)
+                    if _entry_date == _today and pos['open_price'] and current_price < pos['open_price']:
                         sell_reason = f"스윙 기준봉 시가({pos['open_price']:,}원) 하향 이탈 (하드스탑)"
                         
                 if sell_reason and not pos.get('sell_ordered'):
