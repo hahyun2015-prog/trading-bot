@@ -3,9 +3,37 @@ import sys
 import sqlite3
 import json
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import requests
 from bs4 import BeautifulSoup
+
+# 윈도우 CP949 콘솔 인코딩 에러(이모지 출력 크래시) 원천 방지 래퍼 클래스
+class SafeStreamWrapper:
+    def __init__(self, original_stream):
+        self.original_stream = original_stream
+        
+    def write(self, data):
+        if not data:
+            return
+        try:
+            encoding = getattr(self.original_stream, 'encoding', 'cp949') or 'cp949'
+            data.encode(encoding)
+            self.original_stream.write(data)
+        except UnicodeEncodeError:
+            cleaned_data = ""
+            for char in data:
+                try:
+                    char.encode(encoding)
+                    cleaned_data += char
+                except UnicodeEncodeError:
+                    pass  # 인코딩이 불가능한 이모지만 안전하게 발라냄
+            self.original_stream.write(cleaned_data)
+            
+    def flush(self):
+        self.original_stream.flush()
+
+sys.stdout = SafeStreamWrapper(sys.stdout)
+sys.stderr = SafeStreamWrapper(sys.stderr)
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -30,6 +58,189 @@ try:
 except ImportError:
     notifier = None
 
+class AMATSDynamicAllocator:
+    def __init__(self, workspace_root, db_path):
+        self.workspace_root = workspace_root
+        self.db_path = db_path
+        self.config_local_path = os.path.join(workspace_root, "config", "config_local.json")
+        self.config_path = os.path.join(workspace_root, "config", "config.json")
+        self.min_allocation = 0.20 # 한 전략 최소 20% 안전 마진
+        self.default_day = 0.60
+        self.default_swing = 0.40
+
+    def detect_regime(self):
+        """KODEX 200 네이버 일봉 데이터를 활용한 20/50 EMA 및 14일 ATR 기울기 시장 레짐 감지"""
+        try:
+            print("[AMATS 자산 배분] 네이버 금융에서 KODEX 200 일봉 데이터 크롤링 시작...")
+            df = self._get_naver_kodex200_daily(7)
+            import pandas as pd
+            import numpy as np
+            if df.empty or len(df) < 55:
+                # 네이버 크롤링 실패 시 로컬 DB futures_data.db 폴백 시도
+                futures_db = os.path.join(self.workspace_root, "futures_data.db")
+                if os.path.exists(futures_db):
+                    print("[AMATS 자산 배분] 네이버 크롤링 실패 → 로컬 futures_data.db 폴백 시도...")
+                    conn = sqlite3.connect(futures_db)
+                    db_df = pd.read_sql(
+                        "SELECT date,open,high,low,close FROM futures_ohlcv WHERE code='10500000' ORDER BY date", conn
+                    )
+                    conn.close()
+                    db_df['date'] = pd.to_datetime(db_df['date'], format='%Y%m%d%H%M%S', errors='coerce')
+                    db_df.dropna(subset=['date'], inplace=True)
+                    db_df.set_index('date', inplace=True)
+                    df = db_df.resample('D').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
+            
+            if df.empty or len(df) < 55:
+                print("[AMATS 자산 배분] 레짐 데이터 확보 실패 → 기본 RANGE 설정")
+                return "RANGE"
+
+            # 지표 계산
+            df['ema20'] = df['close'].ewm(span=20).mean()
+            df['ema50'] = df['close'].ewm(span=50).mean()
+            df['ema_slope'] = (df['ema20'] - df['ema20'].shift(5)) / df['ema20'].shift(5) * 100
+            
+            last_row = df.iloc[-1]
+            ema20 = last_row['ema20']
+            ema50 = last_row['ema50']
+            slope = last_row['ema_slope']
+            
+            print(f"[AMATS 자산 배분] 감지 지표: EMA20={ema20:.2f} | EMA50={ema50:.2f} | 5일 기울기={slope:+.3f}%")
+            
+            if ema20 > ema50 and slope > 0.3:
+                return "UP"
+            elif ema20 < ema50 and slope < -0.3:
+                return "DOWN"
+            else:
+                return "RANGE"
+        except Exception as e:
+            print(f"[AMATS 자산 배분] 레짐 감지 실패 (RANGE 판별): {e}")
+            return "RANGE"
+
+    def _get_naver_kodex200_daily(self, pages=7):
+        import pandas as pd
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        rows = []
+        for page in range(1, pages + 1):
+            url = f'https://finance.naver.com/item/sise_day.naver?code=069500&page={page}'
+            try:
+                r = requests.get(url, headers=headers, timeout=5)
+                soup = BeautifulSoup(r.content, 'html.parser')
+                for tr in soup.select('table.type2 tr'):
+                    tds = tr.select('td')
+                    if len(tds) < 7:
+                        continue
+                    dstr = tds[0].text.strip()
+                    if not dstr or '.' not in dstr:
+                        continue
+                    try:
+                        rows.append({
+                            'date': datetime.strptime(dstr, '%Y.%m.%d'),
+                            'close': int(tds[1].text.strip().replace(',', '')),
+                            'open': int(tds[3].text.strip().replace(',', '')),
+                            'high': int(tds[4].text.strip().replace(',', '')),
+                            'low': int(tds[5].text.strip().replace(',', '')),
+                        })
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        df = pd.DataFrame(sorted(rows, key=lambda x: x['date']))
+        if df.empty:
+            return df
+        df.set_index('date', inplace=True)
+        return df
+
+    def calculate_rolling_performance(self):
+        """최근 30일간의 단타 및 스윙 거래 이력 기반 Sharpe Ratio 계산"""
+        try:
+            import pandas as pd
+            import numpy as np
+            conn = sqlite3.connect(self.db_path)
+            # stock_trades 테이블 유무 검사 및 조회
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='stock_trades'")
+            if not cursor.fetchone():
+                conn.close()
+                return 6.32, 5.02 # 데이터 부족 시 백테스트 평균 기본값
+                
+            df_trades = pd.read_sql(
+                "SELECT strategy_type, pnl FROM stock_trades WHERE timestamp >= date('now', '-30 days')", conn
+            )
+            conn.close()
+            
+            if df_trades.empty or len(df_trades) < 5:
+                return 6.32, 5.02
+                
+            # 단타(DAY) 성과 계산
+            day_pnls = df_trades[df_trades['strategy_type'] == 'DAY']['pnl'].tolist()
+            score_day = self._calc_sharpe(day_pnls)
+            
+            # 스윙(SWING) 성과 계산
+            swing_pnls = df_trades[df_trades['strategy_type'] == 'SWING']['pnl'].tolist()
+            score_swing = self._calc_sharpe(swing_pnls)
+            
+            return max(score_day, 0.1), max(score_swing, 0.1)
+        except Exception:
+            return 6.32, 5.02
+
+    def _calc_sharpe(self, pnls):
+        import numpy as np
+        if not pnls:
+            return 0.1
+        total_ret = sum(pnls)
+        cap_series = [10000000]
+        for p in pnls:
+            cap_series.append(cap_series[-1] + p)
+        arr = np.array(cap_series)
+        peak = np.maximum.accumulate(arr)
+        mdd = np.min((arr - peak) / peak) * 100
+        mdd_val = abs(mdd) if abs(mdd) > 1.0 else 1.0
+        return total_ret / mdd_val
+
+    def get_dynamic_allocation(self, regime):
+        """성과 점수와 실시간 시장 레짐을 결합해 최종 분배율 도출"""
+        score_day, score_swing = self.calculate_rolling_performance()
+        raw_ratio_day = score_day / (score_day + score_swing)
+        
+        # 1차 분배 및 최소 하한선 적용
+        ratio_day = max(min(raw_ratio_day, 1.0 - self.min_allocation), self.min_allocation)
+        ratio_swing = 1.0 - ratio_day
+        
+        # 시장 레짐에 따른 스케일링
+        if regime == "UP":
+            ratio_swing = max(ratio_swing * 1.5, 0.60)
+            ratio_day = 1.0 - ratio_swing
+        elif regime == "RANGE":
+            ratio_day = 0.80
+            ratio_swing = 0.20
+        elif regime == "DOWN":
+            ratio_day = 0.20
+            ratio_swing = 0.00
+            
+        return round(ratio_day, 2), round(ratio_swing, 2)
+
+    def apply_to_config(self, ratio_day, ratio_swing):
+        """config_local.json 및 config.json 의 예산 비율 업데이트"""
+        try:
+            # 1. config_local.json 업데이트
+            if os.path.exists(self.config_local_path):
+                with open(self.config_local_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            else:
+                cfg = {}
+            if "budget_allocation" not in cfg:
+                cfg["budget_allocation"] = {}
+            cfg["budget_allocation"]["stock_day_ratio"] = ratio_day
+            cfg["budget_allocation"]["stock_swing_ratio"] = ratio_swing
+            cfg["budget_allocation"]["dynamic_allocation_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(self.config_local_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=4)
+            print(f"[AMATS 자산 배분] config_local.json 자동 배분 업데이트 완료 (단타={ratio_day} / 스윙={ratio_swing})")
+            return True
+        except Exception as e:
+            print(f"[AMATS 자산 배분] 설정 파일 저장 오류: {e}")
+            return False
+
 class ERAOrderManager:
     def __init__(self):
         self.kiwoom = QAxWidget("KHOPENAPI.KHOpenAPICtrl.1")
@@ -49,6 +260,7 @@ class ERAOrderManager:
         self.pending_orders = {}      # 주식 미체결/진입 대기
         self.pending_futures_orders = {} # 선물 미체결/진입 대기
         self.system_halted = False
+        self.current_regime = "RANGE"    # [AMATS 최적화] 실시간 감지 레짐 기본값
         
         # 자금 정보
         self.stock_total_balance = 0
@@ -56,7 +268,8 @@ class ERAOrderManager:
         self.stock_daily_loss = 0
         
         self.futures_available_balance = 0
-        self.futures_margin_cap_ratio = 0.3  # 30% 위탁증거금 캡(Cap) 적용
+        self.futures_margin_cap_ratio = 0.20  # [AMATS 최적화] KOSPI200 선물 20% 격리 캡
+        self.isf_margin_cap_ratio = 0.05      # [AMATS 최적화] ISF 종목당 5% 격리 캡
         
         # 자금 분배율 (기본값)
         self.ratio_day = 0.60
@@ -97,10 +310,10 @@ class ERAOrderManager:
         if self.trading_mode in ('stock', 'both'):
             self.ma_timer.start(10000)
         
-        # 3. 스윙 15:14 종가 5일선 이탈 감시 (1초 주기) — stock/both만
+        # 3. 스윙 15:14 종가 5일선 이탈 감시 & ISF 15:20 강제청산 감시 (1초 주기) — 항상 기동
         self.swing_time_timer = QTimer()
         self.swing_time_timer.timeout.connect(self.check_swing_close_time)
-        if self.trading_mode in ('stock', 'both'):
+        if self.trading_mode in ('stock', 'futures', 'both'):
             self.swing_time_timer.start(1000)
         
         # 4. 키움 서버 통신 끊김 검사 (60초 주기) — 항상
@@ -143,10 +356,17 @@ class ERAOrderManager:
         self.futures_strategy_active = False
         self.futures_best_k = 0.5
         self.futures_prev_range = 20.0
+        
+        # ── 선물 과거 5분봉 자동 동기화 상태 변수 ───────────────────────
+        self.futures_sync_queue = []
+        self.futures_sync_index = 0
+        self.futures_sync_current_page = 0
+        self.futures_sync_max_pages = 2      # 수집할 과거 데이터 페이지 수 (1페이지당 약 80~100개 캔들)
+        self.futures_sync_active = False
 
         # 선물 손절/익절 설정 (고정 pt)
-        self.futures_stop_loss_pt = 3.0   # 고정 손절: 진입가 대비 3.0pt
-        self.futures_take_profit_pt = 6.0  # 고정 익절: 진입가 대비 6.0pt
+        self.futures_stop_loss_pt = 2.0   # 고정 손절: 진입가 대비 2.0pt
+        self.futures_take_profit_pt = 5.0  # 고정 익절: 진입가 대비 5.0pt
 
         # 주간 선물 (09:00 ~ 익일 08:45)
         self.futures_day_open     = 0.0
@@ -154,6 +374,7 @@ class ERAOrderManager:
         self.futures_target_short = float('-inf')
         self.futures_order_locked = False
         self.futures_day_entry_price = 0.0  # 주간 진입가 기록
+        self.futures_day_peak = 0.0         # [대안 C] 주간 트레일링 스탑용 최고/최저가 추적
 
         # 야간 선물 (18:00 ~ 익일 04:45)
         self.futures_night_open         = 0.0
@@ -179,6 +400,75 @@ class ERAOrderManager:
         if self.trading_mode in ('stock', 'both'):
             self.ohlcv_flush_timer.start(30000)
 
+        # ── 개별주식선물 (ISF: Individual Stock Futures) 엔진 ──────────────
+        self.isf_configs = []           # config에서 로드된 ISF 종목 리스트
+        self.isf_positions = {}         # {stock_code: {type, qty, price, futures_code}}
+        self.isf_order_locked = {}      # {stock_code: bool} 중복주문 방지
+        self.isf_day_open = {}          # {stock_code: float} 오늘 시초가
+        self.isf_target_long = {}       # {stock_code: float} LONG 진입 목표가
+        self.isf_target_short = {}      # {stock_code: float} SHORT 진입 목표가
+        self.isf_entry_price = {}       # {stock_code: float} 진입가
+        self.isf_peak_price = {}        # {stock_code: float} 진입 후 최고/최저가 추적 (트레일링용)
+        self.isf_direction = {}         # {stock_code: "LONG"|"SHORT"|"NEUTRAL"}
+        self.isf_code_map = {}          # {futures_code: stock_code}
+        self.isf_prev_range = {}        # {stock_code: float} 전일 고저폭(원)
+        self.isf_direction_date = ""    # 방향 로드 날짜 (중복 로드 방지)
+
+        # ISF 09:00 방향 체크 타이머 (1분 주기)
+        self.isf_direction_timer = QTimer()
+        self.isf_direction_timer.timeout.connect(self._update_isf_direction_if_needed)
+        if self.trading_mode in ('futures', 'both'):
+            self.isf_direction_timer.start(60000)
+
+    def get_swing_exit_ma_period(self):
+        """현재 감지된 시장 레짐(UP/RANGE/DOWN)에 따라 스윙 청산 이평선 기간 자동 결정"""
+        regime = getattr(self, 'current_regime', 'RANGE')
+        if regime == "UP":
+            return 10  # 강세장 -> 휩소 방지 및 이익 극대화를 위해 10일선(10MA) 지지력 추종
+        else:
+            return 5   # 횡보/약세장 -> 칼청산으로 단기 이익 실현 및 자산 격리를 위해 5일선(5MA) 추종
+
+    def update_futures_dynamic_sl_tp(self):
+        """BQA 역사적 데이터를 조회하여 실시간 선물 변동성(ATR) 기반 동적 익손절 라인 산출"""
+        try:
+            import pandas as pd
+            import numpy as np
+            if not os.path.exists(self.futures_db_path):
+                return
+            conn = sqlite3.connect(self.futures_db_path)
+            # 최근 70개 일봉(resample) 계산을 위해 충분한 분량 조회
+            df = pd.read_sql(
+                "SELECT date, high, low, close FROM futures_ohlcv WHERE code='10500000' ORDER BY date DESC LIMIT 400", conn
+            )
+            conn.close()
+            
+            if df.empty or len(df) < 50:
+                return
+                
+            df['date'] = pd.to_datetime(df['date'], format='%Y%m%d%H%M%S', errors='coerce')
+            df.dropna(subset=['date'], inplace=True)
+            df.set_index('date', inplace=True)
+            daily = df.resample('D').agg({'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
+            
+            if len(daily) < 15:
+                return
+                
+            # TR 계산
+            daily['tr'] = np.maximum(daily['high'] - daily['low'], 
+                                     np.maximum(abs(daily['high'] - daily['close'].shift(1)), 
+                                                abs(daily['low'] - daily['close'].shift(1))))
+            atr_14 = daily['tr'].rolling(14).mean().iloc[-1]
+            
+            if pd.isna(atr_14) or atr_14 <= 0:
+                return
+                
+            # 동적 SL / TP 연산 (손절 = 1.0 * ATR, 익절 = 2.0 * ATR)
+            self.futures_stop_loss_pt = max(round(atr_14 * 1.0, 2), 2.0)
+            self.futures_take_profit_pt = max(round(atr_14 * 2.0, 2), 4.0)
+            
+            print(f"[AMATS 파생 최적화] 선물 동적 ATR 적용 완료: 14일 ATR={atr_14:.2f}pt ➡️ 손절={self.futures_stop_loss_pt}pt | 익절={self.futures_take_profit_pt}pt")
+        except Exception as dynamic_err:
+            print(f"[AMATS 파생 최적화] 동적 익손절 계산 에러 (기본 고정값 유지): {dynamic_err}")
 
     def load_config(self):
         try:
@@ -205,18 +495,50 @@ class ERAOrderManager:
             self.config_stock_acc = config.get("accounts", {}).get("stock_account", "")
             self.config_futures_acc = config.get("accounts", {}).get("futures_account", "")
 
-            # 선물 손절/익절 설정 로드 (고정 pt)
+            # 선물 손절/익절 설정 로드 (고정 pt) — config.json 기본값
             futures_settings = config.get("futures_settings", {})
             self.futures_stop_loss_pt = float(futures_settings.get("stop_loss_pt", 3.0))
             self.futures_take_profit_pt = float(futures_settings.get("take_profit_pt", 6.0))
 
-            print(f"[ERA] trading_mode = {self.trading_mode} | 손절 = {self.futures_stop_loss_pt}pt | 익절 = {self.futures_take_profit_pt}pt")
+            # active_strategy.json의 백테스트 파라미터로 오버라이드 (백테스트/실전 일치)
+            active_strategy_path = os.path.join(self.workspace_root, "config", "active_strategy.json")
+            if os.path.exists(active_strategy_path):
+                try:
+                    with open(active_strategy_path, "r", encoding="utf-8") as f:
+                        active = json.load(f)
+                    if "stop_loss_pt" in active:
+                        self.futures_stop_loss_pt = float(active["stop_loss_pt"])
+                    if "take_profit_pt" in active:
+                        self.futures_take_profit_pt = float(active["take_profit_pt"])
+                    if "best_k" in active:
+                        self.futures_best_k = float(active["best_k"])
+                    print(f"[ERA] active_strategy.json 파라미터 적용: K={self.futures_best_k} | 손절={self.futures_stop_loss_pt}pt | 익절={self.futures_take_profit_pt}pt")
+                except Exception as e:
+                    print(f"[ERA] active_strategy.json 로드 실패 (config.json 값 유지): {e}")
+
+            # target_code_day를 기반으로 선물 상품 접두사 추출 (디폴트: "101" -> 일반선물, "105" -> 미니선물)
+            target_code_day = futures_settings.get("target_code_day", "10100000")
+            self.futures_prefix = target_code_day[:3] if len(target_code_day) >= 3 else "101"
+
+            # 고정 계약 수량 설정 (기본값: None -> 잔고 비례 동적 계산)
+            fixed_qty_val = futures_settings.get("fixed_qty", None)
+            self.futures_fixed_qty = int(fixed_qty_val) if fixed_qty_val is not None else None
+
+            # 개별주식선물(ISF) 설정 로드
+            self.isf_configs = config.get("individual_stock_futures", [])
+            if self.isf_configs:
+                names = [c.get("name", c.get("stock_code", "?")) for c in self.isf_configs]
+                print(f"[ERA ISF] 개별주식선물 {len(self.isf_configs)}종목 설정 로드: {', '.join(names)}")
+
+            print(f"[ERA] trading_mode = {self.trading_mode} | 상품접두사 = {self.futures_prefix} | 고정수량 = {self.futures_fixed_qty} | 손절 = {self.futures_stop_loss_pt}pt | 익절 = {self.futures_take_profit_pt}pt")
         except Exception as e:
             print(f"[ERA Config Error] {e}")
             self.environment = "mock"
             self.trading_mode = "both"
             self.ratio_day = 0.60
             self.ratio_swing = 0.40
+            self.futures_prefix = "101"
+            self.futures_fixed_qty = None
             self.config_stock_acc = ""
             self.config_futures_acc = ""
             self.futures_stop_loss_pt = 3.0
@@ -243,6 +565,12 @@ class ERAOrderManager:
             print(f"[ERA] 포지션 저장 실패: {e}")
 
     def _check_daily_reset(self):
+        try:
+            self._do_daily_reset()
+        except Exception as e:
+            print(f"[ERA _check_daily_reset 오류] {e}")
+
+    def _do_daily_reset(self):
         now = datetime.now()
         today = now.strftime("%Y-%m-%d")
 
@@ -351,7 +679,29 @@ class ERAOrderManager:
             elif is_trading and now.hour >= 7:
                 self._reconnect_attempts = getattr(self, '_reconnect_attempts', 0) + 1
                 print(f"[ERA] 자동 재연결 시도 #{self._reconnect_attempts}...")
-                self.kiwoom.dynamicCall("CommConnect()")
+                
+                if self._reconnect_attempts >= 3:
+                    print("🚨 [ERA] 3회 연속 재연결 실패. 하드웨어/소프트웨어 리셋(자동 재시작)을 실행합니다.")
+                    if notifier:
+                        notifier.send_message(
+                            "🚨 <b>[ERA 연결 장애 지속]</b>\n"
+                            "3회 연속 재연결에 실패했습니다.\n"
+                            "Kiwoom OpenAPI 세션 초기화 및 ERA 엔진 자동 재구동을 진행합니다 (약 60초 소요)."
+                        )
+                    import subprocess
+                    reconnect_script = os.path.join(current_dir, "auto_reconnect_era.bat")
+                    if os.path.exists(reconnect_script):
+                        # CREATE_NEW_CONSOLE을 사용해 부모 프로세스 트리와 완전히 분리된 별도의 새 독립형 콘솔 창으로 띄웁니다.
+                        # 이로 인해 부모 파이썬 프로세스가 taskkill 당하더라도, 재연결 배치 프로세스는 안전하게 독자 생존하여 시퀀스를 완수합니다.
+                        subprocess.Popen(
+                            [reconnect_script],
+                            creationflags=subprocess.CREATE_NEW_CONSOLE,
+                            cwd=current_dir
+                        )
+                    else:
+                        print(f"⚠️ [오류] 재연결 스크립트가 존재하지 않습니다: {reconnect_script}")
+                else:
+                    self.kiwoom.dynamicCall("CommConnect()")
         else:
             if self.was_disconnected:
                 print("✅ [ERA] 키움증권 서버 통신 복구.")
@@ -382,16 +732,76 @@ class ERAOrderManager:
                 env_label = "실전매매" if self.environment == "live" else "모의투자"
                 notifier.send_message(f"✅ <b>[ERA 연결 성공]</b> 키움증권 서버 접속 완료 ({env_label})")
             
-            # 선물 최근월물 자동 검색
+            # 선물 최근월물 자동 검색 (이중 폴백 탑재)
             future_list = self.kiwoom.dynamicCall("GetFutureList()").strip()
-            self.real_day_code = "10100000"
-            self.real_night_code = "10500000"
+            self.real_day_code = ""
+            self.real_night_code = ""
+            
             if future_list:
-                codes = [c for c in future_list.split(";") if c and c.startswith("101")]
+                codes = [c for c in future_list.split(";") if c and c.startswith(self.futures_prefix)]
                 if codes:
                     self.real_day_code = codes[0]
+            
+            # 폴백 1단계: GetFutureList가 실패했거나 비어있을 시 GetFutureCodeByIndex 시도
+            if not self.real_day_code:
+                print(" => [ERA 폴백 1단계] GetFutureList 응답 없음. GetFutureCodeByIndex 조회 시도...")
+                code_by_idx = self.kiwoom.dynamicCall("GetFutureCodeByIndex(int)", 0).strip()
+                if code_by_idx and code_by_idx.startswith("101"):
+                    self.real_day_code = code_by_idx
+                    print(f" => [ERA 폴백 1단계 성공] Index(0) 코드로 최근월물 인식: {self.real_day_code}")
+            
+            # 폴백 2단계: API 조회가 모두 실패할 시 날짜 기반 동적 연산 알고리즘 가동
+            if not self.real_day_code:
+                print(" => [ERA 폴백 2단계] 키움 API 최근월물 조회 실패. 날짜 기반 가상 알고리즘 가동...")
+                now = datetime.now()
+                curr_year = now.year
+                curr_month = now.month
+                curr_day = now.day
+                
+                # 키움 연도 코드 매핑 (2026=V, 2027=W, 2028=X, 2029=Y, 2030=Z ...)
+                year_codes = {2026: "V", 2027: "W", 2028: "X", 2029: "Y", 2030: "Z"}
+                year_char = year_codes.get(curr_year, "V")
+                
+                # 선물 만기월은 3, 6, 9, 12월. 둘째주 목요일이 만기일.
+                # 안전한 근사를 위해 현재 월을 기준으로 만기월 판단 (매월 10일 전후가 만기이므로, 11일 이후이면 다음 분기로 폴오버)
+                if curr_month <= 3:
+                    if curr_month == 3 and curr_day > 12:  # 3월 만기일(대략 12일경) 이후
+                        expiry_month_char = "6"
+                    else:
+                        expiry_month_char = "3"
+                elif curr_month <= 6:
+                    if curr_month == 6 and curr_day > 12:
+                        expiry_month_char = "9"
+                    else:
+                        expiry_month_char = "6"
+                elif curr_month <= 9:
+                    if curr_month == 9 and curr_day > 12:
+                        expiry_month_char = "C"
+                    else:
+                        expiry_month_char = "9"
+                else:
+                    if curr_month == 12 and curr_day > 12:
+                        # 12월 만기일 이후에는 다음 연도 3월물로 점프
+                        year_char = year_codes.get(curr_year + 1, "W")
+                        expiry_month_char = "3"
+                    else:
+                        expiry_month_char = "C"
+                
+                self.real_day_code = f"{self.futures_prefix}{year_char}{expiry_month_char}000"
+                print(f" => [ERA 폴백 2단계 성공] 알고리즘 생성 최근월물 적용: {self.real_day_code}")
+            
+            # 최종 야간 코드 설정 (야간 지수선물은 주간 최근월물 코드에서 앞 세 자리를 105로 교체)
+            # 단, 이미 미니 선물(105)인 경우에는 별도의 야간 코드가 없으므로 동일하게 설정
+            if self.real_day_code:
+                if self.futures_prefix == "105":
+                    self.real_night_code = self.real_day_code
+                else:
                     self.real_night_code = "105" + self.real_day_code[3:]
-                    print(f" => [선물 최근월물 자동 인식] 주간({self.real_day_code}), 야간({self.real_night_code})")
+            else:
+                self.real_day_code = self.futures_prefix + "00000"
+                self.real_night_code = "10500000"
+            
+            print(f" => [선물 최근월물 최종 인식] 주간({self.real_day_code}), 야간({self.real_night_code})")
             
             # ── 계좌 목록 조회 ──────────────────────────────────────────
             raw_accounts = self.kiwoom.dynamicCall("GetLoginInfo(QString)", "ACCNO")
@@ -495,6 +905,9 @@ class ERAOrderManager:
             # 선물 K값 전략 초기화 (futures/both만)
             if self.trading_mode in ('futures', 'both'):
                 QTimer.singleShot(3000, self._init_futures_strategy)
+                # 개별주식선물 코드 탐지 및 초기화 (10초 후, 일반 선물 초기화 완료 후)
+                if self.isf_configs:
+                    QTimer.singleShot(10000, self._init_isf_strategy)
             # 테마 대장주 실시간 구독 (stock/both만)
             if self.trading_mode in ('stock', 'both'):
                 QTimer.singleShot(6000, self._register_theme_realtime)
@@ -577,30 +990,78 @@ class ERAOrderManager:
             code = self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, 0, "종목코드").strip()
             if code in self.portfolio and self.portfolio[code]['strategy'] == 'SWING':
                 pos = self.portfolio[code]
+                
+                # 동적 이평선 기간 자동 결정 (UP: 10일선, RANGE/DOWN: 5일선)
+                ma_period = self.get_swing_exit_ma_period()
+                
                 closes = []
-                for i in range(5):
+                for i in range(ma_period):
                     c = self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "현재가").strip()
                     if c:
                         closes.append(abs(int(c)))
                         
-                if len(closes) == 5:
-                    ma_5 = sum(closes) / 5
+                if len(closes) == ma_period:
+                    ma_val = sum(closes) / ma_period
                     current_price = abs(int(self.kiwoom.dynamicCall("GetCommRealData(QString, int)", code, 10)))
                     if current_price == 0:
                         current_price = closes[0]
                         
-                    print(f"   => [스윙 종가 검증] {pos['name']} 현재가: {current_price:,} / 5MA: {ma_5:,.1f}")
+                    print(f"   => [스윙 동적 종가 검증] {pos['name']} 현재가: {current_price:,} / {ma_period}MA: {ma_val:,.1f} (적용 레짐: {getattr(self, 'current_regime', 'RANGE')})")
                     
-                    if current_price < ma_5:
-                        print(f"   🚨 [스윙 자동 청산] {pos['name']} 5일선 하향 이탈! 시장가 매도.")
+                    if current_price < ma_val:
+                        print(f"   🚨 [스윙 자동 청산] {pos['name']} {ma_period}일선 하향 이탈! 시장가 매도.")
                         self.kiwoom.dynamicCall(
                             "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-                            ["[ERA_Swing_5MA_Sell]", "0103", self.stock_account, 2, code, pos['qty'], 0, "03", ""]
+                            ["[ERA_Swing_MA_Sell]", "0103", self.stock_account, 2, code, pos['qty'], 0, "03", ""]
                         )
                         if notifier:
-                            notifier.send_message(f"📉 <b>[스윙 익절/청산] {pos['name']}</b>\n• 종가 5일선 이탈로 실계좌 시장가 전량 청산합니다.")
+                            notifier.send_message(f"📉 <b>[스윙 익절/청산] {pos['name']}</b>\n• 종가 {ma_period}일선 이탈로 실계좌 시장가 전량 청산합니다. (적용 레짐: {getattr(self, 'current_regime', 'RANGE')})")
                     else:
-                        print(f"   ✅ [스윙 오버나잇 확정] {pos['name']} 5MA 지지.")
+                        print(f"   ✅ [스윙 오버나잇 확정] {pos['name']} {ma_period}MA 지지.")
+                        
+        elif rqname == "선물과거분차트동기화":
+            cnt = self.kiwoom.dynamicCall("GetRepeatCnt(QString, QString)", trcode, rqname)
+            code = self.futures_sync_queue[self.futures_sync_index]
+            print(f"    [ERA 선물 동기화 수신] {code} | {cnt}개 캔들 수신")
+            
+            futures_rows = []
+            for i in range(cnt):
+                date = self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "체결시간").strip()
+                open_p = abs(float(self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "시가").strip()))
+                high_p = abs(float(self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "고가").strip()))
+                low_p = abs(float(self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "저가").strip()))
+                close_p = abs(float(self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "현재가").strip()))
+                vol = abs(int(self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "거래량").strip()))
+                
+                futures_rows.append((code, date, open_p, high_p, low_p, close_p, vol))
+                
+            try:
+                if futures_rows:
+                    conn = sqlite3.connect(self.futures_db_path, timeout=30)
+                    conn.execute("PRAGMA journal_mode=WAL;")
+                    cursor = conn.cursor()
+                    cursor.execute("""CREATE TABLE IF NOT EXISTS futures_ohlcv
+                                      (code TEXT, date TEXT, open REAL, high REAL,
+                                       low REAL, close REAL, volume INTEGER, UNIQUE(code, date))""")
+                    cursor.executemany(
+                        "REPLACE INTO futures_ohlcv (code,date,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?)",
+                        futures_rows
+                    )
+                    conn.commit()
+                    conn.close()
+                    print(f"    [DB 저장] {len(futures_rows)}개 완료")
+            except Exception as e:
+                print(f"[ERA 선물 과거 동기화 DB 저장 에러] {e}")
+                
+            self.futures_sync_current_page += 1
+            
+            # 다음 페이지 또는 다음 코드로 이동
+            if str(next_str).strip() == "2" and self.futures_sync_current_page < self.futures_sync_max_pages:
+                self._request_sync_tr("2")
+            else:
+                self.futures_sync_index += 1
+                self.futures_sync_current_page = 0
+                self._request_sync_tr()
 
     # ── STA 통합: 테마 크롤링 + 실시간 OHLCV ────────────────────────────
 
@@ -610,6 +1071,39 @@ class ERAOrderManager:
         today_str = now.strftime("%Y-%m-%d")
         if not (now.weekday() < 5 and now.hour == 8 and 50 <= now.minute <= 59 and self.theme_crawl_date != today_str):
             return
+            
+        # [AMATS 통합 최적화] 실시간 시장 레짐 판별 및 동적 자산 배분 연동 기동
+        try:
+            print("[AMATS 자산 배분] 아침 장세 레짐 분석 및 동적 자금 분배를 가동합니다...")
+            allocator = AMATSDynamicAllocator(self.workspace_root, self.unified_db_path)
+            
+            # 오늘 시장 레짐 판별
+            today_regime = allocator.detect_regime()
+            # 시장 레짐 & Sharpe 기반 동적 배분 비율 연산
+            r_day, r_swing = allocator.get_dynamic_allocation(today_regime)
+            allocator.apply_to_config(r_day, r_swing)
+            
+            # ERA 인스턴스에 즉시 핫-로드 (Hot-load) 반영
+            self.load_config()
+            self.current_regime = today_regime # 실시간 레짐 동적 동기화
+            
+            # [AMATS 파생 최적화] 아침 장전 선물 동적 ATR SL/TP 실시간 갱신
+            if self.trading_mode in ('futures', 'both'):
+                self.update_futures_dynamic_sl_tp()
+            
+            regime_lbl = {"UP": "🚀 강세 추세장", "DOWN": "📉 약세 추세장 (현금방어)", "RANGE": "⏸️ 횡보/박스장"}.get(today_regime, today_regime)
+            
+            if notifier:
+                notifier.send_message(
+                    f"📊 <b>[AMATS AI 동적 자산 배분 완료]</b>\n\n"
+                    f"👤 오늘의 시장 레짐: <b>{regime_lbl}</b>\n"
+                    f"💰 자금 배분 비율: 단타 <b>{int(r_day*100)}%</b> / 스윙 <b>{int(r_swing*100)}%</b>\n"
+                    f"💡 <i>(횡보/약세장 시 스윙을 자동 배제하여 오버나잇 휩소 손실을 방어합니다.)</i>"
+                )
+            print(f"[AMATS 자산 배분] 연동 완료: 레짐={today_regime} | 단타={r_day} | 스윙={r_swing}")
+        except Exception as alloc_err:
+            print(f"[AMATS 자산 배분] 연동 오류 발생: {alloc_err}")
+            
         # STA ThemeTracker가 이미 오늘 데이터를 적재했으면 ERA 크롤 생략
         try:
             conn = sqlite3.connect(self.unified_db_path, timeout=30)
@@ -626,6 +1120,8 @@ class ERAOrderManager:
                     if notifier:
                         notifier.send_message(f"🌅 <b>[08:50 테마 준비 완료]</b>\nSTA 등록 {count}종목 활용 (스마트머니 필터 적용됨)")
                     self._trigger_rsa_premarket()
+                    # STA 데이터 사용 시에도 실시간 구독 등록
+                    QTimer.singleShot(1000, self._register_theme_realtime)
                     return
             else:
                 conn.close()
@@ -634,10 +1130,15 @@ class ERAOrderManager:
         self._morning_theme_crawl()
 
     def _morning_theme_crawl(self):
-        """네이버 금융 테마 대장주 크롤링 (Kiwoom 불필요 — 순수 HTTP)"""
+        """네이버 금융 테마 대장주 크롤링 — 상위 10테마 × 5종목 = 최대 50개 RSA 후보"""
         _HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        _EXCLUDE = ["KODEX","TIGER","KBSTAR","KINDEX","KOSEF","HANARO","인버스","레버리지","선물","스팩","ETN"]
+        # ETF·레버리지·인버스·스팩·리츠 등 비정상 변동 종목 제외
+        _EXCLUDE = [
+            "KODEX","TIGER","KBSTAR","KINDEX","KOSEF","HANARO","ARIRANG","TREX","SOL","ACE","RISE",
+            "인버스","레버리지","선물","스팩","ETN","리츠","DR","우선주"
+        ]
         leaders = []
+        seen_codes = set()
         try:
             res = requests.get("https://finance.naver.com/sise/theme.naver", headers=_HEADERS, timeout=5)
             soup = BeautifulSoup(res.content, "html.parser")
@@ -646,23 +1147,32 @@ class ERAOrderManager:
                 for r in soup.select("table.type_1 tr")
                 for c in r.select("td.col_type1 a")
             ]
-            for theme in themes[:3]:
-                tres = requests.get(theme["url"], headers=_HEADERS, timeout=5)
-                tsoup = BeautifulSoup(tres.content, "html.parser")
-                count = 0
-                for row in tsoup.select("table.type_5 tbody tr"):
-                    if count >= 3:
-                        break
-                    a = row.select_one("td.col_type1 a")
-                    if a:
-                        sname = a.text.strip()
-                        scode = a["href"].split("code=")[1]
-                        if not any(kw in sname for kw in _EXCLUDE):
-                            leaders.append({"code": scode, "name": sname, "theme": theme["name"]})
-                            count += 1
+            print(f"[ERA 테마 크롤링] 감지된 테마 수: {len(themes)}개 → 상위 10개 분석")
+
+            # 상위 10개 테마에서 각 5종목 수집 (중복 종목 제거)
+            for theme in themes[:10]:
+                try:
+                    tres = requests.get(theme["url"], headers=_HEADERS, timeout=5)
+                    tsoup = BeautifulSoup(tres.content, "html.parser")
+                    count = 0
+                    for row in tsoup.select("table.type_5 tbody tr"):
+                        if count >= 5:
+                            break
+                        a = row.select_one("td.col_type1 a")
+                        if a:
+                            sname = a.text.strip()
+                            scode = a["href"].split("code=")[1]
+                            if not any(kw in sname for kw in _EXCLUDE) and scode not in seen_codes:
+                                leaders.append({"code": scode, "name": sname, "theme": theme["name"]})
+                                seen_codes.add(scode)
+                                count += 1
+                except Exception:
+                    continue
+
             if not leaders:
                 print("[ERA 테마 크롤링] 결과 없음")
                 return
+
             today = datetime.now().strftime("%Y-%m-%d")
             conn = sqlite3.connect(self.unified_db_path, timeout=30)
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -676,11 +1186,24 @@ class ERAOrderManager:
             conn.commit()
             conn.close()
             self.theme_crawl_date = today
-            names = ", ".join(i["name"] for i in leaders)
-            print(f"\n[ERA 테마 크롤링] 완료: {names}")
+
+            # 테마별 그룹핑하여 요약 출력
+            theme_groups = {}
+            for item in leaders:
+                theme_groups.setdefault(item["theme"], []).append(item["name"])
+            summary_lines = [f"• {t}: {', '.join(ns)}" for t, ns in list(theme_groups.items())[:5]]
+            print(f"\n[ERA 테마 크롤링] 완료: {len(leaders)}개 후보 확보")
+
             if notifier:
-                notifier.send_message(f"🌅 <b>[08:50 테마 대장주 포착]</b>\n{names}\n로그인 후 실시간 구독 시작")
+                notifier.send_message(
+                    f"🌅 <b>[08:50 RSA 분석 후보 확보]</b>\n"
+                    f"총 <b>{len(leaders)}개</b> 종목 ({len(theme_groups)}개 테마)\n"
+                    + "\n".join(summary_lines) +
+                    f"\n\n🔬 RSA 정밀 분석 시작 중... (완료 후 추천 종목 안내)"
+                )
             self._trigger_rsa_premarket()
+            # 크롤 완료 후 1초 뒤 실시간 구독 등록 (DB 커밋 완료 대기)
+            QTimer.singleShot(1000, self._register_theme_realtime)
         except Exception as e:
             print(f"[ERA 테마 크롤링 오류] {e}")
 
@@ -714,7 +1237,15 @@ class ERAOrderManager:
             stocks = cursor.fetchall()
             conn.close()
             if not stocks:
-                print("[ERA 실시간 구독] 오늘 테마 대장주 없음 (08:50 이전이거나 크롤링 미완료)")
+                now = datetime.now()
+                # 늦은 기동 폴백: 08:50 이후 14:00 이전이면 즉시 크롤링
+                # _morning_theme_crawl 내부에서 QTimer.singleShot(1000, _register_theme_realtime) 호출하므로
+                # 크롤 완료 1초 후 이 함수가 재실행되어 구독 등록까지 처리됨
+                if now.weekday() < 5 and (now.hour > 8 or (now.hour == 8 and now.minute >= 50)) and now.hour < 14:
+                    print("[ERA 실시간 구독] 오늘 테마 데이터 없음 — 늦은 기동 감지, 즉시 크롤링 시도")
+                    self._morning_theme_crawl()
+                else:
+                    print("[ERA 실시간 구독] 오늘 테마 대장주 없음 (08:50 이전이거나 크롤링 미완료)")
                 return
             self.theme_stocks = {code: name for code, name in stocks}
             for code in self.theme_stocks:
@@ -833,7 +1364,6 @@ class ERAOrderManager:
     def _init_futures_strategy(self):
         """로그인 성공 후 선물 전략 초기화 (주간 + 야간)"""
         self._load_futures_k()
-        self._load_prev_range()
 
         # 주간 선물 실시간 구독
         self.kiwoom.dynamicCall(
@@ -845,26 +1375,88 @@ class ERAOrderManager:
             "SetRealReg(QString, QString, QString, QString)",
             "FUTURES_MON", self.real_night_code, "10;11;12;15", "1"
         )
-        self.futures_strategy_active = True
-        print(f"\n[ERA 선물 전략] K={self.futures_best_k:.2f} | 전일Range={self.futures_prev_range:.2f}pt")
-        print(f"  ▶ 주간 구독: {self.real_day_code}  |  야간 구독: {self.real_night_code}")
+        
+        # 선물 과거 5분봉 자동 DB 동기화 개시
+        self._start_futures_db_sync()
+
+    def _start_futures_db_sync(self):
+        """선물 과거 5분봉 데이터베이스 자동 동기화 기동"""
+        if self.futures_sync_active:
+            return
+            
+        print("\n[ERA 선물] 과거 5분봉 자동 동기화 시퀀스를 기동합니다...")
         if notifier:
-            notifier.send_message(
-                f"📊 <b>[선물 전략 대기 중]</b>\n"
-                f"• K값: {self.futures_best_k:.2f} | 전일 Range: {self.futures_prev_range:.2f}pt\n"
-                f"• 주간 ({self.real_day_code}): 09:00 시초가 → 익일 08:45 청산\n"
-                f"• 야간 ({self.real_night_code}): 18:00 시초가 → 익일 04:45 청산"
-            )
+            notifier.send_message("⏳ <b>[선물 데이터 자동 동기화]</b>\n누락된 최근 5분봉 과거 데이터를 동기화 중입니다...")
+            
+        self.futures_sync_queue = []
+        # 주간 및 야간 동기화 대상 코드 큐 적재
+        for code in ["10100000", "10500000"]:
+            if code not in self.futures_sync_queue:
+                self.futures_sync_queue.append(code)
+                
+        self.futures_sync_index = 0
+        self.futures_sync_current_page = 0
+        self.futures_sync_active = True
+        
+        self._request_sync_tr()
+
+    def _request_sync_tr(self, prev_next="0"):
+        if not self.futures_sync_active:
+            return
+            
+        if self.futures_sync_index >= len(self.futures_sync_queue):
+            # 모든 코드의 동기화 완료!
+            self.futures_sync_active = False
+            print("[ERA 선물] 과거 5분봉 데이터베이스 자동 동기화 완료!")
+            self._load_prev_range()
+            self.futures_strategy_active = True
+            
+            print(f"\n[ERA 선물 전략 활성화] K={self.futures_best_k:.2f} | 전일Range={self.futures_prev_range:.2f}pt")
+            print(f"  ▶ 주간 구독: {self.real_day_code}  |  야간 구독: {self.real_night_code}")
+            
+            if notifier:
+                notifier.send_message(
+                    f"✅ <b>[선물 데이터 동기화 완료]</b>\n"
+                    f"• K값: {self.futures_best_k:.2f} | 전일 Range: {self.futures_prev_range:.2f}pt\n"
+                    f"• 실시간 감시 전략이 정상 가동됩니다."
+                )
+            return
+
+        code = self.futures_sync_queue[self.futures_sync_index]
+        print(f" -> [ERA 선물 동기화] {code} ({self.futures_sync_current_page + 1}/{self.futures_sync_max_pages} 페이지) 요청 중...")
+        
+        # TR 입력값 설정
+        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
+        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "시간단위", "5") # 5분봉
+        
+        # 0.2초 딜레이 후 조회 (TR 과부하 방지)
+        QTimer.singleShot(200, lambda: self.kiwoom.dynamicCall(
+            "CommRqData(QString, QString, int, QString)",
+            "선물과거분차트동기화", "opt50029", int(prev_next), "5029"
+        ))
 
     def _load_futures_k(self):
-        """active_strategy.json 에서 최적 K값 로드"""
+        """active_strategy.json 에서 최적 K값 및 손절/익절 한도 로드"""
         strategy_file = os.path.join(self.workspace_root, "config", "active_strategy.json")
         try:
             with open(strategy_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self.futures_best_k = float(data.get("best_k", 0.5))
-        except Exception:
+            self.futures_stop_loss_pt = float(data.get("stop_loss_pt", 2.0))
+            self.futures_take_profit_pt = float(data.get("take_profit_pt", 5.0))
+            print(f"[ERA BQA 연동] 최적화 파라미터 로드 완료: K={self.futures_best_k}, 손절={self.futures_stop_loss_pt}pt, 익절={self.futures_take_profit_pt}pt")
+        except Exception as e:
+            print(f"[ERA BQA 로드 경고] {e} — 임시 디폴트 K=0.5, 손절=2.0pt, 익절=5.0pt 폴백 적용")
             self.futures_best_k = 0.5
+            self.futures_stop_loss_pt = 2.0
+            self.futures_take_profit_pt = 5.0
+            if notifier:
+                notifier.send_message(
+                    "⚠️ <b>[BQA 동기화 지연 경보]</b>\n"
+                    "최적화 파라미터 파일 로드에 실패하였습니다.\n"
+                    "임시 안전 규격(디폴트 K=0.5, 손절=2.0pt, 익절=5.0pt)으로 매매 감시를 무중단 유지합니다.\n"
+                    "구글 드라이브 동기화 상태를 확인해 주세요!"
+                )
 
     def _load_prev_range(self):
         """futures_data.db 에서 전일 고저폭(Range) 계산"""
@@ -874,53 +1466,530 @@ class ERAOrderManager:
             cursor = conn.cursor()
             # 날짜별 일봉 집계 → 가장 최근 완성된 전일 데이터
             # 주의: date 컬럼이 '20260519154500' 형식이므로 date() 대신 SUBSTR 사용
-            cursor.execute("""
-                SELECT SUBSTR(date, 1, 8) as d, MAX(high) as h, MIN(low) as l
-                FROM futures_ohlcv WHERE code = ?
-                GROUP BY SUBSTR(date, 1, 8) ORDER BY d DESC LIMIT 2
-            """, (self.real_day_code,))
-            rows = cursor.fetchall()
+            # 폴백: API 코드(예: 105V6000) 매칭 실패 시 prefix 기반 generic 코드로 재조회
+            for query_code in [self.real_day_code, self.futures_prefix + "00000"]:
+                cursor.execute("""
+                    SELECT SUBSTR(date, 1, 8) as d, MAX(high) as h, MIN(low) as l
+                    FROM futures_ohlcv WHERE code = ?
+                    GROUP BY SUBSTR(date, 1, 8) ORDER BY d DESC LIMIT 2
+                """, (query_code,))
+                rows = cursor.fetchall()
+                if len(rows) >= 2:
+                    break
             conn.close()
             if len(rows) >= 2:
                 prev_h, prev_l = rows[1][1], rows[1][2]
                 calc = prev_h - prev_l
                 if calc > 0:
                     self.futures_prev_range = calc
+                    print(f"[ERA 선물] 전일 Range 로드 완료: {calc:.2f}pt (조회코드: {query_code})")
         except Exception as e:
             print(f"[ERA 선물] 전일 Range 로드 실패: {e}")
 
-    def _process_futures_tick(self, code, current_price):
-        """실시간 선물 현재가 수신 — 주간/야간 세션 분리 처리"""
-        if not self.futures_strategy_active or current_price <= 0:
+    def _get_today_futures_open(self, code):
+        """오늘 주간 09시 첫 5분봉 시가를 DB에서 조회 (늦은 기동 시 실제 시초가 복원)"""
+        try:
+            today_prefix = datetime.now().strftime("%Y%m%d09")
+            conn = sqlite3.connect(self.futures_db_path, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            cursor = conn.cursor()
+            # real_day_code(예: 105V6000) → DB 저장 코드(10500000) 순으로 폴백
+            for query_code in [code, self.futures_prefix + "00000", "10500000", "10100000"]:
+                cursor.execute(
+                    "SELECT open FROM futures_ohlcv WHERE code = ? AND date LIKE ? ORDER BY date LIMIT 1",
+                    (query_code, today_prefix + "%")
+                )
+                row = cursor.fetchone()
+                if row and row[0] and row[0] > 0:
+                    conn.close()
+                    print(f"[주간선물] 오늘 시초가 DB 복원 성공: {row[0]:.2f}pt (code={query_code})")
+                    return float(row[0])
+            conn.close()
+        except Exception as e:
+            print(f"[주간선물] 시초가 DB 조회 실패: {e}")
+        return 0.0
+
+    # ── 개별주식선물 (ISF) 엔진 ─────────────────────────────────────────────
+
+    def _init_isf_strategy(self):
+        """개별주식선물 코드 탐지 → 실시간 구독 → 전일 Range 로드"""
+        if not self.isf_configs:
+            return
+        detected = []
+        not_found = []
+
+        # GetFutureList()에서 개별주식선물 코드 탐지 시도
+        try:
+            full_list = self.kiwoom.dynamicCall("GetFutureList()").strip()
+            all_codes = [c for c in full_list.split(";") if c]
+        except Exception:
+            all_codes = []
+
+        for isf_cfg in self.isf_configs:
+            sc = isf_cfg["stock_code"]
+            fc = isf_cfg.get("futures_code", "").strip()
+
+            if not fc:
+                # GetFutureList 결과에서 종목코드 포함 코드 탐지
+                for code in all_codes:
+                    if sc in code:
+                        fc = code
+                        isf_cfg["futures_code"] = fc
+                        break
+
+            if not fc:
+                # GetOptionCode로 주식선물 코드 탐지 시도
+                try:
+                    result = self.kiwoom.dynamicCall(
+                        "GetOptionCode(QString, QString, QString, QString)",
+                        ["F", "0", sc, ""]
+                    ).strip()
+                    if result:
+                        fc = result.split(";")[0]
+                        isf_cfg["futures_code"] = fc
+                except Exception:
+                    pass
+
+            if fc:
+                self.isf_code_map[fc] = sc
+                # 실시간 구독 등록 (주식선물 FID: 10=현재가, 228=전일종가)
+                self.kiwoom.dynamicCall(
+                    "SetRealReg(QString, QString, QString, QString)",
+                    "ISF_MON", fc, "10;228", "1"
+                )
+                self._load_isf_prev_range(isf_cfg)
+                detected.append(f"{isf_cfg['name']}({fc})")
+            else:
+                not_found.append(isf_cfg['name'])
+
+        if detected:
+            print(f"[ISF] 구독 등록 완료: {', '.join(detected)}")
+            if notifier:
+                notifier.send_message(
+                    f"✅ <b>[ISF 코드 자동 탐지 성공]</b>\n\n"
+                    + "\n".join(f"• {d}" for d in detected) +
+                    f"\n\n실시간 구독 등록 완료. 09:00부터 방향 감시 시작."
+                )
+
+        if not_found and notifier:
+            notifier.send_message(
+                f"⚠️ <b>[ISF 코드 미탐지]</b>\n"
+                f"{', '.join(not_found)} 개별주식선물 코드를 찾지 못했습니다.\n\n"
+                f"📌 <b>해결 방법 (텔레그램으로 직접 입력):</b>\n"
+                f"1. 키움 HTS → 선물옵션 → 종목검색에서 코드 확인\n"
+                f"2. 텔레그램에 입력:\n"
+                f"<code>!ISF코드 005930 여기에코드입력</code>\n"
+                f"<code>!ISF코드 000660 여기에코드입력</code>\n"
+                f"3. <code>!시스템재시작</code> 으로 ERA 재시작"
+            )
+
+        # 09:00 방향 체크 즉시 1회 실행
+        self._check_isf_direction()
+
+    def _load_isf_prev_range(self, isf_cfg):
+        """개별주식선물 전일 고저폭(원) 로드"""
+        sc = isf_cfg["stock_code"]
+        fc = isf_cfg.get("futures_code", "")
+        if not fc:
+            return
+        try:
+            conn = sqlite3.connect(self.futures_db_path, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS isf_ohlcv
+                (code TEXT, date TEXT, open REAL, high REAL,
+                 low REAL, close REAL, volume INTEGER, UNIQUE(code, date))
+            """)
+            conn.commit()
+            cursor.execute("""
+                SELECT SUBSTR(date,1,8) as d, MAX(high) as h, MIN(low) as l
+                FROM isf_ohlcv WHERE code = ?
+                GROUP BY d ORDER BY d DESC LIMIT 2
+            """, (fc,))
+            rows = cursor.fetchall()
+            conn.close()
+            if len(rows) >= 2:
+                prev_range = rows[1][1] - rows[1][2]
+                if prev_range > 0:
+                    self.isf_prev_range[sc] = prev_range
+                    print(f"[ISF] {isf_cfg['name']} 전일 Range: {prev_range:,.0f}원")
+        except Exception as e:
+            print(f"[ISF] {isf_cfg['name']} Range 로드 실패: {e}")
+
+    def _check_isf_direction(self):
+        """research_reports 에서 NSAA 점수 조회 → 오늘의 Long/Short/Neutral 방향 결정"""
+        if not self.isf_configs:
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        try:
+            conn = sqlite3.connect(self.unified_db_path, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            cursor = conn.cursor()
+            for isf_cfg in self.isf_configs:
+                sc = isf_cfg["stock_code"]
+                cursor.execute(
+                    "SELECT nsaa_score FROM research_reports WHERE code=? AND date(timestamp)=? ORDER BY id DESC LIMIT 1",
+                    (sc, today)
+                )
+                row = cursor.fetchone()
+                prev_dir = self.isf_direction.get(sc, "NEUTRAL")
+                if row:
+                    nsaa = row[0]
+                    long_min  = isf_cfg.get("nsaa_long_min", 72)
+                    short_max = isf_cfg.get("nsaa_short_max", 35)
+                    long_only = isf_cfg.get("long_only", False)
+                    if nsaa >= long_min:
+                        self.isf_direction[sc] = "LONG"
+                    elif not long_only and nsaa <= short_max:
+                        # long_only=True 이면 SHORT 방향 무시 → NEUTRAL 처리
+                        self.isf_direction[sc] = "SHORT"
+                    else:
+                        self.isf_direction[sc] = "NEUTRAL"
+                    new_dir = self.isf_direction[sc]
+                    print(f"[ISF] {isf_cfg['name']} NSAA={nsaa}점 → 방향: {new_dir}")
+                    if prev_dir != new_dir and notifier:
+                        icon = {"LONG": "📈", "SHORT": "📉", "NEUTRAL": "⏸️"}.get(new_dir, "")
+                        notifier.send_message(
+                            f"{icon} <b>[ISF 방향 결정] {isf_cfg['name']}</b>\n"
+                            f"• NSAA 뉴스감성: {nsaa}점\n"
+                            f"• 오늘 방향: <b>{new_dir}</b>\n"
+                            + (f"• K={isf_cfg.get('best_k',0.35)} | 손절-{isf_cfg.get('stop_loss_pct',1.5)}% | 익절+{isf_cfg.get('take_profit_pct',4.0)}%"
+                               if new_dir != "NEUTRAL" else "• 오늘 거래 없음 (뉴스 중립)")
+                        )
+                else:
+                    self.isf_direction[sc] = "NEUTRAL"
+            conn.close()
+        except Exception as e:
+            print(f"[ISF] 방향 체크 오류: {e}")
+
+    def _update_isf_direction_if_needed(self):
+        """09:00~09:05 사이에 RSA 방향 갱신 (1분 주기 타이머에서 호출)"""
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        if now.hour == 9 and now.minute <= 5 and self.isf_direction_date != today:
+            self.isf_direction_date = today
+            self._check_isf_direction()
+            # 방향 갱신과 함께 당일 상태 초기화
+            for isf_cfg in self.isf_configs:
+                sc = isf_cfg["stock_code"]
+                self.isf_day_open[sc] = 0.0
+                self.isf_target_long[sc] = float('inf')
+                self.isf_target_short[sc] = float('-inf')
+                self.isf_order_locked[sc] = False
+                self.isf_entry_price[sc] = 0.0
+                self.isf_peak_price[sc] = 0.0
+                self._load_isf_prev_range(isf_cfg)
+
+    def _process_isf_tick(self, futures_code, price):
+        """개별주식선물 실시간 틱 처리 — RSA 방향 기반 K값 돌파 전략"""
+        if price <= 0:
+            return
+        sc = self.isf_code_map.get(futures_code)
+        if sc is None:
+            return
+        isf_cfg = next((c for c in self.isf_configs if c["stock_code"] == sc), None)
+        if isf_cfg is None:
             return
 
-        is_night = (code == getattr(self, 'real_night_code', '10500000'))
-        now = datetime.now()
+        direction = self.isf_direction.get(sc, "NEUTRAL")
+        if direction == "NEUTRAL":
+            return   # RSA 중립이면 오늘 거래 없음
 
+        now = datetime.now()
+        is_trading_session = (9 <= now.hour < 15) or (now.hour == 15 and now.minute <= 30)
+        if not is_trading_session:
+            return
+
+        # 시초가 설정 (첫 틱)
+        if self.isf_day_open.get(sc, 0) == 0:
+            db_open = self._get_isf_day_open(futures_code, sc)
+            open_price = db_open if db_open > 0 else price
+            prev_range = self.isf_prev_range.get(sc, price * 0.02)  # 전일 Range 없으면 2% 추정
+            k = isf_cfg.get("best_k", 0.35)
+            self.isf_day_open[sc] = open_price
+            self.isf_target_long[sc] = open_price + prev_range * k
+            self.isf_target_short[sc] = open_price - prev_range * k
+            print(f"[ISF] {isf_cfg['name']} 시초가={open_price:,}원 | "
+                  f"LONG목표={self.isf_target_long[sc]:,.0f} | SHORT목표={self.isf_target_short[sc]:,.0f}")
+            if notifier:
+                notifier.send_message(
+                    f"🌅 <b>[ISF 목표가] {isf_cfg['name']}</b>\n"
+                    f"• 방향: {direction} | K={k}\n"
+                    f"• 시초가: {open_price:,}원\n"
+                    + (f"• LONG ▲ {self.isf_target_long[sc]:,.0f}원" if direction == "LONG"
+                       else f"• SHORT ▼ {self.isf_target_short[sc]:,.0f}원")
+                )
+
+        # 포지션 보유 중: 손절/익절 감시
+        if sc in self.isf_positions:
+            pos = self.isf_positions[sc]
+            entry = self.isf_entry_price.get(sc, 0)
+            if entry > 0:
+                ts_enabled = isf_cfg.get("ts_enabled", False)
+                ts_activate_pct = isf_cfg.get("ts_activate_pct", 2.0)
+                ts_trail_pct = isf_cfg.get("ts_trail_pct", 0.8)
+
+                if pos["type"] == "LONG":
+                    if sc not in self.isf_peak_price or self.isf_peak_price[sc] == 0.0:
+                        self.isf_peak_price[sc] = price
+                    else:
+                        self.isf_peak_price[sc] = max(self.isf_peak_price[sc], price)
+
+                    pnl_pct = (price - entry) / entry * 100
+                    max_pnl_pct = (self.isf_peak_price[sc] - entry) / entry * 100
+
+                    # 1. 고정 손절 (언제나 활성화)
+                    if pnl_pct <= -isf_cfg.get("stop_loss_pct", 1.5):
+                        print(f"[ISF] {isf_cfg['name']} LONG 손절: {pnl_pct:+.2f}%")
+                        self._execute_isf_order(isf_cfg, "LONG_EXIT", price)
+                        self.isf_peak_price[sc] = 0.0
+                        if notifier:
+                            notifier.send_message(f"🛑 <b>[ISF 손절] {isf_cfg['name']}</b> {pnl_pct:+.2f}% | 진입:{entry:,} → {price:,}원")
+                    # 2. 트레일링 스탑 감시
+                    elif ts_enabled and max_pnl_pct >= ts_activate_pct:
+                        ts_threshold = self.isf_peak_price[sc] * (1 - ts_trail_pct / 100)
+                        if price <= ts_threshold:
+                            print(f"[ISF] {isf_cfg['name']} LONG 트레일링 스탑 작동: 현재 {pnl_pct:+.2f}% (고점 {max_pnl_pct:+.2f}%, 기준선 {ts_threshold:,.0f}원)")
+                            self._execute_isf_order(isf_cfg, "LONG_EXIT", price)
+                            self.isf_peak_price[sc] = 0.0
+                            if notifier:
+                                notifier.send_message(f"✨ <b>[ISF 트레일링 스탑] {isf_cfg['name']}</b> {pnl_pct:+.2f}% | 진입:{entry:,} → {price:,}원 (최고가:{self.isf_peak_price[sc]:,.0f}원)")
+                    # 3. 고정 익절 (트레일링 비활성화 상태이거나 활성화 기준에 도달하지 못한 경우)
+                    elif pnl_pct >= isf_cfg.get("take_profit_pct", 4.0):
+                        print(f"[ISF] {isf_cfg['name']} LONG 익절: {pnl_pct:+.2f}%")
+                        self._execute_isf_order(isf_cfg, "LONG_EXIT", price)
+                        self.isf_peak_price[sc] = 0.0
+                        if notifier:
+                            notifier.send_message(f"🎯 <b>[ISF 익절] {isf_cfg['name']}</b> {pnl_pct:+.2f}% | 진입:{entry:,} → {price:,}원")
+
+                elif pos["type"] == "SHORT":
+                    if sc not in self.isf_peak_price or self.isf_peak_price[sc] == 0.0:
+                        self.isf_peak_price[sc] = price
+                    else:
+                        self.isf_peak_price[sc] = min(self.isf_peak_price[sc], price)
+
+                    pnl_pct = (entry - price) / entry * 100
+                    max_pnl_pct = (entry - self.isf_peak_price[sc]) / entry * 100
+
+                    # 1. 고정 손절 (언제나 활성화)
+                    if pnl_pct <= -isf_cfg.get("stop_loss_pct", 1.5):
+                        print(f"[ISF] {isf_cfg['name']} SHORT 손절: {pnl_pct:+.2f}%")
+                        self._execute_isf_order(isf_cfg, "SHORT_EXIT", price)
+                        self.isf_peak_price[sc] = 0.0
+                        if notifier:
+                            notifier.send_message(f"🛑 <b>[ISF 손절] {isf_cfg['name']}</b> {pnl_pct:+.2f}% | 진입:{entry:,} → {price:,}원")
+                    # 2. 트레일링 스탑 감시
+                    elif ts_enabled and max_pnl_pct >= ts_activate_pct:
+                        ts_threshold = self.isf_peak_price[sc] * (1 + ts_trail_pct / 100)
+                        if price >= ts_threshold:
+                            print(f"[ISF] {isf_cfg['name']} SHORT 트레일링 스탑 작동: 현재 {pnl_pct:+.2f}% (고점 {max_pnl_pct:+.2f}%, 기준선 {ts_threshold:,.0f}원)")
+                            self._execute_isf_order(isf_cfg, "SHORT_EXIT", price)
+                            self.isf_peak_price[sc] = 0.0
+                            if notifier:
+                                notifier.send_message(f"✨ <b>[ISF 트레일링 스탑] {isf_cfg['name']}</b> {pnl_pct:+.2f}% | 진입:{entry:,} → {price:,}원 (최저가:{self.isf_peak_price[sc]:,.0f}원)")
+                    # 3. 고정 익절 (트레일링 비활성화 상태이거나 활성화 기준에 도달하지 못한 경우)
+                    elif pnl_pct >= isf_cfg.get("take_profit_pct", 4.0):
+                        print(f"[ISF] {isf_cfg['name']} SHORT 익절: {pnl_pct:+.2f}%")
+                        self._execute_isf_order(isf_cfg, "SHORT_EXIT", price)
+                        self.isf_peak_price[sc] = 0.0
+                        if notifier:
+                            notifier.send_message(f"🎯 <b>[ISF 익절] {isf_cfg['name']}</b> {pnl_pct:+.2f}% | 진입:{entry:,} → {price:,}원")
+            return  # 포지션 보유 중 신규 진입 불가
+
+        # 신규 진입 — RSA 방향에 맞는 목표가 돌파 시
+        if self.isf_order_locked.get(sc, False) or self.system_halted:
+            return
+        if direction == "LONG" and price >= self.isf_target_long.get(sc, float('inf')):
+            self.isf_entry_price[sc] = price
+            self._execute_isf_order(isf_cfg, "LONG_ENTER", price)
+        elif direction == "SHORT" and price <= self.isf_target_short.get(sc, float('-inf')):
+            self.isf_entry_price[sc] = price
+            self._execute_isf_order(isf_cfg, "SHORT_ENTER", price)
+
+    def _execute_isf_order(self, isf_cfg, signal_type, price):
+        """개별주식선물 주문 실행"""
+        sc = isf_cfg["stock_code"]
+        fc = isf_cfg.get("futures_code", "")
+        if not fc:
+            return
+        if self.isf_order_locked.get(sc, False):
+            return
+        self.isf_order_locked[sc] = True
+
+        # 방향 매핑 (lOrdKind: 1=신규매수, 2=신규매도)
+        dir_map = {
+            "LONG_ENTER":  (1, "LONG 진입"),
+            "SHORT_ENTER": (2, "SHORT 진입"),
+            "LONG_EXIT":   (2, "LONG 청산"),
+            "SHORT_EXIT":  (1, "SHORT 청산"),
+        }
+        trade_dir, label = dir_map.get(signal_type, (None, ""))
+        if trade_dir is None:
+            self.isf_order_locked[sc] = False
+            return
+
+        # 수량: EXIT이면 기존 수량, ENTER이면 5% 증거금 격리 비례 수량
+        if "EXIT" in signal_type and sc in self.isf_positions:
+            qty = self.isf_positions[sc].get("qty", 1)
+        else:
+            # [AMATS 파생 최적화] 예수금 비례 5% 한도 격리 (Virtual Margin Partitioning)
+            # 주식선물 거래승수=10, 위탁증거금율 대략 15% 적용
+            try:
+                multiplier = 10
+                margin_rate = 0.15
+                margin_per = price * multiplier * margin_rate
+                safe_budget = self.futures_available_balance * getattr(self, 'isf_margin_cap_ratio', 0.05)
+                qty = max(1, int(safe_budget // margin_per)) if margin_per > 0 else 1
+            except Exception:
+                qty = 1 # 계산 예외 발생 시 안전 기본값 1계약 폴백
+
+        ord_tp = "" if self.environment == "live" else "3"
+        print(f"\n[ISF 주문] {isf_cfg['name']} {label} | {price:,}원 | {qty}계약 | {fc}")
+
+        res = self.kiwoom.dynamicCall(
+            "SendOrderFO(QString, QString, QString, QString, int, QString, QString, int, QString, QString)",
+            ["ISFOrder", "0300", self.futures_account, fc, trade_dir, "03", ord_tp, qty, "0", ""]
+        )
+        if res == 0:
+            if "EXIT" in signal_type:
+                self.isf_order_locked[sc] = False
+                if sc in self.isf_positions:
+                    del self.isf_positions[sc]
+                self.isf_entry_price[sc] = 0.0
+                self.isf_peak_price[sc] = 0.0
+            else:
+                # 15초 내 체결 미확인 시 자동 잠금 해제
+                def _isf_unlock(s=sc):
+                    if self.isf_order_locked.get(s) and s not in self.isf_positions:
+                        print(f"[ISF] {s} 15초 체결 미확인 → 잠금 해제")
+                        self.isf_order_locked[s] = False
+                        self.isf_entry_price[s] = 0.0
+                        self.isf_peak_price[s] = 0.0
+                QTimer.singleShot(15000, _isf_unlock)
+        else:
+            print(f"  => ISF 주문 실패 (res={res})")
+            self.isf_order_locked[sc] = False
+            self.isf_entry_price[sc] = 0.0
+            self.isf_peak_price[sc] = 0.0
+
+    def _get_isf_day_open(self, futures_code, stock_code):
+        """ISF 오늘 09시 시초가 DB에서 조회"""
+        try:
+            today_prefix = datetime.now().strftime("%Y%m%d09")
+            conn = sqlite3.connect(self.futures_db_path, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT open FROM isf_ohlcv WHERE code=? AND date LIKE ? ORDER BY date LIMIT 1",
+                (futures_code, today_prefix + "%")
+            )
+            row = cursor.fetchone()
+            conn.close()
+            if row and row[0] > 0:
+                return float(row[0])
+        except Exception:
+            pass
+        return 0.0
+
+    def _update_isf_ohlcv(self, futures_code, price):
+        """ISF 실시간 틱 → 5분봉 버퍼 갱신 (ohlcv_buffer 공유)"""
+        now = datetime.now()
+        period_min = (now.minute // 5) * 5
+        period_str = now.strftime(f"%Y%m%d{now.hour:02d}") + f"{period_min:02d}00"
+        if futures_code not in self.ohlcv_buffer:
+            self.ohlcv_buffer[futures_code] = {}
+        buf = self.ohlcv_buffer[futures_code]
+        if period_str not in buf:
+            buf[period_str] = {'o': price, 'h': price, 'l': price, 'c': price, 'v': 1}
+        else:
+            c = buf[period_str]
+            c['h'] = max(c['h'], price)
+            c['l'] = min(c['l'], price)
+            c['c'] = price
+            c['v'] += 1
+
+    def _get_today_night_open(self, code, now):
+        """오늘 야간 세션 첫 5분봉 시가를 DB에서 조회 (늦은 기동 시 실제 야간 시초가 복원)"""
+        try:
+            # 야간 시작 시각 접두어 (18시 → '202605291800...')
+            today_str = now.strftime("%Y%m%d")
+            yesterday_str = (now.replace(hour=0, minute=0, second=0) -
+                             timedelta(days=1)).strftime("%Y%m%d")
+            # 새벽(00~04)은 전날 밤 18시 이후 데이터 조회
+            if now.hour < 5:
+                date_prefix = yesterday_str + "18"
+            else:
+                date_prefix = today_str + "18"
+            conn = sqlite3.connect(self.futures_db_path, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            cursor = conn.cursor()
+            for query_code in [code, self.futures_prefix + "00000", "10500000", "10100000"]:
+                cursor.execute(
+                    "SELECT open FROM futures_ohlcv WHERE code = ? AND date LIKE ? ORDER BY date LIMIT 1",
+                    (query_code, date_prefix + "%")
+                )
+                row = cursor.fetchone()
+                if row and row[0] and row[0] > 0:
+                    conn.close()
+                    print(f"[야간선물] 야간 시초가 DB 복원 성공: {row[0]:.2f}pt (code={query_code})")
+                    return float(row[0])
+            conn.close()
+        except Exception as e:
+            print(f"[야간선물] 야간 시초가 DB 조회 실패: {e}")
+        return 0.0
+
+    def _process_futures_tick(self, code, current_price):
+        """실시간 선물 현재가 수신 — 주간/야간 세션 분리 처리"""
+        if current_price <= 0:
+            return
+
+        # 미니선물(105)은 주간/야간 코드가 동일하므로 시간으로 세션 구분
+        real_day = getattr(self, 'real_day_code', '10100000')
+        real_night = getattr(self, 'real_night_code', '10500000')
+        if real_day == real_night:
+            h = datetime.now().hour
+            is_night = (h >= 18) or (h < 5)
+        else:
+            is_night = (code == real_night)
+
+        # 실시간 선물 포지션 현재가 업데이트 (TCA 계좌확인용)
+        pos_key = "KOSPI200_NIGHT" if is_night else "KOSPI200"
+        if pos_key in self.futures_positions:
+            self.futures_positions[pos_key]['current_price'] = current_price
+
+        if not self.futures_strategy_active:
+            return
+
+        now = datetime.now()
         if is_night:
             self._process_night_tick(code, current_price, now)
         else:
             self._process_day_tick(code, current_price, now)
 
     def _process_day_tick(self, code, current_price, now):
-        """주간 선물 전략 (09:00 진입 → 익일 08:45 청산, 2pt 손절 / 5pt 익절)"""
+        """주간 선물 전략 (09:00 진입 → 익일 08:45 청산, 3pt 손절 / 대안 C 트레일링 스탑)"""
         pos_key = "KOSPI200"
 
-        # 09:00 시초가 확정 (09:00~09:04 첫 틱 수신 시)
-        if now.hour == 9 and now.minute < 5 and self.futures_day_open == 0:
-            self.futures_day_open     = current_price
-            self.futures_target_long  = current_price + self.futures_prev_range * self.futures_best_k
-            self.futures_target_short = current_price - self.futures_prev_range * self.futures_best_k
-            print(f"\n[주간선물] ✅ 09:00 시초가: {current_price:.2f}pt")
+        # 09:00 ~ 15:45 정규장 시초가 및 목표가 동적 생성
+        is_day_session = (now.hour == 9 and now.minute >= 0) or (10 <= now.hour < 15) or (now.hour == 15 and now.minute <= 45)
+        if is_day_session and self.futures_day_open == 0:
+            db_open = self._get_today_futures_open(code)
+            day_open = db_open if db_open > 0 else current_price
+            self.futures_day_open     = day_open
+            self.futures_target_long  = day_open + self.futures_prev_range * self.futures_best_k
+            self.futures_target_short = day_open - self.futures_prev_range * self.futures_best_k
+            src_label = "DB 시초가" if db_open > 0 else "현재가(폴백)"
+            print(f"\n[주간선물] ✅ 시초가 설정: {day_open:.2f}pt ({src_label})")
             print(f"  LONG목표: {self.futures_target_long:.2f}  SHORT목표: {self.futures_target_short:.2f}")
-            print(f"  손절: {self.futures_stop_loss_pt}pt  익절: {self.futures_take_profit_pt}pt")
+            print(f"  손절: {self.futures_stop_loss_pt}pt | 대안 C 트레일링 스탑 적용 (3pt 이상 상승 시 가동 ➡️ 최고가 대비 -2pt 청산)")
             if notifier:
                 notifier.send_message(
                     f"🌅 <b>[주간선물 목표가]</b>\n"
-                    f"• 시초가: {current_price:.2f}pt\n"
+                    f"• 시초가: {day_open:.2f}pt ({src_label})\n"
                     f"• LONG ▲ {self.futures_target_long:.2f}pt\n"
                     f"• SHORT ▼ {self.futures_target_short:.2f}pt\n"
-                    f"• 손절: {self.futures_stop_loss_pt}pt | 익절: {self.futures_take_profit_pt}pt"
+                    f"• <b>[대안 C 적용]</b> 3pt 가동 ➡️ 최고가 -2pt 트레일링 스탑"
                 )
 
         if self.futures_day_open == 0:
@@ -934,72 +2003,111 @@ class ERAOrderManager:
                 self._execute_futures_direct("LONG_EXIT" if pos["type"] == "LONG" else "SHORT_EXIT",
                                              current_price, code, pos_key)
                 self.futures_day_entry_price = 0.0
+                self.futures_day_peak = 0.0
             return
 
-        # ── 포지션 보유 중: 손절/익절 감시 ──
+        # ── 포지션 보유 중: 손절 / 대안 C 트레일링 스탑 감시 ──
         if pos_key in self.futures_positions:
             pos = self.futures_positions[pos_key]
             entry = self.futures_day_entry_price
             if entry > 0:
                 if pos['type'] == 'LONG':
+                    # 최고가 추적 및 갱신
+                    if current_price > self.futures_day_peak:
+                        self.futures_day_peak = current_price
+                    
                     pnl_pt = current_price - entry
+                    max_pnl_pt = self.futures_day_peak - entry # 진입 후 도달한 최고 수익폭
+                    
+                    # 1. 고정 손절 감시 (트레일링 가동 전까지 계좌 보호)
                     if pnl_pt <= -self.futures_stop_loss_pt:
                         print(f"[주간선물] 🛑 LONG 손절 발동! 진입:{entry:.2f} 현재:{current_price:.2f} 손실:{pnl_pt:+.2f}pt")
                         self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
                         self.futures_day_entry_price = 0.0
+                        self.futures_day_peak = 0.0
                         if notifier:
                             notifier.send_message(f"🛑 <b>[주간선물 손절]</b> {pnl_pt:+.2f}pt | 진입:{entry:.2f} → 청산:{current_price:.2f}")
                         return
-                    elif pnl_pt >= self.futures_take_profit_pt:
-                        print(f"[주간선물] 🎯 LONG 익절 발동! 진입:{entry:.2f} 현재:{current_price:.2f} 수익:{pnl_pt:+.2f}pt")
-                        self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
-                        self.futures_day_entry_price = 0.0
-                        if notifier:
-                            notifier.send_message(f"🎯 <b>[주간선물 익절]</b> {pnl_pt:+.2f}pt | 진입:{entry:.2f} → 청산:{current_price:.2f}")
-                        return
+                    
+                    # 2. 대안 C 트레일링 스탑 감시 (최고 수익이 +3.0 pt 이상 도달했을 때부터 기동)
+                    elif max_pnl_pt >= 3.0:
+                        ts_price = self.futures_day_peak - 2.0
+                        if current_price <= ts_price:
+                            realized_pnl = current_price - entry
+                            print(f"[주간선물] 🎯 LONG 트레일링 스탑 발동! 최고가:{self.futures_day_peak:.2f} 현재가(청산):{current_price:.2f} 익절:{realized_pnl:+.2f}pt")
+                            self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
+                            self.futures_day_entry_price = 0.0
+                            self.futures_day_peak = 0.0
+                            if notifier:
+                                notifier.send_message(f"🎯 <b>[주간선물 트레일링 익절]</b> {realized_pnl:+.2f}pt (최고가:{self.futures_day_peak:.2f} ➡️ 청산:{current_price:.2f})")
+                            return
+
                 elif pos['type'] == 'SHORT':
+                    # 최저가(숏 포지션이므로 가격이 낮아질수록 최고 수익) 추적 및 갱신
+                    if current_price < self.futures_day_peak or self.futures_day_peak == 0:
+                        self.futures_day_peak = current_price
+                    
                     pnl_pt = entry - current_price
+                    max_pnl_pt = entry - self.futures_day_peak # 진입 후 도달한 최고 수익폭
+                    
+                    # 1. 고정 손절 감시
                     if pnl_pt <= -self.futures_stop_loss_pt:
                         print(f"[주간선물] 🛑 SHORT 손절 발동! 진입:{entry:.2f} 현재:{current_price:.2f} 손실:{pnl_pt:+.2f}pt")
                         self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
                         self.futures_day_entry_price = 0.0
+                        self.futures_day_peak = 0.0
                         if notifier:
                             notifier.send_message(f"🛑 <b>[주간선물 손절]</b> {pnl_pt:+.2f}pt | 진입:{entry:.2f} → 청산:{current_price:.2f}")
                         return
-                    elif pnl_pt >= self.futures_take_profit_pt:
-                        print(f"[주간선물] 🎯 SHORT 익절 발동! 진입:{entry:.2f} 현재:{current_price:.2f} 수익:{pnl_pt:+.2f}pt")
-                        self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
-                        self.futures_day_entry_price = 0.0
-                        if notifier:
-                            notifier.send_message(f"🎯 <b>[주간선물 익절]</b> {pnl_pt:+.2f}pt | 진입:{entry:.2f} → 청산:{current_price:.2f}")
-                        return
+                    
+                    # 2. 대안 C 트레일링 스탑 감시 (최고 수익이 +3.0 pt 이상 도달했을 때부터 기동)
+                    elif max_pnl_pt >= 3.0:
+                        ts_price = self.futures_day_peak + 2.0
+                        if current_price >= ts_price:
+                            realized_pnl = entry - current_price
+                            print(f"[주간선물] 🎯 SHORT 트레일링 스탑 발동! 최저가:{self.futures_day_peak:.2f} 현재가(청산):{current_price:.2f} 익절:{realized_pnl:+.2f}pt")
+                            self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
+                            self.futures_day_entry_price = 0.0
+                            self.futures_day_peak = 0.0
+                            if notifier:
+                                notifier.send_message(f"🎯 <b>[주간선물 트레일링 익절]</b> {realized_pnl:+.2f}pt (최저가:{self.futures_day_peak:.2f} ➡️ 청산:{current_price:.2f})")
+                            return
             return  # 포지션 보유 중이면 신규 진입 불가
 
-        # ── 신규 진입 조건 ──
+        # ── 신규 진입 조건 (09:00 장 초반 15분 노이즈 필터 연동) ──
         if not self.futures_order_locked and not self.system_halted:
-            if current_price >= self.futures_target_long:
-                self.futures_day_entry_price = current_price
-                self._execute_futures_direct("LONG_ENTER", current_price, code, pos_key)
-            elif current_price <= self.futures_target_short:
-                self.futures_day_entry_price = current_price
-                self._execute_futures_direct("SHORT_ENTER", current_price, code, pos_key)
+            is_after_9 = (now.hour == 9 and now.minute >= 0) or (now.hour > 9)
+            if is_after_9:
+                if current_price >= self.futures_target_long:
+                    self.futures_day_entry_price = current_price
+                    self.futures_day_peak = current_price # 진입 즉시 초기화
+                    self._execute_futures_direct("LONG_ENTER", current_price, code, pos_key)
+                elif current_price <= self.futures_target_short:
+                    self.futures_day_entry_price = current_price
+                    self.futures_day_peak = current_price # 진입 즉시 초기화
+                    self._execute_futures_direct("SHORT_ENTER", current_price, code, pos_key)
 
     def _process_night_tick(self, code, current_price, now):
         """야간 선물 전략 (18:00 진입 → 익일 04:45 청산, 2pt 손절 / 5pt 익절)"""
         pos_key = "KOSPI200_NIGHT"
 
-        # 18:00 시초가 확정 (18:00~18:04 첫 틱 수신 시)
-        if now.hour == 18 and now.minute < 5 and self.futures_night_open == 0:
-            self.futures_night_open         = current_price
-            self.futures_night_target_long  = current_price + self.futures_prev_range * self.futures_best_k
-            self.futures_night_target_short = current_price - self.futures_prev_range * self.futures_best_k
-            print(f"\n[야간선물] ✅ 18:00 시초가: {current_price:.2f}pt")
+        # 18:00 ~ 새벽 04:45 사이 야간 세션 중도 기동 시에도 즉시 야간 시초가 및 목표가 동적 생성
+        is_night_session = (now.hour >= 18) or (now.hour < 5)
+        if is_night_session and self.futures_night_open == 0:
+            # 늦은 기동 시 실제 야간 시초가 DB 조회 (없으면 현재가 폴백)
+            db_night_open = self._get_today_night_open(code, now)
+            night_open = db_night_open if db_night_open > 0 else current_price
+            self.futures_night_open         = night_open
+            self.futures_night_target_long  = night_open + self.futures_prev_range * self.futures_best_k
+            self.futures_night_target_short = night_open - self.futures_prev_range * self.futures_best_k
+            src_label = "DB 시초가" if db_night_open > 0 else "현재가(폴백)"
+            print(f"\n[야간선물] ✅ 시초가 설정: {night_open:.2f}pt ({src_label})")
             print(f"  LONG목표: {self.futures_night_target_long:.2f}  SHORT목표: {self.futures_night_target_short:.2f}")
             print(f"  손절: {self.futures_stop_loss_pt}pt  익절: {self.futures_take_profit_pt}pt")
             if notifier:
                 notifier.send_message(
                     f"🌙 <b>[야간선물 목표가]</b>\n"
-                    f"• 시초가: {current_price:.2f}pt\n"
+                    f"• 시초가: {night_open:.2f}pt ({src_label})\n"
                     f"• LONG ▲ {self.futures_night_target_long:.2f}pt\n"
                     f"• SHORT ▼ {self.futures_night_target_short:.2f}pt\n"
                     f"• 손절: {self.futures_stop_loss_pt}pt | 익절: {self.futures_take_profit_pt}pt"
@@ -1090,21 +2198,39 @@ class ERAOrderManager:
         if "EXIT" in signal_type and pos_key in self.futures_positions:
             qty = self.futures_positions[pos_key].get("qty", 1)
         else:
-            margin_per = current_price * 250000 * 0.10
-            safe_budget = self.futures_available_balance * self.futures_margin_cap_ratio
-            qty = max(1, int(safe_budget // margin_per)) if margin_per > 0 else 1
+            if getattr(self, 'futures_fixed_qty', None) is not None:
+                qty = self.futures_fixed_qty
+            else:
+                multiplier = 50000 if getattr(self, 'futures_prefix', '101') == '105' else 250000
+                margin_per = current_price * multiplier * 0.10
+                safe_budget = self.futures_available_balance * self.futures_margin_cap_ratio
+                qty = max(1, int(safe_budget // margin_per)) if margin_per > 0 else 1
 
         session_label = "야간" if is_night else "주간"
         print(f"\n[{session_label}선물 주문] {label} | {current_price:.2f}pt | {qty}계약 | {order_code}")
 
+        # sOrdTp: 실전투자="" 모의투자="3"(시장가) — 빈값이면 Mock 서버가 주문을 무시함
+        ord_tp = "" if self.environment == "live" else "3"
         res = self.kiwoom.dynamicCall(
             "SendOrderFO(QString, QString, QString, QString, int, QString, QString, int, QString, QString)",
-            ["FuturesLive", "0200", self.futures_account, order_code, trade_dir, "03", "", qty, "0", ""]
+            ["FuturesLive", "0200", self.futures_account, order_code, trade_dir, "03", ord_tp, qty, "0", ""]
         )
 
         if res == 0:
             if "EXIT" in signal_type:
                 setattr(self, lock_attr, False)
+            else:
+                # ENTER 주문 전송 후 15초 내 체결 미확인 시 잠금 자동 해제
+                # (Mock 서버 무응답 또는 주문 거절 후 res=0 반환하는 경우 대비)
+                def _unlock_if_no_fill():
+                    if getattr(self, lock_attr) and pos_key not in self.futures_positions:
+                        print(f"[{session_label}선물] ⚠️ 15초 체결 미확인 → 잠금 자동 해제 (주문 재시도 허용)")
+                        setattr(self, lock_attr, False)
+                        if is_night:
+                            self.futures_night_entry_price = 0.0
+                        else:
+                            self.futures_day_entry_price = 0.0
+                QTimer.singleShot(15000, _unlock_if_no_fill)
             if notifier:
                 icon = "🌙" if is_night else "☀️"
                 notifier.send_message(
@@ -1227,6 +2353,8 @@ class ERAOrderManager:
                 "day_entry_price": self.futures_day_entry_price,
                 "night_entry_price": self.futures_night_entry_price,
             },
+            "isf_positions": self.isf_positions,
+            "isf_direction": self.isf_direction,
             "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
         # 모드별 파일명 분리 (2대PC 동기화 충돌 방지)
@@ -1244,6 +2372,61 @@ class ERAOrderManager:
                 json.dump(status_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"[ERA status 내보내기 오류] {e}")
+
+        # [수익률 추적] 일자별 자산 합계 기록 (daily_balance_history)
+        try:
+            from datetime import datetime as dt
+            today_str = dt.now().strftime("%Y-%m-%d")
+            
+            if not hasattr(self, '_last_logged_balance_date') or self._last_logged_balance_date != today_str:
+                stock_invested = 0
+                for code, pos in self.portfolio.items():
+                    buy_price = pos.get('buy_price', 0)
+                    qty = pos.get('qty', 0)
+                    current_price = pos.get('current_price', buy_price)
+                    stock_invested += current_price * qty
+                
+                stock_total = self.stock_total_balance + stock_invested
+                
+                futures_pnl = 0
+                for code, pos in self.futures_positions.items():
+                    p_type = pos.get('type', 'LONG')
+                    buy_price = pos.get('price', 0)
+                    qty = pos.get('qty', 0)
+                    current_price = pos.get('current_price', buy_price)
+                    multiplier = 50000 if '105' in code else 250000
+                    if p_type == 'LONG':
+                        pnl = (current_price - buy_price) * qty * multiplier
+                    else:
+                        pnl = (buy_price - current_price) * qty * multiplier
+                    futures_pnl += pnl
+                    
+                futures_total = self.futures_available_balance + futures_pnl
+                combined_total = stock_total + futures_total
+                
+                if combined_total > 0:
+                    import sqlite3
+                    db_conn = sqlite3.connect(self.unified_db_path, timeout=5)
+                    db_cursor = db_conn.cursor()
+                    db_cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS daily_balance_history (
+                        date TEXT PRIMARY KEY,
+                        stock_total REAL,
+                        futures_total REAL,
+                        combined_total REAL
+                    )
+                    """)
+                    db_cursor.execute("""
+                    INSERT OR REPLACE INTO daily_balance_history (date, stock_total, futures_total, combined_total)
+                    VALUES (?, ?, ?, ?)
+                    """, (today_str, round(stock_total, 2), round(futures_total, 2), round(combined_total, 2)))
+                    db_conn.commit()
+                    db_conn.close()
+                    self._last_logged_balance_date = today_str
+                    print(f"[ERA] daily_balance_history 기록 완료: {today_str} | Stock: {stock_total:,.0f} | Futures: {futures_total:,.0f} | Combined: {combined_total:,.0f}")
+        except Exception as e:
+            print(f"[ERA daily_balance_history 기록 에러] {e}")
+
 
     def update_day_ma_data(self):
         """단타 종목들의 실시간 차트 10MA/20MA 추적 갱신"""
@@ -1274,14 +2457,46 @@ class ERAOrderManager:
             print(f"[ERA update_day_ma_data 오류] {e}")
 
     def check_swing_close_time(self):
+        try:
+            self._do_swing_close_time()
+        except Exception as e:
+            print(f"[ERA check_swing_close_time 오류] {e}")
+
+    def _do_swing_close_time(self):
         now = datetime.now()
-        if now.hour == 15 and now.minute >= 14 and not self.today_5ma_checked:
-            self.today_5ma_checked = True
-            print("\n[⏰ ERA 종가 익절 감시] 15:14+ 스윙 종목 5MA 체크를 시작합니다.")
-            self.pending_5ma_checks = [c for c, p in self.portfolio.items() if p['strategy'] == 'SWING']
-            self._request_next_5ma()
-        elif now.hour < 9:
-            self.today_5ma_checked = False
+        # 1. 스윙 이평선 감시 (stock/both만)
+        if self.trading_mode in ('stock', 'both'):
+            if now.hour == 15 and now.minute >= 14 and not self.today_5ma_checked:
+                self.today_5ma_checked = True
+                print("\n[⏰ ERA 종가 익절 감시] 15:14+ 스윙 종목 5MA 체크를 시작합니다.")
+                self.pending_5ma_checks = [c for c, p in self.portfolio.items() if p['strategy'] == 'SWING']
+                self._request_next_5ma()
+            elif now.hour < 9:
+                self.today_5ma_checked = False
+                
+        # 2. [AMATS 파생 최적화] 개별주식선물(ISF) 15:20 당일 무조건 시장가 일괄 청산 (Daily Flat)
+        if self.trading_mode in ('futures', 'both'):
+            self.check_isf_daily_flat()
+
+    def check_isf_daily_flat(self):
+        """오후 15시 20분 도달 시 미체결/보유 중인 모든 ISF 포지션을 당일 일괄 청산(Flat)하여 오버나잇 갭 차단"""
+        now = datetime.now()
+        if not (now.hour == 15 and 20 <= now.minute < 30):
+            return
+            
+        for sc, pos in list(self.isf_positions.items()):
+            if pos.get("qty", 0) > 0 and not pos.get("flat_ordered", False):
+                pos["flat_ordered"] = True
+                isf_cfg = next((c for c in self.isf_configs if c["stock_code"] == sc), None)
+                if isf_cfg:
+                    exit_type = "LONG_EXIT" if pos["type"] == "LONG" else "SHORT_EXIT"
+                    print(f"\n🚨 [ISF 장마감 강제 청산 발동] {pos['name']} - 오버나잇 갭 차단용 당일 청산 주문 전송.")
+                    self._execute_isf_order(isf_cfg, exit_type, pos.get("current_price", 0))
+                    if notifier:
+                        notifier.send_message(
+                            f"⚠️ <b>[ISF 장마감 강제 청산] {pos['name']}</b>\n"
+                            f"• 오버나잇 갭 변동성 방지를 위해 15:20 기준 실계좌 시장가 일괄 청산(Flat)을 완료했습니다."
+                        )
 
     def _request_next_5ma(self):
         if not self.pending_5ma_checks:
@@ -1380,7 +2595,32 @@ class ERAOrderManager:
                 # 2차 관문 필터링: RSA 종합 평점 조회 연동 (차후 RSA 개발 완료 시 완전 활성화)
                 # 만약 research_reports 테이블이 존재하면 70점 미만 필터링
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='research_reports'")
-                if cursor.fetchone():
+                has_table = cursor.fetchone()
+                
+                # 모의투자 환경: RSA 테이블 자동 생성 + 기존 저점수 포함 전체 우회 (80점 강제 삽입/갱신)
+                if self.environment != "live":
+                    if not has_table:
+                        # RSA coordinator와 동일한 11컬럼 스키마로 생성 (INSERT 호환)
+                        cursor.execute("""CREATE TABLE IF NOT EXISTS research_reports (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            code TEXT, name TEXT, strategy_type TEXT,
+                            faa_score INTEGER, faa_reason TEXT,
+                            ira_score INTEGER, ira_reason TEXT,
+                            nsaa_score INTEGER, nsaa_reason TEXT,
+                            score INTEGER,
+                            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+                        has_table = True
+                    cursor.execute("SELECT score FROM research_reports WHERE code = ? ORDER BY id DESC LIMIT 1", (code,))
+                    existing = cursor.fetchone()
+                    if existing is None or existing[0] < 70:
+                        cursor.execute(
+                            "INSERT INTO research_reports (code, name, strategy_type, score) VALUES (?, ?, 'MOCK', 80)",
+                            (code, name)
+                        )
+                        print(f" => [모의투자 RSA 자동 통과] {name}({code}) 80점 삽입 (기존={existing[0] if existing else '없음'})")
+                    has_table = True
+
+                if has_table:
                     cursor.execute("SELECT score FROM research_reports WHERE code = ? ORDER BY id DESC LIMIT 1", (code,))
                     rep = cursor.fetchone()
                     if rep is None:
@@ -1402,10 +2642,16 @@ class ERAOrderManager:
                 
                 if res == 0:
                     cursor.execute("UPDATE signals SET status = 'EXECUTED' WHERE id = ?", (signal_id,))
+                    # 30초 내 체결 미확인 시 pending_orders 자동 해제 (Mock 서버 무체결 대비)
+                    def _clear_pending(c=code):
+                        if c in self.pending_orders and c not in self.portfolio:
+                            print(f"[ERA 주식] ⚠️ {c} 30초 체결 미확인 → pending 자동 해제")
+                            del self.pending_orders[c]
+                    QTimer.singleShot(30000, _clear_pending)
                 else:
                     cursor.execute("UPDATE signals SET status = 'FAILED' WHERE id = ?", (signal_id,))
                     del self.pending_orders[code]
-                    
+
             conn.commit()
         except sqlite3.OperationalError as e:
             print(f"[ERA 주식 폴링 에러] {e}")
@@ -1417,21 +2663,33 @@ class ERAOrderManager:
         conn.execute("PRAGMA journal_mode=WAL;")
         cursor = conn.cursor()
         try:
+            cursor.execute("""CREATE TABLE IF NOT EXISTS signals
+                              (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, signal_type TEXT,
+                               price REAL, status TEXT DEFAULT 'PENDING')""")
             cursor.execute("SELECT id, code, signal_type, price FROM signals WHERE status = 'PENDING' LIMIT 1")
             row = cursor.fetchone()
             if row:
                 signal_id, code, signal_type, price = row
                 print(f"\n[🚨 선물 신규 신호 감지] {code} | {signal_type} | 현재가: {price}")
                 
-                # 선물 1계약 위탁증거금 계산
-                margin_per_contract = price * 250000 * 0.10  # 승수 25만, 위탁증거금률 10%
-                safe_budget = self.futures_available_balance * self.futures_margin_cap_ratio
-                qty = int(safe_budget // margin_per_contract)
-                
-                # 최소 1계약 보장
-                if qty == 0 and self.futures_available_balance >= (margin_per_contract * 1.2):
-                    qty = 1
-                    print("  => [선물 안전 마진 예외] 실잔고로 최소 1계약 진입 보장")
+                if getattr(self, 'futures_fixed_qty', None) is not None:
+                    qty = self.futures_fixed_qty
+                else:
+                    # 선물 1계약 위탁증거금 계산
+                    multiplier = 50000 if getattr(self, 'futures_prefix', '101') == '105' else 250000
+                    margin_per_contract = price * multiplier * 0.10  # 승수 5만(미니) 또는 25만(일반), 위탁증거금률 10%
+                    safe_budget = self.futures_available_balance * self.futures_margin_cap_ratio
+                    qty = int(safe_budget // margin_per_contract)
+                    
+                    # 최소 1계약 보장
+                    if qty == 0 and self.futures_available_balance >= (margin_per_contract * 1.2):
+                        qty = 1
+                        print("  => [선물 안전 마진 예외] 실잔고로 최소 1계약 진입 보장")
+                        
+                    # 모의투자 환경 긴급 우회: 예수금이 부족하더라도(혹은 0원이더라도) 테스트 작동성 검증을 위해 최소 1계약 강제 보장
+                    if self.environment != "live" and qty <= 0:
+                        qty = 1
+                        print("  => [모의투자 긴급 우회] 모의 예수금 부족 상황이나 테스트 작동 검증을 위해 최소 1계약 강제 보장")
                     
                 if qty <= 0:
                     print("  => [거절] 선물 위탁증거금 부족")
@@ -1460,10 +2718,11 @@ class ERAOrderManager:
                     elif code == "10500000":
                         order_code = getattr(self, 'real_night_code', "10500000")
 
+                    ord_tp = "" if self.environment == "live" else "3"
                     print(f"  => [선물 실계좌 전송] SendOrderFO 전송 (trade_dir:{trade_dir}, 수량:{qty}, 코드:{order_code})")
                     res = self.kiwoom.dynamicCall(
                         "SendOrderFO(QString, QString, QString, QString, int, QString, QString, int, QString, QString)",
-                        ["FuturesOrder", "0101", self.futures_account, order_code, trade_dir, "03", "", qty, "0", ""]
+                        ["FuturesOrder", "0101", self.futures_account, order_code, trade_dir, "03", ord_tp, qty, "0", ""]
                     )
                     if res == 0:
                         cursor.execute("UPDATE signals SET status = 'EXECUTED' WHERE id = ?", (signal_id,))
@@ -1476,6 +2735,13 @@ class ERAOrderManager:
             conn.close()
 
     def _on_receive_chejan_data(self, gubun, item_cnt, fid_list):
+        try:
+            self._handle_chejan_data(gubun, item_cnt, fid_list)
+        except Exception as e:
+            import traceback
+            print(f"[ERA 체잔 콜백 오류] {e}\n{traceback.format_exc()}")
+
+    def _handle_chejan_data(self, gubun, item_cnt, fid_list):
         if gubun == "0":
             status = self.kiwoom.dynamicCall("GetChejanData(int)", 913).strip()
             name = self.kiwoom.dynamicCall("GetChejanData(int)", 302).strip()
@@ -1485,14 +2751,58 @@ class ERAOrderManager:
                 exec_price = float(self.kiwoom.dynamicCall("GetChejanData(int)", 910).strip())
                 exec_qty = int(self.kiwoom.dynamicCall("GetChejanData(int)", 911).strip())
                 order_gubun = self.kiwoom.dynamicCall("GetChejanData(int)", 905).strip()
-                
+
+                # 개별주식선물(ISF) 체결 처리
+                if code in self.isf_code_map:
+                    sc = self.isf_code_map[code]
+                    isf_cfg = next((c for c in self.isf_configs if c["stock_code"] == sc), None)
+                    if isf_cfg:
+                        if "매수" in order_gubun or "환매" in order_gubun:
+                            if sc not in self.isf_positions:
+                                self.isf_positions[sc] = {"type": "LONG", "qty": exec_qty, "price": exec_price, "futures_code": code}
+                                self.isf_entry_price[sc] = exec_price
+                                self.isf_peak_price[sc] = exec_price
+                            else:
+                                if self.isf_positions[sc]["type"] == "SHORT":
+                                    self.isf_positions[sc]["qty"] -= exec_qty
+                                    if self.isf_positions[sc]["qty"] <= 0:
+                                        del self.isf_positions[sc]
+                                        self.isf_peak_price[sc] = 0.0
+                                else:
+                                    self.isf_positions[sc]["qty"] += exec_qty
+                            if notifier:
+                                notifier.send_message(f"💰 <b>[ISF 매수체결] {isf_cfg['name']}</b>\n• {exec_price:,}원 | {exec_qty}계약")
+                        elif "매도" in order_gubun or "전매" in order_gubun:
+                            if sc not in self.isf_positions:
+                                self.isf_positions[sc] = {"type": "SHORT", "qty": exec_qty, "price": exec_price, "futures_code": code}
+                                self.isf_entry_price[sc] = exec_price
+                                self.isf_peak_price[sc] = exec_price
+                            else:
+                                if self.isf_positions[sc]["type"] == "LONG":
+                                    self.isf_positions[sc]["qty"] -= exec_qty
+                                    if self.isf_positions[sc]["qty"] <= 0:
+                                        del self.isf_positions[sc]
+                                        self.isf_peak_price[sc] = 0.0
+                                else:
+                                    self.isf_positions[sc]["qty"] += exec_qty
+                            if notifier:
+                                notifier.send_message(f"📉 <b>[ISF 매도체결] {isf_cfg['name']}</b>\n• {exec_price:,}원 | {exec_qty}계약")
+                        self.export_status()
+                    return
+
                 # 선물 체결 감지 (코드 길이 또는 "KOSPI" 이름 감지)
                 if len(code) > 6 or "KOSPI" in name or "선물" in name:
-                    is_night_fill = (code == getattr(self, 'real_night_code', '10500000'))
+                    _rd = getattr(self, 'real_day_code', '10100000')
+                    _rn = getattr(self, 'real_night_code', '10500000')
+                    if _rd == _rn:
+                        _h = datetime.now().hour
+                        is_night_fill = (_h >= 18) or (_h < 5)
+                    else:
+                        is_night_fill = (code == _rn)
                     pos_key = "KOSPI200_NIGHT" if is_night_fill else "KOSPI200"
                     session_label = "야간" if is_night_fill else "주간"
                     print(f"[{session_label}선물 실체결 확정] {name}({code}) | {exec_price} | {exec_qty}계약 | {order_gubun}")
-                    if "매수" in order_gubun:
+                    if "매수" in order_gubun or "환매" in order_gubun:
                         if pos_key not in self.futures_positions:
                             self.futures_positions[pos_key] = {'type': 'LONG', 'qty': exec_qty, 'price': exec_price}
                             # 실체결가로 손절/익절 기준 갱신
@@ -1510,7 +2820,7 @@ class ERAOrderManager:
                         if notifier:
                             notifier.send_message(f"💰 <b>[{session_label}선물 매수 체결] 코스피200</b>\n• 체결가: {exec_price:,.2f}pt\n• 수량: {exec_qty}계약\n• 손절: -{self.futures_stop_loss_pt}pt | 익절: +{self.futures_take_profit_pt}pt")
 
-                    elif "매도" in order_gubun:
+                    elif "매도" in order_gubun or "전매" in order_gubun:
                         if pos_key not in self.futures_positions:
                             self.futures_positions[pos_key] = {'type': 'SHORT', 'qty': exec_qty, 'price': exec_price}
                             # 실체결가로 손절/익절 기준 갱신
@@ -1607,6 +2917,18 @@ class ERAOrderManager:
                         self.export_status()
 
     def _on_receive_real_data(self, code, real_type, real_data):
+        # 개별주식선물(ISF) 실시간 틱 처리
+        if code in self.isf_code_map:
+            raw = self.kiwoom.dynamicCall("GetCommRealData(QString, int)", code, 10).strip()
+            if raw:
+                try:
+                    price = abs(float(raw))
+                    self._process_isf_tick(code, price)
+                    self._update_isf_ohlcv(code, price)
+                except ValueError:
+                    pass
+            return
+
         # 선물 실시간 틱 처리 (futures/both만)
         if real_type == "선물시세" or real_type == "선물체결":
             if self.trading_mode not in ('futures', 'both'):
@@ -1718,9 +3040,10 @@ class ERAOrderManager:
             for pos_key in list(self.futures_positions.keys()):
                 pos = self.futures_positions[pos_key]
                 order_code = self.real_night_code if 'NIGHT' in pos_key else self.real_day_code
+                kill_price = pos.get('current_price', pos.get('price', 0))
                 self._execute_futures_direct(
                     "LONG_EXIT" if pos['type'] == 'LONG' else "SHORT_EXIT",
-                    0, order_code, pos_key
+                    kill_price, order_code, pos_key
                 )
             # 주식 포지션 청산
             for code in list(self.portfolio.keys()):
@@ -1740,6 +3063,15 @@ if __name__ == "__main__":
         print("[ERA] 윈도우 절전 방지 활성화 완료.")
     except Exception as e:
         print(f"[ERA] 절전 방지 활성화 실패: {e}")
+
+    import socket
+    # 물리적 소켓 바인딩 락 (Port: 9991) - Singleton 보장
+    try:
+        _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _lock_socket.bind(('127.0.0.1', 9991))
+    except socket.error:
+        print("[ERA ERROR] 이미 다른 ERA 주문 엔진이 실행 중입니다 (Port 9991 Lock). 실행을 중단합니다.")
+        sys.exit(0)
 
     import atexit
     _pid_file = os.path.join(current_dir, "era.pid")

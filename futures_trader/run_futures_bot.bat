@@ -11,7 +11,7 @@ echo ===================================================
 echo Starting Order Manager in a new background window...
 echo Please log in to the Kiwoom mock server in the new window!
 echo DO NOT CLOSE the new window while trading!
-start "Futures Order Manager" cmd /c "..\ai_trader\venv32\Scripts\python.exe -u futures_order_manager.py"
+start "Futures Order Manager" cmd /c "..\venv32\Scripts\python.exe -u futures_order_manager.py"
 
 echo.
 echo ===================================================

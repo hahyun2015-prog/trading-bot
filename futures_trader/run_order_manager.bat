@@ -8,7 +8,7 @@ echo Starting Kiwoom API Order Manager...
 echo Please log in to the Kiwoom mock investment server.
 echo.
 
-..\ai_trader\venv32\Scripts\python.exe -u order_manager.py
+..\venv32\Scripts\python.exe -u order_manager.py
 
 echo.
 pause

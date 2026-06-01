@@ -65,7 +65,12 @@ class FuturesOrderManager:
             "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
         try:
-            with open(r"c:\antigravity\노트븍활용\telegram_controller\futures_status.json", "w", encoding="utf-8") as f:
+            status_dir = r"c:\antigravity\노트븍활용\telegram_controller"
+            if not os.path.exists(status_dir):
+                status_dir = os.path.join(os.path.dirname(current_dir), "tca")
+            if not os.path.exists(status_dir):
+                os.makedirs(status_dir)
+            with open(os.path.join(status_dir, "futures_status.json"), "w", encoding="utf-8") as f:
                 json.dump(status_data, f, ensure_ascii=False, indent=2)
         except:
             pass
@@ -88,7 +93,7 @@ class FuturesOrderManager:
                 
                 # 자동 재연결 스크립트 실행 후 현재 프로세스는 종료 대기
                 import subprocess
-                subprocess.Popen("start auto_reconnect.bat", shell=True, cwd=r"c:\\antigravity\\노트븍활용\\futures_trader")
+                subprocess.Popen("start auto_reconnect.bat", shell=True, cwd=current_dir)
         else:
             if self.was_disconnected:
                 print("✅ [복구] 키움증권 서버 통신 정상화.")

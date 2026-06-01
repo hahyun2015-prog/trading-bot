@@ -8,7 +8,7 @@ echo Starting Kiwoom API Data Collector...
 echo Please log in to the Kiwoom mock investment server.
 echo.
 
-..\ai_trader\venv32\Scripts\python.exe -u data_collector.py
+..\venv32\Scripts\python.exe -u data_collector.py
 
 echo.
 pause

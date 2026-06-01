@@ -15,11 +15,17 @@ def _load_config():
 _CONFIG = _load_config()
 IS_LIVE = _CONFIG.get("environment") == "live"
 
-# PyQt5 환경 변수 에러 방지 (경로 절대 지정)
 current_dir = os.path.dirname(os.path.abspath(__file__))
-qt_plugin_path = os.path.abspath(os.path.join(current_dir, "..", "ai_trader", "venv32", "Lib", "site-packages", "PyQt5", "Qt5", "plugins"))
-os.environ['QT_PLUGIN_PATH'] = qt_plugin_path
-os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = os.path.join(qt_plugin_path, "platforms")
+
+# PyQt5 플러그인 경로 동적 감지 (ERA와 동일 방식 — 하드코딩 제거)
+_exe_dir = os.path.dirname(sys.executable)
+_qt_base = os.path.join(_exe_dir, "Lib", "site-packages", "PyQt5")
+_qt_plugin_path = os.path.join(_qt_base, "Qt5", "plugins")
+if not os.path.exists(_qt_plugin_path):
+    _qt_plugin_path = os.path.join(_qt_base, "Qt", "plugins")
+if os.path.exists(_qt_plugin_path):
+    os.environ["QT_PLUGIN_PATH"] = _qt_plugin_path
+    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(_qt_plugin_path, "platforms")
 
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QAxContainer import QAxWidget
@@ -119,7 +125,7 @@ class UnifiedOrderManager:
                 
                 # 자동 재연결 스크립트 실행 후 현재 프로세스는 종료 대기
                 import subprocess
-                subprocess.Popen("start auto_reconnect.bat", shell=True, cwd=r"c:\\antigravity\\노트븍활용\\unified_trader")
+                subprocess.Popen("start auto_reconnect.bat", shell=True, cwd=current_dir)
         else:
             if self.was_disconnected:
                 print("✅ [복구] 키움증권 서버 통신 정상화.")
@@ -340,7 +346,12 @@ class UnifiedOrderManager:
             "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
         try:
-            with open(r"c:\antigravity\노트븍활용\telegram_controller\unified_status.json", "w", encoding="utf-8") as f:
+            status_dir = r"c:\antigravity\노트븍활용\telegram_controller"
+            if not os.path.exists(status_dir):
+                status_dir = os.path.join(os.path.dirname(current_dir), "tca")
+            if not os.path.exists(status_dir):
+                os.makedirs(status_dir)
+            with open(os.path.join(status_dir, "unified_status.json"), "w", encoding="utf-8") as f:
                 json.dump(status_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"[export_status 오류] {e}")

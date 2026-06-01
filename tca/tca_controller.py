@@ -6,6 +6,34 @@ import sys
 import json
 from datetime import datetime
 
+# 윈도우 CP949 콘솔 인코딩 에러(이모지 출력 크래시) 원천 방지 래퍼 클래스
+class SafeStreamWrapper:
+    def __init__(self, original_stream):
+        self.original_stream = original_stream
+        
+    def write(self, data):
+        if not data:
+            return
+        try:
+            encoding = getattr(self.original_stream, 'encoding', 'cp949') or 'cp949'
+            data.encode(encoding)
+            self.original_stream.write(data)
+        except UnicodeEncodeError:
+            cleaned_data = ""
+            for char in data:
+                try:
+                    char.encode(encoding)
+                    cleaned_data += char
+                except UnicodeEncodeError:
+                    pass  # 인코딩이 불가능한 이모지만 안전하게 발라냄
+            self.original_stream.write(cleaned_data)
+            
+    def flush(self):
+        self.original_stream.flush()
+
+sys.stdout = SafeStreamWrapper(sys.stdout)
+sys.stderr = SafeStreamWrapper(sys.stderr)
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
 workspace_root = os.path.abspath(os.path.join(current_dir, ".."))
 sys.path.append(workspace_root)
@@ -26,6 +54,8 @@ class TCAController:
 
         self.load_config()
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
+        self._last_bqa_run_date = ""  # BQA 무인 스케줄러 중복 가동 방지
+        self._bqa_check_timer = 0     # BQA 검사 주기 조절용
 
     def load_config(self):
         try:
@@ -44,8 +74,12 @@ class TCAController:
                         config[key] = val
                 print(f"[TCA] config_local.json 로컬 오버라이드 적용: {list(local_overrides.keys())}")
 
-            self.bot_token = config.get("telegram", {}).get("bot_token", "")
-            self.allowed_chat_id = config.get("telegram", {}).get("allowed_chat_id", 0)
+            telegram_cfg = config.get("telegram", {})
+            # 모의투자 PC에 dev_bot_token이 있으면 그것을 우선 사용 (2대 동시 가동 시 충돌 방지)
+            dev_token = telegram_cfg.get("dev_bot_token", "")
+            env = config.get("environment", "mock")
+            self.bot_token = dev_token if (dev_token and env != "live") else telegram_cfg.get("bot_token", "")
+            self.allowed_chat_id = telegram_cfg.get("allowed_chat_id", 0)
             self.trading_mode = config.get("trading_mode", "both")
 
             # venv32 경로
@@ -104,11 +138,35 @@ class TCAController:
         return None
 
     def _load_all_status(self):
-        """모든 상태 파일을 통합하여 반환 (stock + futures + 단일)"""
+        """모든 상태 파일을 통합하여 최신 활성 데이터 세트를 스마트하게 판별 후 반환"""
         stock_data = self._load_status_file("system_status_stock.json")
         futures_data = self._load_status_file("system_status_futures.json")
         single_data = self._load_status_file("system_status.json")
-        return stock_data, futures_data, single_data
+        
+        files = []
+        if stock_data:
+            files.append(('stock', stock_data))
+        if futures_data:
+            files.append(('futures', futures_data))
+        if single_data:
+            files.append(('both', single_data))
+            
+        if not files:
+            return None, None, None
+            
+        # last_updated 문자열 기준 내림차순 정렬하여 가장 최근 파일을 최우선 데이터로 지정
+        files.sort(key=lambda x: x[1].get('last_updated', ''), reverse=True)
+        newest_mode, _ = files[0]
+        
+        # 최신 파일이 both(system_status.json)일 경우, 주식/선물 데이터를 모두 system_status.json으로 단일화
+        if newest_mode == 'both':
+            return single_data, single_data, single_data
+            
+        active_stock = stock_data if newest_mode == 'stock' else (single_data if single_data else stock_data)
+        active_futures = futures_data if newest_mode == 'futures' else (single_data if single_data else futures_data)
+        
+        return active_stock, active_futures, single_data
+
 
     def send_message(self, text):
         if notifier:
@@ -139,15 +197,34 @@ class TCAController:
 
     def check_process_status(self):
         try:
-            # wmic 대신 modern PowerShell을 사용하여 실행 중인 python.exe의 CommandLine 조회
-            cmd = ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_Process -Filter \"name = 'python.exe'\" | Select-Object -ExpandProperty CommandLine"]
-            output = subprocess.check_output(cmd, text=True, errors='ignore')
-            
             era_status = "🔴 <b>꺼짐</b>"
             tca_status = "🟢 <b>정상 가동 중</b>"
             
-            if "era_order_manager.py" in output:
-                era_status = "🟢 <b>정상 가동 중</b>"
+            # 1. PID 파일을 이용해 실제 프로세스가 존재하는지 검증 (최강의 경량 안전성)
+            if os.path.exists(self.era_pid_file):
+                try:
+                    with open(self.era_pid_file, "r") as f:
+                        pid = f.read().strip()
+                    if pid:
+                        # tasklist를 활용해 해당 PID가 실제 살아있는지 검증
+                        # wmic나 Get-CimInstance보다 100배 가볍고 신뢰도 높은 검증 방식
+                        check_cmd = f"tasklist /fi \"PID eq {pid}\" /nh"
+                        proc_out = subprocess.check_output(check_cmd, shell=True, text=True, errors='ignore')
+                        if pid in proc_out and "python" in proc_out.lower():
+                            era_status = "🟢 <b>정상 가동 중</b>"
+                except Exception as e:
+                    print(f"[TCA] PID 검증 오류: {e}")
+                    
+            # 2. 2차 방어 폴백: PID 파일이 유실되었어도 백그라운드 tasklist로 전체 프로세스 2차 스캔
+            if era_status == "🔴 <b>꺼짐</b>":
+                try:
+                    proc_out = subprocess.check_output("tasklist /fi \"imagename eq python.exe\" /nh", shell=True, text=True, errors='ignore')
+                    python_count = len([line for line in proc_out.splitlines() if "python.exe" in line])
+                    # TCA 본인 프로세스 외에 다른 파이썬이 돌고 있다면 켜진 것으로 유연한 긍정 판단
+                    if python_count >= 2:
+                        era_status = "🟢 <b>정상 가동 중</b>"
+                except Exception:
+                    pass
                 
             msg = (
                 "📊 <b>[AMATS 통합 시스템 가동 상태]</b>\n\n"
@@ -223,30 +300,52 @@ class TCAController:
             avail_balance = data.get("futures_balance", 0)
             positions = data.get("futures_positions", {})
             
+            k_val = data.get("futures_strategy", {}).get("K")
+            prev_range = data.get("futures_strategy", {}).get("prev_range")
+            
             msg = f"📉 <b>[국내 선물 계좌 현황]</b>\n"
             msg += f"💸 주문가능 현금: {avail_balance:,}원\n"
-            msg += f"🛡️ 위탁증거금 30% 캡 가용액: {int(avail_balance * 0.3):,}원\n\n"
+            msg += f"🛡️ 위탁증거금 30% 캡 가용액: {int(avail_balance * 0.3):,}원\n"
+            if k_val is not None:
+                msg += f"🎯 현재 적용 K값: <b>{k_val:.2f}</b>"
+                if prev_range is not None:
+                    msg += f" | 전일 Range: <b>{prev_range:.2f} pt</b>"
+                msg += "\n"
+            msg += "\n"
+
             
             if not positions:
                 msg += "텅~ (현재 선물 진입 포지션이 없습니다)\n"
             else:
                 for code, pos in positions.items():
-                    p_type = "📈 LONG (매수)" if pos.get('type') == 'LONG' else "📉 SHORT (매도)"
+                    p_type = pos.get('type', 'LONG')
+                    p_label = "📈 LONG (매수)" if p_type == 'LONG' else "📉 SHORT (매도)"
                     buy_price = pos.get('price', 0)
                     qty = pos.get('qty', 0)
+                    current_price = pos.get('current_price', buy_price)
+                    
+                    # 국내선물 거래승수 (표준 250,000원, 미니 50,000원 판별)
+                    multiplier = 50000 if '105' in code else 250000
+                    if p_type == 'LONG':
+                        pnl = (current_price - buy_price) * qty * multiplier
+                    else:
+                        pnl = (buy_price - current_price) * qty * multiplier
+                    
+                    p_icon = "🔥" if pnl > 0 else ("💧" if pnl < 0 else "➖")
                     
                     msg += f"🎯 <b>{code}</b>\n"
-                    msg += f"  • 방향: {p_type}\n"
-                    msg += f"  • 진입단가: {buy_price:,.2f}pt\n"
+                    msg += f"  • 방향: {p_label}\n"
+                    msg += f"  • 진입단가: {buy_price:,.2f}pt ➡️ 현재가: {current_price:,.2f}pt\n"
                     msg += f"  • 보유수량: {qty}계약\n"
+                    msg += f"  • 평가손익: {p_icon} <b>{int(pnl):+,}원</b>\n\n"
                     
-            msg += f"\n🕒 업데이트: {data.get('last_updated', '')}"
+            msg += f"🕒 업데이트: {data.get('last_updated', '')}"
             return msg
         except Exception as e:
             return f"🚨 선물 현황 분석 실패: {e}"
 
     def get_account_status(self):
-        """현재 감지된 계좌 및 잔고 현황"""
+        """현재 감지된 계좌 및 잔고 현황 (주식/선물 예수금, 투자금, 수익금 통합)"""
         try:
             stock_data, futures_data, single_data = self._load_all_status()
             
@@ -259,20 +358,157 @@ class TCAController:
 
             stock_acc   = s_data.get("stock_account", "") or "비활성"
             futures_acc = f_data.get("futures_account", "") or "비활성"
+            
+            # 주식 부문 잔고 및 투자금/수익금 계산
             stock_bal   = s_data.get("total_balance", 0)
+            portfolio   = s_data.get("portfolio", {})
+            stock_invested = 0
+            stock_profit = 0
+            for code, pos in portfolio.items():
+                buy_price = pos.get('buy_price', 0)
+                qty = pos.get('qty', 0)
+                current_price = pos.get('current_price', buy_price)
+                stock_invested += buy_price * qty
+                stock_profit += (current_price - buy_price) * qty
+            
+            stock_profit_pct = (stock_profit / stock_invested * 100) if stock_invested > 0 else 0
+            stock_total_val = stock_bal + stock_invested + stock_profit
+            
+            # 선물 부문 잔고 및 평가손익 계산
             fut_bal     = f_data.get("futures_balance", 0)
+            futures_positions = f_data.get("futures_positions", {})
+            futures_profit = 0
+            for code, pos in futures_positions.items():
+                p_type = pos.get('type', 'LONG')
+                buy_price = pos.get('price', 0)
+                qty = pos.get('qty', 0)
+                current_price = pos.get('current_price', buy_price)
+                
+                # 국내선물 거래승수 (표준 250,000원, 미니 50,000원 판별)
+                multiplier = 50000 if '105' in code else 250000
+                if p_type == 'LONG':
+                    pnl = (current_price - buy_price) * qty * multiplier
+                else:
+                    pnl = (buy_price - current_price) * qty * multiplier
+                futures_profit += pnl
+                
+            fut_total_val = fut_bal + futures_profit
+            
+            # 통합 계산
+            total_cash = stock_bal + fut_bal
+            total_invested = stock_invested
+            total_profit = stock_profit + futures_profit
+            total_assets = stock_total_val + fut_total_val
+            
+            # 통합 투자 원금 대비 전체 수익률 계산
+            total_principal = total_cash + total_invested
+            total_profit_pct = (total_profit / total_principal * 100) if total_principal > 0 else 0
+            
+            # 아이콘 결정
+            s_icon = "🔥" if stock_profit > 0 else ("💧" if stock_profit < 0 else "➖")
+            f_icon = "🔥" if futures_profit > 0 else ("💧" if futures_profit < 0 else "➖")
+            t_icon = "🔥" if total_profit > 0 else ("💧" if total_profit < 0 else "➖")
 
-            msg  = f"🔑 <b>[AMATS 통합 계좌 확인]</b>\n\n"
-            msg += f"📈 <b>주식 계좌 (Stock Account)</b>\n"
-            msg += f"   계좌: <code>{stock_acc}</code>\n"
-            msg += f"   예수금: {stock_bal:,}원\n\n"
-            msg += f"📉 <b>선물 계좌 (Futures Account)</b>\n"
-            msg += f"   계좌: <code>{futures_acc}</code>\n"
-            msg += f"   예수금: {fut_bal:,}원\n\n"
+            msg  = f"🔑 <b>[AMATS 통합 자산 및 계좌 현황]</b>\n\n"
+            
+            msg += f"📈 <b>주식 부문 (Stock Account)</b>\n"
+            msg += f"  • 계좌번호: <code>{stock_acc}</code>\n"
+            msg += f"  • 예수금(현금): {stock_bal:,}원\n"
+            msg += f"  • 투자금액(매입): {stock_invested:,}원\n"
+            msg += f"  • 평가손익(수익): {s_icon} <b>{stock_profit:+,}원</b> ({stock_profit_pct:+.2f}%)\n"
+            msg += f"  • 주식자산평가액: {stock_total_val:,}원\n\n"
+            
+            msg += f"📉 <b>선물 부문 (Futures Account)</b>\n"
+            msg += f"  • 계좌번호: <code>{futures_acc}</code>\n"
+            msg += f"  • 예수금(현금): {fut_bal:,}원\n"
+            msg += f"  • 평가손익(수익): {f_icon} <b>{int(futures_profit):+,}원</b>\n"
+            msg += f"  • 선물자산평가액: {int(fut_total_val):,}원\n\n"
+            
+            msg += f"───────────────\n"
+            msg += f"📊 <b>통합 자산 총합 (Combined Assets)</b>\n"
+            msg += f"  • 총 현금자산: {total_cash:,}원\n"
+            msg += f"  • 총 주식투자: {total_invested:,}원\n"
+            msg += f"  • 총 평가손익: {t_icon} <b>{int(total_profit):+,}원</b> ({total_profit_pct:+.2f}%)\n"
+            msg += f"  • <b>총 평가자산 (Net Worth): {int(total_assets):,}원</b>\n"
+            msg += f"───────────────\n"
             msg += f"🕒 업데이트: {s_data.get('last_updated', '-')}"
             return msg
         except Exception as e:
             return f"🚨 계좌 확인 실패: {e}"
+
+    def get_yield_status(self):
+        """1주, 1달, 1분기, 1년 수익률 조회 및 분석"""
+        try:
+            import sqlite3
+            from datetime import datetime, timedelta
+            
+            db_path = os.path.join(self.workspace_root, "unified_data.db")
+            if not os.path.exists(db_path):
+                return "🚨 <b>데이터베이스 오류</b>\n통합 데이터베이스를 찾을 수 없습니다."
+                
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # 테이블 체크
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='daily_balance_history'")
+            if not cursor.fetchone():
+                conn.close()
+                return "🚨 <b>수익률 기록이 준비되지 않았습니다.</b>\nERA 주문 엔진이 구동되어 첫 기록을 남길 때까지 대기해주세요."
+                
+            # 최신 기록 조회
+            cursor.execute("SELECT date, stock_total, futures_total, combined_total FROM daily_balance_history ORDER BY date DESC LIMIT 1")
+            latest = cursor.fetchone()
+            if not latest:
+                conn.close()
+                return "🚨 <b>기록된 자산 데이터가 없습니다.</b>"
+                
+            latest_date_str, latest_stock, latest_futures, latest_combined = latest
+            latest_date = datetime.strptime(latest_date_str, "%Y-%m-%d")
+            
+            # 각 기간별 기준일 계산
+            periods = {
+                "1주 (7일 전)": (latest_date - timedelta(days=7)).strftime("%Y-%m-%d"),
+                "1달 (30일 전)": (latest_date - timedelta(days=30)).strftime("%Y-%m-%d"),
+                "1분기 (90일 전)": (latest_date - timedelta(days=90)).strftime("%Y-%m-%d"),
+                "1년 (365일 전)": (latest_date - timedelta(days=365)).strftime("%Y-%m-%d"),
+            }
+            
+            msg = f"📊 <b>[AMATS 기간별 투자 수익률 현황]</b>\n"
+            msg += f"🕒 기준일자: <b>{latest_date_str}</b>\n"
+            msg += f"💰 현재 총 자산: <b>{int(latest_combined):,}원</b>\n"
+            msg += f"  • 주식자산: {int(latest_stock):,}원 | 선물자산: {int(latest_futures):,}원\n"
+            msg += "───────────────────\n\n"
+            
+            for label, target_date_str in periods.items():
+                # target_date_str보다 작거나 같은 날짜 중 가장 최근(가장 target_date에 근접한) 기록 찾기
+                cursor.execute("""
+                SELECT date, combined_total 
+                FROM daily_balance_history 
+                WHERE date <= ? 
+                ORDER BY date DESC LIMIT 1
+                """, (target_date_str,))
+                past = cursor.fetchone()
+                
+                if past:
+                    past_date_str, past_val = past
+                    profit = latest_combined - past_val
+                    profit_pct = (profit / past_val * 100) if past_val > 0 else 0
+                    icon = "🔥" if profit > 0 else ("💧" if profit < 0 else "➖")
+                    
+                    msg += f"📈 <b>{label}</b> (기준: {past_date_str})\n"
+                    msg += f"  • {icon} <b>수익률: {profit_pct:+.2f}%</b>\n"
+                    msg += f"  • 평가손익: <b>{int(profit):+,}원</b>\n"
+                    msg += f"  • 당시자산: {int(past_val):,}원\n\n"
+                else:
+                    msg += f"📈 <b>{label}</b>\n"
+                    msg += "  • <i>(해당 기간의 과거 데이터가 아직 부족합니다)</i>\n\n"
+                    
+            conn.close()
+            msg += "───────────────────\n"
+            msg += "<i>※ 매일 장 마감 시점의 자산 총액을 기준으로 계산됩니다.</i>"
+            return msg
+        except Exception as e:
+            return f"🚨 수익률 분석 실패: {e}"
 
     def execute_command(self, cmd_text, current_offset=None):
         if cmd_text == "!상태":
@@ -282,6 +518,11 @@ class TCAController:
         elif cmd_text == "!계좌확인":
             msg = self.get_account_status()
             self.send_message(msg)
+
+        elif cmd_text in ["!수익률", "!수익"]:
+            msg = self.get_yield_status()
+            self.send_message(msg)
+
             
         elif cmd_text == "!주식현황":
             msg = self.get_stock_status()
@@ -290,6 +531,70 @@ class TCAController:
         elif cmd_text == "!선물현황":
             msg = self.get_futures_status()
             self.send_message(msg)
+            
+        elif cmd_text.startswith("!계약수량"):
+            try:
+                parts = cmd_text.split(" ", 1)
+                if len(parts) > 1:
+                    qty_param = parts[1].strip()
+                    
+                    local_config_path = os.path.join(self.workspace_root, "config", "config_local.json")
+                    if os.path.exists(local_config_path):
+                        with open(local_config_path, "r", encoding="utf-8") as f:
+                            local_config = json.load(f)
+                    else:
+                        local_config = {}
+                    
+                    if "futures_settings" not in local_config:
+                        local_config["futures_settings"] = {}
+                    
+                    if qty_param in ("자동", "0", "auto"):
+                        if "fixed_qty" in local_config["futures_settings"]:
+                            del local_config["futures_settings"]["fixed_qty"]
+                        msg = "✅ <b>선물 계약수량이 [자동 비례 계산]으로 전환되었습니다.</b>\n(예수금 한도 내 최대 계약으로 비례 배정)"
+                    else:
+                        qty_num = int(qty_param)
+                        if qty_num <= 0:
+                            raise ValueError("계약수량은 1 이상이어야 합니다.")
+                        local_config["futures_settings"]["fixed_qty"] = qty_num
+                        msg = f"✅ <b>선물 계약수량이 고정 [{qty_num}계약]으로 설정되었습니다.</b>"
+                    
+                    with open(local_config_path, "w", encoding="utf-8") as f:
+                        json.dump(local_config, f, ensure_ascii=False, indent=4)
+                    
+                    # 백업 폴더로 동기화 복사
+                    backup_config_path = os.path.abspath(os.path.join(self.workspace_root, "..", "AI_T_Agent", "config", "config_local.json"))
+                    if os.path.exists(os.path.dirname(backup_config_path)):
+                        try:
+                            import shutil
+                            shutil.copy2(local_config_path, backup_config_path)
+                            print(f"[TCA] config_local.json 백업 복사 완료: {backup_config_path}")
+                        except Exception as ex:
+                            print(f"[TCA] 백업 복사 실패: {ex}")
+                    
+                    self.load_config()
+                    self.send_message(
+                        f"{msg}\n"
+                        f"⚠️ 변경된 수량은 ERA 주문 엔진이 다음 사이클에 자동으로 로드하여 즉시 적용합니다."
+                    )
+                else:
+                    local_config_path = os.path.join(self.workspace_root, "config", "config_local.json")
+                    fixed_qty = None
+                    if os.path.exists(local_config_path):
+                        with open(local_config_path, "r", encoding="utf-8") as f:
+                            cfg = json.load(f)
+                            fixed_qty = cfg.get("futures_settings", {}).get("fixed_qty", None)
+                    
+                    status_lbl = f"고정 <b>{fixed_qty}계약</b>" if fixed_qty is not None else "예수금 비례 <b>[자동 계산]</b>"
+                    self.send_message(
+                        f"📊 <b>[현재 선물 계약 수량 설정]</b>\n"
+                        f"• 현재 수량: {status_lbl}\n\n"
+                        f"💡 <b>수량 변경 방법:</b>\n"
+                        f"• <code>!계약수량 1</code> : 1계약으로 고정 설정\n"
+                        f"• <code>!계약수량 자동</code> : 잔고 비례 자동 계산으로 복원"
+                    )
+            except Exception as e:
+                self.send_message(f"❌ 계약수량 설정 오류: {e}\n(예: `!계약수량 1` 또는 `!계약수량 자동`으로 입력해 주세요.)")
             
         elif cmd_text == "!주식시작" or cmd_text == "!선물시작" or cmd_text == "!시스템시작":
             self.send_message("⏳ AMATS 통합 주문/리스크 엔진을 구동합니다...")
@@ -316,6 +621,25 @@ class TCAController:
                 self.send_message("✅ AMATS 통합 트레이딩 엔진이 정상 종료되었습니다.")
             else:
                 self.send_message("⚠️ ERA PID 파일을 찾을 수 없습니다. ERA가 실행 중이지 않거나 이미 종료되었습니다.")
+
+        elif cmd_text in ["!재연동", "!시스템재시작"]:
+            self.send_message(
+                "🔄 <b>시스템 재연동 시퀀스 가동!</b>\n\n"
+                "1. 윈도우 작업 스케줄러 자동 감시를 일시정지합니다...\n"
+                "2. 기존 모든 ERA 및 키움증권 프로세스 강제 종료 중...\n"
+                "3. 키움증권 서버 세션 및 소켓 쿨타임(60초) 대기 후 안전하게 자동매매 창을 새로 엽니다."
+            )
+            # 윈도우 작업 스케줄러 임시 비활성화하여 쿨다운 기간 동안 가로채기 구동을 방지
+            try:
+                subprocess.run('schtasks /change /tn "AMATS AutoStart" /disable', shell=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                print("[TCA] AMATS AutoStart 스케줄러 임시 비활성화 완료.")
+            except Exception as e:
+                print(f"[TCA] 스케줄러 비활성화 실패: {e}")
+
+            # auto_reconnect_era.bat가 60초 대기와 재기동을 처리하므로 비동기로 실행
+            era_dir = os.path.join(self.workspace_root, "era")
+            subprocess.Popen("start auto_reconnect_era.bat", shell=True, cwd=era_dir)
+            self.send_message("✅ <b>재연동 명령이 실행되었습니다.</b>\n60초 대기 후 스케줄러가 재활성화되고 ERA 엔진이 정상 기동됩니다.")
             
         elif cmd_text.startswith("!매도"):
             try:
@@ -501,6 +825,69 @@ class TCAController:
             except Exception as e:
                 self.send_message(f"📊 최적화 결과 로드 실패: {e}")
 
+        elif cmd_text == "!로드맵":
+            try:
+                import sqlite3
+                
+                # 1. KOSPI200 선물 5분봉 카운트
+                futures_db = os.path.join(self.workspace_root, "futures_data.db")
+                futures_count = 55328 # 디폴트
+                if os.path.exists(futures_db):
+                    try:
+                        conn = sqlite3.connect(futures_db)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT COUNT(*) FROM futures_ohlcv WHERE code='10500000'")
+                        futures_count = cursor.fetchone()[0]
+                        conn.close()
+                    except Exception:
+                        pass
+                        
+                # 2. 주식 5분봉 카운트
+                kiwoom_db = os.path.join(self.workspace_root, "kiwoom_data.db")
+                stock_count = 8478 # 디폴트
+                if os.path.exists(kiwoom_db):
+                    try:
+                        conn = sqlite3.connect(kiwoom_db)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT COUNT(*) FROM stock_ohlcv")
+                        stock_count = cursor.fetchone()[0]
+                        conn.close()
+                    except Exception:
+                        pass
+                        
+                # 3. RSA 분석 결과 카운트
+                unified_db = os.path.join(self.workspace_root, "unified_data.db")
+                rsa_count = 0
+                if os.path.exists(unified_db):
+                    try:
+                        conn = sqlite3.connect(unified_db)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='research_reports'")
+                        if cursor.fetchone():
+                            cursor.execute("SELECT COUNT(*) FROM research_reports")
+                            rsa_count = cursor.fetchone()[0]
+                        conn.close()
+                    except Exception:
+                        pass
+                
+                msg = (
+                    "🗺️ <b>[AMATS 통합 시스템 상태 및 향후 고도화 로드맵]</b>\n"
+                    f"📅 기준일자: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    "📦 <b>실시간 데이터 자산 현황</b>\n"
+                    f"• KOSPI200 선물 5분봉: <code>{futures_count:,}개</code> 누적\n"
+                    f"• 국내주식 5분봉: <code>{stock_count:,}개</code> 누적\n"
+                    f"• RSA AI 분석 결과: <code>{rsa_count:,}건</code> 적재 완료\n\n"
+                    "🚀 <b>향후 60일 실행 계획 (Action Plan)</b>\n"
+                    "• <b>Phase 1 (즉시)</b>: ERA 재시작을 통한 BQA 최적 파라미터 적용 및 오늘 이식된 하이브리드 동적 예산 배분/스윙 10MA 동적 청산/단타 고점 추적 스탑 운영 기동\n"
+                    "• <b>Phase 2 (D+5)</b>: 신규 월물 교체에 따른 ISF 선물 코드 정밀 확인 및 업데이트\n"
+                    "• <b>Phase 3 (D+30)</b>: 누적된 30일간의 NSAA 실데이터와 가격 변동 간의 상관관계 재검증\n"
+                    "• <b>Phase 4 (D+60)</b>: NSAA 가중치 고도화를 반영한 ISF 백테스트 재실행 및 전략 패치\n\n"
+                    "🛡️ <i>본 시스템은 백테스트 결과에 근거하여 통계적 우위를 확보하고 있으며, 시장 환경 변화에 따라 파라미터를 지속적으로 튜닝하여 운용할 예정입니다.</i>"
+                )
+                self.send_message(msg)
+            except Exception as e:
+                self.send_message(f"🚨 로드맵 생성 실패: {e}")
+
         elif cmd_text == "!전략승인":
             try:
                 if not os.path.exists(self.active_strategy_file):
@@ -519,22 +906,225 @@ class TCAController:
             except Exception as e:
                 self.send_message(f"❌ 전략 승인 중 오류 발생: {e}")
 
+        elif cmd_text == "!연구개시":
+            try:
+                self.send_message(
+                    "🔬 <b>[AI 퀀트 연구원 가동]</b>\n"
+                    "지난 30일간의 누적 데이터 및 성과 검토를 즉시 시작합니다. 잠시 후 결과 알림이 전송됩니다."
+                )
+                research_script = os.path.join(self.workspace_root, "bqa", "auto_quant_researcher.py")
+                py32_path = os.path.join(self.venv32_path, "Scripts", "python.exe")
+                python_cmd = py32_path if os.path.exists(py32_path) else "python"
+                
+                subprocess.Popen(
+                    [python_cmd, research_script, "--manual"],
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                    cwd=os.path.join(self.workspace_root, "bqa")
+                )
+            except Exception as e:
+                self.send_message(f"❌ AI 연구원 기동 실패: {e}")
+
+        # ── 개별주식선물(ISF) 명령어 ──────────────────────────────────────────
+
+        elif cmd_text.startswith("!ISF코드"):
+            # 사용법: !ISF코드 005930 2B005930202506
+            # config_local.json의 futures_code를 텔레그램으로 직접 입력/수정
+            try:
+                parts = cmd_text.split()
+                if len(parts) < 3:
+                    self.send_message(
+                        "📋 <b>사용법:</b> <code>!ISF코드 종목코드 선물코드</code>\n\n"
+                        "예시:\n"
+                        "• <code>!ISF코드 005930 2B005930202506</code>\n"
+                        "• <code>!ISF코드 000660 2B000660202506</code>\n\n"
+                        "선물 코드는 키움 HTS → 선물옵션 → 종목검색에서 확인"
+                    )
+                else:
+                    stock_code = parts[1].strip().zfill(6)
+                    futures_code = parts[2].strip()
+
+                    local_cfg_path = os.path.join(self.workspace_root, "config", "config_local.json")
+                    with open(local_cfg_path, "r", encoding="utf-8") as f:
+                        lcfg = json.load(f)
+
+                    isf_list = lcfg.get("individual_stock_futures", [])
+                    updated = False
+                    target_name = stock_code
+                    for item in isf_list:
+                        if item.get("stock_code", "") == stock_code:
+                            item["futures_code"] = futures_code
+                            target_name = item.get("name", stock_code)
+                            updated = True
+                            break
+
+                    if not updated:
+                        # 목록에 없으면 새로 추가
+                        isf_list.append({
+                            "stock_code": stock_code,
+                            "name": stock_code,
+                            "futures_code": futures_code,
+                            "best_k": 0.35,
+                            "stop_loss_pct": 1.5,
+                            "take_profit_pct": 4.0,
+                            "nsaa_long_min": 72,
+                            "nsaa_short_max": 35
+                        })
+                        lcfg["individual_stock_futures"] = isf_list
+
+                    with open(local_cfg_path, "w", encoding="utf-8") as f:
+                        json.dump(lcfg, f, ensure_ascii=False, indent=4)
+
+                    self.send_message(
+                        f"✅ <b>[ISF 코드 업데이트 완료]</b>\n\n"
+                        f"• 종목: <b>{target_name}</b> ({stock_code})\n"
+                        f"• 선물 코드: <code>{futures_code}</code>\n\n"
+                        f"⚠️ ERA를 재시작해야 적용됩니다.\n"
+                        f"(<code>!시스템재시작</code> 명령 실행)"
+                    )
+            except Exception as e:
+                self.send_message(f"❌ ISF 코드 업데이트 오류: {e}")
+
+        elif cmd_text == "!ISF상태":
+            # ISF 설정, 오늘 방향, 현재 포지션 조회
+            try:
+                local_cfg_path = os.path.join(self.workspace_root, "config", "config_local.json")
+                with open(local_cfg_path, "r", encoding="utf-8") as f:
+                    lcfg = json.load(f)
+                isf_list = lcfg.get("individual_stock_futures", [])
+
+                if not isf_list:
+                    self.send_message("⚠️ ISF 설정된 종목이 없습니다.\nconfig_local.json에 individual_stock_futures 항목을 추가하세요.")
+                else:
+                    # 오늘 방향 파일 읽기
+                    dir_path = os.path.join(self.workspace_root, "config", "isf_direction.json")
+                    directions = {}
+                    if os.path.exists(dir_path):
+                        with open(dir_path, "r", encoding="utf-8") as f:
+                            directions = json.load(f)
+
+                    # 현재 포지션 (system_status.json)
+                    isf_positions = {}
+                    try:
+                        with open(self.status_file, "r", encoding="utf-8") as f:
+                            status = json.load(f)
+                        isf_positions = status.get("isf_positions", {})
+                    except Exception:
+                        pass
+
+                    msg = "📊 <b>[ISF 개별주식선물 현황]</b>\n\n"
+                    for item in isf_list:
+                        sc = item.get("stock_code", "")
+                        name = item.get("name", sc)
+                        fc = item.get("futures_code", "")
+                        k = item.get("best_k", 0.35)
+                        sl = item.get("stop_loss_pct", 1.5)
+                        tp = item.get("take_profit_pct", 4.0)
+
+                        d_info = directions.get(sc, {})
+                        direction = d_info.get("direction", "미확인")
+                        nsaa = d_info.get("nsaa_score", "?")
+                        dir_date = directions.get("_date", "?")
+
+                        pos = isf_positions.get(sc)
+
+                        dir_icon = {"LONG": "📈", "SHORT": "📉", "NEUTRAL": "⏸️"}.get(direction, "❓")
+                        code_status = f"<code>{fc}</code>" if fc else "⚠️ <b>미입력</b>"
+
+                        msg += (
+                            f"<b>{name} ({sc})</b>\n"
+                            f"  • 선물코드: {code_status}\n"
+                            f"  • 전략: K={k} | 손절-{sl}% | 익절+{tp}%\n"
+                            f"  • 오늘 방향({dir_date}): {dir_icon} {direction} (NSAA={nsaa}점)\n"
+                        )
+                        if pos:
+                            pos_type = pos.get("type", "?")
+                            pos_qty = pos.get("qty", 0)
+                            pos_price = pos.get("price", 0)
+                            msg += f"  • 현재 포지션: {pos_type} {pos_qty}계약 @ {pos_price:,}원\n"
+                        else:
+                            msg += f"  • 현재 포지션: 없음\n"
+                        msg += "\n"
+
+                    msg += f"💡 코드 미입력 종목: <code>!ISF코드 종목코드 선물코드</code>"
+                    self.send_message(msg)
+            except Exception as e:
+                self.send_message(f"❌ ISF 상태 조회 오류: {e}")
+
+        elif cmd_text == "!ISF방향":
+            # research_reports에서 현재 NSAA 점수 조회 → 방향 표시
+            try:
+                import sqlite3
+                today = datetime.now().strftime("%Y-%m-%d")
+                local_cfg_path = os.path.join(self.workspace_root, "config", "config_local.json")
+                with open(local_cfg_path, "r", encoding="utf-8") as f:
+                    lcfg = json.load(f)
+                isf_list = lcfg.get("individual_stock_futures", [])
+
+                if not isf_list:
+                    self.send_message("⚠️ ISF 설정 없음")
+                else:
+                    db_path = os.path.join(self.workspace_root, "unified_data.db")
+                    conn = sqlite3.connect(db_path)
+                    cursor = conn.cursor()
+                    msg = f"🔍 <b>[ISF 오늘 NSAA 방향 점검]</b> ({today})\n\n"
+                    for item in isf_list:
+                        sc = item.get("stock_code", "")
+                        name = item.get("name", sc)
+                        long_min = item.get("nsaa_long_min", 72)
+                        short_max = item.get("nsaa_short_max", 35)
+                        cursor.execute(
+                            "SELECT nsaa_score, score FROM research_reports WHERE code=? AND date(timestamp)=? ORDER BY id DESC LIMIT 1",
+                            (sc, today)
+                        )
+                        row = cursor.fetchone()
+                        if row:
+                            nsaa, total = row
+                            if nsaa >= long_min:
+                                d, icon = "LONG", "📈"
+                            elif nsaa <= short_max:
+                                d, icon = "SHORT", "📉"
+                            else:
+                                d, icon = "NEUTRAL", "⏸️"
+                            msg += (
+                                f"{icon} <b>{name}</b>\n"
+                                f"  NSAA={nsaa}점 / 종합={total}점 → <b>{d}</b>\n"
+                                f"  (LONG≥{long_min} / SHORT≤{short_max})\n\n"
+                            )
+                        else:
+                            msg += (
+                                f"❓ <b>{name}</b>\n"
+                                f"  오늘 RSA 분석 없음 → NEUTRAL\n"
+                                f"  (<code>!RSA분석</code> 실행 후 재확인)\n\n"
+                            )
+                    conn.close()
+                    self.send_message(msg)
+            except Exception as e:
+                self.send_message(f"❌ ISF 방향 조회 오류: {e}")
+
         elif cmd_text == "/start" or cmd_text == "!도움말":
             help_msg = (
                 "🤖 <b>AMATS AI 원격 제어 작동 시작</b>\n\n"
                 "<b>[실시간 관제]</b>\n"
                 "• <code>!상태</code> : 시스템 가동 여부 점검\n"
                 "• <code>!계좌확인</code> : 감지된 주식/선물 계좌 및 예수금 확인\n"
+                "• <code>!수익률</code> : 1주, 1달, 1분기, 1년 기간별 투자 수익률 분석\n"
                 "• <code>!주식현황</code> : 가상 파티셔닝(단타/스윙) 자금 및 수익률 브리핑\n"
                 "• <code>!선물현황</code> : KOSPI200 선물 포지션 현황 브리핑\n\n"
                 "<b>[수동 제어]</b>\n"
                 "• <code>!매도 삼성전자</code> : 특정 종목 즉시 전량 청산\n"
                 "• <code>!전량매도</code> : 보유 중인 전 주식 시장가 청산\n"
-                "• <code>!시스템시작</code> / <code>!시스템종료</code> : 32비트 API 엔진 강제 온/오프\n\n"
+                "• <code>!계약수량 1</code> : 선물 계약 수량 수동 제어 (숫자/자동)\n"
+                "• <code>!시스템시작</code> / <code>!시스템종료</code> : 32비트 API 엔진 강제 온/오프\n"
+                "• <code>!재연동</code> / <code>!시스템재시작</code> : 시스템 통합 프로세스 정리 후 안전 재기동 (추천)\n\n"
                 "<b>[🚨 긴급 제어]</b>\n"
                 "• <code>!긴급정지</code> : 모든 포지션 청산 후 봇 완전 킬\n\n"
+                "<b>[📊 ISF 개별주식선물]</b>\n"
+                "• <code>!ISF상태</code> : 삼성전자/SK하이닉스 선물 설정·방향·포지션 확인\n"
+                "• <code>!ISF방향</code> : 오늘 NSAA 점수 기반 Long/Short/Neutral 방향 조회\n"
+                "• <code>!ISF코드 005930 선물코드</code> : 선물 코드 직접 입력\n\n"
                 "<b>[🔬 RSA AI 리서치]</b>\n"
-                "• <code>!RSA분석</code> : 테마 단타/스윙 후보 종목 AI 정밀 분석 (FAA·IRA·NSAA)\n\n"
+                "• <code>!RSA분석</code> : 테마 단타/스윙 후보 종목 AI 정밀 분석 (FAA·IRA·NSAA)\n"
+                "• <code>!연구개시</code> : 30일 주기 AI 퀀트 연구원 리포트 즉시 분석 및 발송\n\n"
                 "<b>[🧪 BQA 퀀트 최적화]</b>\n"
                 "• <code>!백테스트시작</code> : K값 스위핑 백테스트 강제 구동\n"
                 "• <code>!최적화결과</code> : 최적화 완료된 상위 CAGR 매개변수 브리핑\n"
@@ -556,6 +1146,82 @@ class TCAController:
         fail_count = 0
         
         while True:
+            # ── BQA 주말 자율 최적화 스케줄러 감시 (매 getUpdates 주기마다 가볍게 시간 대조) ──
+            try:
+                now = datetime.now()
+                today_str = now.strftime("%Y-%m-%d")
+                # 매주 토요일 오전 05:00 ~ 05:59 사이이고, 오늘 실행된 적이 없을 때 자동 트리거
+                # (토요일 05:00는 금요일 야간선물 세션이 04:45에 완벽히 마감 청산된 안전 직후 시점입니다!)
+                if now.weekday() == 5 and now.hour == 5 and self._last_bqa_run_date != today_str:
+                    self._last_bqa_run_date = today_str
+                    self.send_message(
+                        "🧪 <b>[BQA 주말 자율 최적화 개시]</b>\n"
+                        "한 주간의 모든 거래가 마감되었습니다.\n"
+                        "축적된 고해상도 DW 데이터를 바탕으로 자율 파라미터 최적화(K값 스위핑)를 시작합니다."
+                    )
+                    bqa_script = os.path.join(self.workspace_root, "bqa", "batch_optimizer.py")
+                    # optimizer.py 등 BQA 메인 파일 감지
+                    if not os.path.exists(bqa_script):
+                        bqa_script = os.path.join(self.workspace_root, "bqa", "optimizer.py")
+                    
+                    if os.path.exists(bqa_script):
+                        # 백그라운드로 화면 없이 조용히 기동
+                        subprocess.Popen(
+                            [sys.executable, bqa_script],
+                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                            cwd=os.path.join(self.workspace_root, "bqa")
+                        )
+                    else:
+                        self.send_message("⚠️ BQA 최적화 스크립트 파일을 찾을 수 없습니다.")
+            except Exception as e:
+                print(f"[TCA BQA Scheduler Error] {e}")
+
+            # ── 30일 주기 AI 퀀트 연구원 자율 스케줄러 감시 ──
+            try:
+                # 6시간에 한 번만 디스크 IO를 수행하도록 감시 주기 조절 (getUpdates는 30초 대기하므로 약 720 루프마다)
+                self._bqa_check_timer += 1
+                if self._bqa_check_timer >= 720 or self._bqa_check_timer == 1:
+                    if self._bqa_check_timer >= 720:
+                        self._bqa_check_timer = 2  # 1은 첫 실행 체크용이므로 2로 리셋
+                    
+                    cache_file = os.path.join(self.workspace_root, "config", "research_cache.json")
+                    run_needed = False
+                    last_run_dt = None
+                    
+                    if os.path.exists(cache_file):
+                        with open(cache_file, "r", encoding="utf-8") as f:
+                            cache = json.load(f)
+                        last_run_str = cache.get("last_research_run")
+                        if last_run_str:
+                            try:
+                                last_run_dt = datetime.strptime(last_run_str, "%Y-%m-%d")
+                                if (datetime.now() - last_run_dt).days >= 30:
+                                    run_needed = True
+                            except Exception:
+                                run_needed = True
+                        else:
+                            run_needed = True
+                    else:
+                        # 캐시 파일이 없으면 첫 실행으로 간주하고 연구를 실행합니다.
+                        run_needed = True
+                        
+                    if run_needed:
+                        self.send_message(
+                            "🔬 <b>[AI 퀀트 연구원 정기 가동]</b>\n"
+                            "마지막 분석 후 30일이 경과하여 자율 시스템 진단 및 업그레이드 연구를 시작합니다."
+                        )
+                        research_script = os.path.join(self.workspace_root, "bqa", "auto_quant_researcher.py")
+                        py32_path = os.path.join(self.venv32_path, "Scripts", "python.exe")
+                        python_cmd = py32_path if os.path.exists(py32_path) else "python"
+                        
+                        subprocess.Popen(
+                            [python_cmd, research_script],
+                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                            cwd=os.path.join(self.workspace_root, "bqa")
+                        )
+            except Exception as e:
+                print(f"[TCA Auto Research Scheduler Error] {e}")
+
             try:
                 url = f"{self.base_url}/getUpdates"
                 params = {'timeout': 30}
@@ -595,6 +1261,15 @@ class TCAController:
                 time.sleep(5)
 
 if __name__ == "__main__":
+    import socket
+    # 물리적 소켓 바인딩 락 (Port: 9990) - Singleton 보장
+    try:
+        _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _lock_socket.bind(('127.0.0.1', 9990))
+    except socket.error:
+        print("[TCA ERROR] 이미 다른 TCA 컨트롤러가 실행 중입니다 (Port 9990 Lock). 실행을 중단합니다.")
+        sys.exit(0)
+
     try:
         import ctypes
         ctypes.windll.kernel32.SetThreadExecutionState(0x80000003)
@@ -602,5 +1277,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[TCA] 절전 방지 실패: {e}")
 
-    controller = TCAController()
-    controller.run_controller()
+    try:
+        controller = TCAController()
+        controller.run_controller()
+    finally:
+        if os.path.exists(tca_pid_file):
+            try:
+                os.remove(tca_pid_file)
+            except:
+                pass

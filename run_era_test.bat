@@ -1,7 +1,7 @@
 @echo off
-chcp 65001 > nul
+rem chcp 65001 (Disabled to prevent CMD UTF-8 parser bug)
 echo ========================================
-echo   ERA ì—ëŸ¬ ì§„ë‹¨ ì‹œì‘
+echo   ERA ¿¡·¯ Áø´Ü ½ÃÀÛ
 echo ========================================
 echo.
 "c:\Antigravity\AI_T_Agent\venv32\Scripts\python.exe" "c:\Antigravity\AI_T_Agent\test_era.py"

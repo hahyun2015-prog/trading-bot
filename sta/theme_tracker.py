@@ -91,7 +91,7 @@ class ThemeTracker:
                     if stock_count >= top_n_stocks:
                         break
 
-                    name_td = row.select("td.col_type1 a")
+                    name_td = row.select("td.name a")
                     if name_td:
                         stock_name = name_td[0].text.strip()
                         stock_code = name_td[0]["href"].split("code=")[1]

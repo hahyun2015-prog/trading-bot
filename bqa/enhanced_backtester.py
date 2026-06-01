@@ -13,10 +13,16 @@ import sqlite3
 import os
 import sys
 import json
+import io
 import pandas as pd
 import numpy as np
 import ta
 from datetime import datetime
+
+# Prevent encoding crashes in CP949 environment (Windows console)
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 workspace_root = os.path.abspath(os.path.join(current_dir, ".."))

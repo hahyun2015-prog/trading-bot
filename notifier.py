@@ -3,20 +3,64 @@ import sys
 import json
 import requests
 
+# 윈도우 CP949 콘솔 인코딩 에러(이모지 출력 크래시) 원천 방지 래퍼 클래스
+class SafeStreamWrapper:
+    def __init__(self, original_stream):
+        self.original_stream = original_stream
+        
+    def write(self, data):
+        if not data:
+            return
+        try:
+            encoding = getattr(self.original_stream, 'encoding', 'cp949') or 'cp949'
+            data.encode(encoding)
+            self.original_stream.write(data)
+        except UnicodeEncodeError:
+            cleaned_data = ""
+            for char in data:
+                try:
+                    char.encode(encoding)
+                    cleaned_data += char
+                except UnicodeEncodeError:
+                    pass  # 인코딩이 불가능한 이모지만 안전하게 발라냄
+            self.original_stream.write(cleaned_data)
+            
+    def flush(self):
+        self.original_stream.flush()
+
+sys.stdout = SafeStreamWrapper(sys.stdout)
+sys.stderr = SafeStreamWrapper(sys.stderr)
+
 def _load_config():
-    # 이 스크립트 위치 기준으로 config.json을 탐색하거나 절대경로로 로드
     current_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(current_dir, 'config', 'config.json')
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            cfg = json.load(f)
     except Exception as e:
         print(f"[notifier] config.json 로드 실패: {e}")
         return {}
+    # config_local.json 오버라이드 (동기화 제외 파일)
+    local_path = os.path.join(current_dir, 'config', 'config_local.json')
+    if os.path.exists(local_path):
+        try:
+            with open(local_path, 'r', encoding='utf-8') as f:
+                local = json.load(f)
+            for key, val in local.items():
+                if isinstance(val, dict) and isinstance(cfg.get(key), dict):
+                    cfg[key].update(val)
+                else:
+                    cfg[key] = val
+        except Exception:
+            pass
+    return cfg
 
 _CONFIG = _load_config()
 _TELEGRAM = _CONFIG.get("telegram", {})
-BOT_TOKEN = _TELEGRAM.get("bot_token")
+_ENV = _CONFIG.get("environment", "mock")
+# 모의투자 PC에 dev_bot_token이 있으면 그것을 사용 (2대 동시 가동 시 알림 채널 분리)
+_DEV_TOKEN = _TELEGRAM.get("dev_bot_token", "")
+BOT_TOKEN = _DEV_TOKEN if (_DEV_TOKEN and _ENV != "live") else _TELEGRAM.get("bot_token")
 CHAT_ID = _TELEGRAM.get("allowed_chat_id")
 
 def send_message(text):

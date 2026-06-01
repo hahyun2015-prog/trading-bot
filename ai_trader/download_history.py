@@ -26,14 +26,23 @@ class DataDownloader:
         self._init_db()
         
         self.target_stocks = [
+            {"code": "005930", "name": "삼성전자"},
+            {"code": "000660", "name": "SK하이닉스"},
             {"code": "005380", "name": "현대차"},
-            {"code": "012450", "name": "한화에어로스페이스"}
+            {"code": "012450", "name": "한화에어로스페이스"},
+            {"code": "274090", "name": "AP위성"},
+            {"code": "027360", "name": "에이텍"},
+            {"code": "036930", "name": "주성엔지니어링"},
+            {"code": "131290", "name": "토비스"},
+            {"code": "001450", "name": "현대해상"},
+            {"code": "003690", "name": "코리안리"},
+            {"code": "000370", "name": "한화손해보험"}
         ]
         
         self.current_stock_code = ""
         self.has_next = False
         self.request_count = 0
-        self.max_requests_per_stock = 4 # 1요청 = 약 900개. 4번 = 3600개 (약 1.3개월)
+        self.max_requests_per_stock = 8 # 8번 = 약 7200개 (약 1.6개월 이상)
         
         print("[DataDownloader] 키움증권 서버 로그인 중...")
         self.kiwoom.dynamicCall("CommConnect()")
@@ -54,6 +63,18 @@ class DataDownloader:
                 UNIQUE(code, date)
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS intraday_ohlcv (
+                code TEXT,
+                date TEXT,
+                open INTEGER,
+                high INTEGER,
+                low INTEGER,
+                close INTEGER,
+                volume INTEGER,
+                UNIQUE(code, date)
+            )
+        ''')
         self.db_conn.commit()
         
     def _on_login(self, err_code):
@@ -63,16 +84,17 @@ class DataDownloader:
             print(f"[DataDownloader] 로그인 실패 (에러코드: {err_code})")
         if self.login_loop:
             self.login_loop.exit()
-
+ 
     def download_data(self):
         cursor = self.db_conn.cursor()
         
         for stock in self.target_stocks:
             self.current_stock_code = stock["code"]
-            print(f"\n[다운로드 시작] {stock['name']} ({self.current_stock_code}) - 과거 1개월 3분봉")
+            print(f"\n[다운로드 시작] {stock['name']} ({self.current_stock_code}) - 과거 1.6개월 3분봉")
             
             # 이전 백테스트 데이터 삭제
             cursor.execute("DELETE FROM backtest_ohlcv WHERE code = ?", (self.current_stock_code,))
+            cursor.execute("DELETE FROM intraday_ohlcv WHERE code = ?", (self.current_stock_code,))
             self.db_conn.commit()
             
             self.has_next = False
@@ -124,6 +146,10 @@ class DataDownloader:
                 try:
                     cursor.execute('''
                         INSERT INTO backtest_ohlcv (code, date, open, high, low, close, volume)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (self.current_stock_code, date, open_p, high_p, low_p, close_p, vol))
+                    cursor.execute('''
+                        INSERT INTO intraday_ohlcv (code, date, open, high, low, close, volume)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                     ''', (self.current_stock_code, date, open_p, high_p, low_p, close_p, vol))
                     inserted += 1

@@ -1,61 +1,52 @@
 @echo off
-chcp 65001 > nul
-for /F %%a in ('echo prompt $E ^| cmd') do set "ESC=%%a"
-set "R=%ESC%[0m"
-set "BOLD=%ESC%[1m"
-set "RED=%ESC%[91m"
-set "GRN=%ESC%[92m"
-set "YLW=%ESC%[93m"
-set "CYN=%ESC%[96m"
-set "GRY=%ESC%[90m"
-set "WHT=%ESC%[97m"
-
+title AMATS ERA Order Manager
 cls
-echo.
-echo %GRY%  ════════════════════════════════════════════════════%R%
-echo   %CYN%%BOLD%AMATS%R%  %RED%%BOLD%[ ERA ]%R%  %WHT%주문 / 리스크 관리 엔진%R%
-echo %GRY%  ════════════════════════════════════════════════════%R%
-echo   %GRY%Kiwoom OpenAPI  ·  32bit Python  ·  실시간 자동매매%R%
-echo %GRY%  ────────────────────────────────────────────────────%R%
+echo ==========================================================
+echo   AMATS [ ERA ] Order & Risk Management Engine
+echo ==========================================================
+echo   Kiwoom OpenAPI - 32bit Python Virtual Environment
+echo ----------------------------------------------------------
 echo.
 
-if not exist "%~dp0venv32\Scripts\python.exe" (
-    echo   %RED%[오류]%R%  venv32 가상환경을 찾을 수 없습니다.
-    echo   %YLW%[조치]%R%  %WHT%setup_env.bat%R% 을 먼저 실행하세요.
+:: Set working directory to the directory of this batch file
+cd /d "%~dp0"
+
+if not exist "venv32\Scripts\python.exe" (
+    echo [ERROR] venv32 environment not found!
+    echo Please run setup_env.bat first.
     echo.
     pause
     exit /b 1
 )
 
-echo   %GRN%[확인]%R%  venv32 가상환경 감지됨
+echo [OK] venv32 python verified.
 echo.
 
-:: ── 코드 자동 업데이트 (git pull) ───────────────────────────────
+:: Auto git pull updates
 where git >nul 2>&1
 if %errorlevel% equ 0 (
-    echo   %CYN%[동기화]%R%  GitHub 최신 코드 확인 중...
-    git -C "%~dp0" pull origin main --quiet 2>&1
+    echo [GIT] Checking latest GitHub repository updates...
+    git pull origin main --quiet 2>&1
     if %errorlevel% equ 0 (
-        echo   %GRN%[동기화]%R%  코드 최신 상태 확인 완료
-        for /f %%v in ('git -C "%~dp0" log --oneline -1') do echo   %GRY%         버전: %%v%R%
+        echo [GIT] GitHub code is up to date.
+        for /f "usebackq tokens=*" %%v in (`git log --oneline -1`) do echo Latest Commit: %%v
     ) else (
-        echo   %YLW%[동기화]%R%  git pull 실패 — 현재 버전으로 계속 실행합니다.
+        echo [GIT] git pull failed. Starting with local codebase...
     )
 ) else (
-    echo   %GRY%[동기화]%R%  git 미설치 — 코드 동기화 건너뜀
+    echo [GIT] git not installed. Skipping auto-update...
 )
 echo.
 
-echo   %YLW%[시작]%R%  ERA 엔진 구동 중...
-echo   %GRY%         종료: Ctrl+C 또는 창 닫기%R%
-echo.
-echo %GRY%  ────────────────────────────────────────────────────%R%
+echo [OK] Starting ERA Order Manager...
+echo      To terminate, press Ctrl+C or close this window.
+echo ----------------------------------------------------------
 echo.
 
-"%~dp0venv32\Scripts\python.exe" "%~dp0era\era_order_manager.py"
+"venv32\Scripts\python.exe" "era\era_order_manager.py"
 
 echo.
-echo %GRY%  ────────────────────────────────────────────────────%R%
-echo   %YLW%[종료]%R%  ERA 엔진이 중지되었습니다.
+echo ----------------------------------------------------------
+echo [OK] ERA Order Manager has terminated.
 echo.
 pause

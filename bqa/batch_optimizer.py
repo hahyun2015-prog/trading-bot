@@ -175,22 +175,58 @@ def optimize():
             ratio = res['cagr'] / max(res['mdd'], 0.1)
             print(f"{res['K']:>6.2f} | {res['trades']:>6} | {res['win_rate']:>7.1f} | {res['cagr']:>8.2f} | {res['mdd']:>7.2f} | {ratio:>8.2f}")
 
+    # ── 자율 피드백 고리 (Sharpe/MDD 기반 자율 핫-리로드 & 텔레그램 알림) ──
     if not results:
-        print("유효한 결과가 없습니다 (거래 횟수 부족).")
+        print("유효한 백테스트 결과가 없습니다. 데이터를 확인하세요.")
         return
 
-    # CAGR/MDD 비율로 정렬 (위험조정 수익 최적화)
-    results.sort(key=lambda x: x['cagr'] / max(x['mdd'], 0.1), reverse=True)
-    top_results = results[:3]
+    top_results = sorted(results, key=lambda x: x['cagr'] / max(x['mdd'], 0.1), reverse=True)
 
-    print("\n=== 최적화 결과 Top 3 (CAGR/MDD 비율 기준) ===")
-    for i, r in enumerate(top_results):
-        ratio = r['cagr'] / max(r['mdd'], 0.1)
-        print(f"  Top{i+1}: K={r['K']} | CAGR={r['cagr']}% | MDD={r['mdd']}% | CAGR/MDD={ratio:.2f} | 승률={r['win_rate']}%")
+    old_best_k = 0.5
+    old_ratio = 0.0
 
-    best_k = top_results[0]['K']
+    if os.path.exists(RESULTS_FILE):
+        try:
+            with open(RESULTS_FILE, "r", encoding="utf-8") as f:
+                old_data = json.load(f)
+            old_best_k = old_data.get("best_k", 0.5)
+            old_top = old_data.get("top_strategies", [])
+            if old_top:
+                old_ratio = old_top[0].get("cagr", 0) / max(old_top[0].get("mdd", 0.1), 0.1)
+        except Exception:
+            pass
+
+    new_best_k = top_results[0]['K']
+    new_ratio = top_results[0]['cagr'] / max(top_results[0]['mdd'], 0.1)
+    
+    msg = f"📊 <b>[BQA 주말 자율 최적화 분석 완료]</b>\n🕒 완료시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    msg += f"🏆 <b>최종 도출 1위 전략:</b>\n"
+    msg += f"  • 파라미터 (K값): {new_best_k}\n"
+    msg += f"  • CAGR(연성장률): {top_results[0]['cagr']}%\n"
+    msg += f"  • MDD(최대낙폭): {top_results[0]['mdd']}%\n"
+    msg += f"  • CAGR/MDD 비율: {new_ratio:.2f}\n"
+    msg += f"  • 통계적 승률: {top_results[0]['win_rate']}%\n\n"
+    
+    best_k = new_best_k
+    # CAGR/MDD 비율이 향상되었거나 기존 파일이 깨진 경우 자율 핫-리로드 자동 승인
+    if new_ratio > old_ratio or old_ratio == 0:
+        approved_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg += f"🔄 <b>[자율 진화 완료]</b>\n"
+        msg += f"성능이 기존 대비 우수(CAGR/MDD {old_ratio:.2f} ➡️ {new_ratio:.2f})하여, "
+        msg += f"신규 K값(<b>K={new_best_k}</b>)의 무인 자동 적용을 즉시 승인하였습니다.\n"
+        msg += f"ERA 매매 엔진이 다음 거래일에 새 전략으로 자동 교체 가동됩니다."
+    else:
+        # 기존 K값 수호 (횡보장 노이즈 방어)
+        best_k = old_best_k
+        top_results = old_top if 'old_top' in locals() and old_top else top_results
+        approved_time = old_data.get("approved_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")) if 'old_data' in locals() else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg += f"🛡️ <b>[기존 전략 고수]</b>\n"
+        msg += f"신규 분석(CAGR/MDD {new_ratio:.2f})이 기존 검증된 전략({old_ratio:.2f})보다 보합/열세에 있습니다.\n"
+        msg += f"안전을 위해 검증된 기존 파라미터(<b>K={old_best_k}</b>)를 흔들림 없이 유지합니다."
+
     out_data = {
         'last_updated':   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'approved_at':     approved_time,
         'strategy':       'era_realworld_v1',
         'best_k':         best_k,
         'stop_loss_pt':   2.0,
@@ -201,8 +237,17 @@ def optimize():
     os.makedirs(os.path.dirname(RESULTS_FILE), exist_ok=True)
     with open(RESULTS_FILE, "w", encoding="utf-8") as f:
         json.dump(out_data, f, ensure_ascii=False, indent=4)
+        
     print(f"\n결과 저장 완료: {RESULTS_FILE}")
-    print(f"=> ERA 권고 K값: {best_k} (CAGR/MDD 비율 최우수)")
+    print(f"=> ERA 최종 적용 K값: {best_k}")
+    
+    # 텔레그램으로 주말 진화 완료 보고서 전송!
+    try:
+        import notifier
+        if notifier:
+            notifier.send_message(msg)
+    except Exception as e:
+        print(f"텔레그램 전송 실패: {e}")
 
 if __name__ == "__main__":
     optimize()
