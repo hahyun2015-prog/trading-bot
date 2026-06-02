@@ -63,10 +63,14 @@ _DEV_TOKEN = _TELEGRAM.get("dev_bot_token", "")
 BOT_TOKEN = _DEV_TOKEN if (_DEV_TOKEN and _ENV != "live") else _TELEGRAM.get("bot_token")
 CHAT_ID = _TELEGRAM.get("allowed_chat_id")
 
-def send_message(text):
+import queue
+import threading
+
+_msg_queue = queue.Queue()
+
+def _send_message_sync(text):
     """
-    텔레그램 봇 API를 통해 지정된 챗 아이디로 메시지를 발송합니다.
-    오류가 발생하더라도 메인 시스템(매매)이 멈추지 않도록 예외 처리합니다.
+    실제 동기식 전송을 수행하는 내부 함수
     """
     if not BOT_TOKEN or not CHAT_ID:
         print("[텔레그램 알림] config.json에 bot_token 또는 allowed_chat_id가 설정되지 않았습니다.")
@@ -84,6 +88,25 @@ def send_message(text):
         response.raise_for_status()
     except Exception as e:
         print(f"[텔레그램 알림 오류] 메시지 전송 실패: {e}")
+
+def _worker():
+    while True:
+        text = _msg_queue.get()
+        if text is None:
+            break
+        _send_message_sync(text)
+        _msg_queue.task_done()
+
+# 백그라운드 워커 스레드 시작
+_worker_thread = threading.Thread(target=_worker, daemon=True)
+_worker_thread.start()
+
+def send_message(text):
+    """
+    텔레그램 알림 메시지를 큐에 즉시 삽입합니다. (비동기 처리)
+    메인 스레드를 전혀 대기(블로킹)시키지 않습니다.
+    """
+    _msg_queue.put(text)
 
 if __name__ == "__main__":
     send_message("🤖 <b>AI 트레이딩 시스템 (AMATS)</b>\n중앙 알림망 연동 테스트입니다.")

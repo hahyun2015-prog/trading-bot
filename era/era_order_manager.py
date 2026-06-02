@@ -405,6 +405,12 @@ class ERAOrderManager:
         if self.trading_mode in ('stock', 'both'):
             self.morning_timer.start(60000)
 
+        # 7-2. 장중 주도주 1시간 주기 실시간 동적 편입 타이머 — stock/both만
+        self.intraday_refresh_timer = QTimer()
+        self.intraday_refresh_timer.timeout.connect(self._refresh_intraday_leaders)
+        if self.trading_mode in ('stock', 'both'):
+            self.intraday_refresh_timer.start(3600000) # 1시간 주기
+
         # 8. OHLCV 버퍼 → DB 30초 주기 동기화 — stock/both만
         self.ohlcv_flush_timer = QTimer()
         self.ohlcv_flush_timer.timeout.connect(self._flush_ohlcv_buffer)
@@ -938,7 +944,40 @@ class ERAOrderManager:
         print(f"[Kiwoom Msg] {msg}")
 
     def _on_receive_tr_data(self, screen_no, rqname, trcode, record_name, next_str):
-        if rqname == "주식예수금조회":
+        if rqname in ("장전거래대금상위조회", "장중거래대금상위조회"):
+            rows = self.kiwoom.dynamicCall("GetRepeatCnt(QString, QString)", trcode, rqname)
+            print(f"   [opt10032] 거래대금상위 수신 ({rqname}): {rows}개 종목")
+            
+            leaders = []
+            seen_codes = set()
+            _EXCLUDE = [
+                "KODEX","TIGER","KBSTAR","KINDEX","KOSEF","HANARO","ARIRANG","TREX","SOL","ACE","RISE",
+                "인버스","레버리지","선물","스팩","ETN","리츠","DR","우선주"
+            ]
+            
+            for i in range(rows):
+                code = self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "종목코드").strip()
+                code = code.replace("A", "").strip()
+                name = self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "종목명").strip()
+                
+                if not code or len(code) != 6:
+                    continue
+                if any(kw in name for kw in _EXCLUDE):
+                    continue
+                if code in seen_codes:
+                    continue
+                    
+                leaders.append({"code": code, "name": name, "theme": "거래대금상위"})
+                seen_codes.add(code)
+                if len(leaders) >= 20: # 최대 20개만 사용
+                    break
+            
+            if rqname == "장전거래대금상위조회":
+                self._save_fallback_leaders(leaders)
+            else:
+                self._apply_intraday_leaders(leaders)
+                
+        elif rqname == "주식예수금조회":
             d2_deposit = self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, 0, "d+2추정예수금").strip()
             if d2_deposit:
                 self.stock_total_balance = int(d2_deposit)
@@ -1193,6 +1232,7 @@ class ERAOrderManager:
 
             if not leaders:
                 print("[ERA 테마 크롤링] 결과 없음")
+                self._request_fallback_leaders()
                 return
 
             today = datetime.now().strftime("%Y-%m-%d")
@@ -1228,6 +1268,111 @@ class ERAOrderManager:
             QTimer.singleShot(1000, self._register_theme_realtime)
         except Exception as e:
             print(f"[ERA 테마 크롤링 오류] {e}")
+            self._request_fallback_leaders()
+
+    def _request_fallback_leaders(self):
+        print("[ERA 폴백] 키움 API를 통해 전일 거래대금 상위 종목 조회를 요청합니다...")
+        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "시장구분", "000") # 전체
+        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "관리종목제외", "1")
+        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "우선주제외", "1")
+        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "신용구분", "0")
+        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "거래대금구분", "1") # 전체
+        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "가격구분", "0")
+        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "거래량구분", "0")
+        
+        self.kiwoom.dynamicCall(
+            "CommRqData(QString, QString, int, QString)",
+            "장전거래대금상위조회", "opt10032", 0, "0232"
+        )
+
+    def _save_fallback_leaders(self, leaders):
+        if not leaders:
+            print("[ERA 폴백] 거래대금상위 데이터가 비어 있어 주도주 셋업을 스킵합니다.")
+            return
+            
+        today = datetime.now().strftime("%Y-%m-%d")
+        try:
+            conn = sqlite3.connect(self.unified_db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            cursor = conn.cursor()
+            cursor.execute("""CREATE TABLE IF NOT EXISTS top_volume_theme
+                              (date TEXT, code TEXT, name TEXT, volume TEXT, UNIQUE(date, code))""")
+            cursor.execute("DELETE FROM top_volume_theme WHERE date = ?", (today,))
+            for item in leaders:
+                cursor.execute("INSERT OR REPLACE INTO top_volume_theme (date,code,name,volume) VALUES(?,?,?,?)",
+                               (today, item["code"], item["name"], item["theme"]))
+            conn.commit()
+            conn.close()
+            self.theme_crawl_date = today
+            print(f"\n[ERA 폴백] 키움 API 기반 주도주 {len(leaders)}개 DB 적재 완료 (네이버 크롤링 대체)")
+            
+            if notifier:
+                notifier.send_message(
+                    f"⚠️ <b>[장전 폴백 가동]</b>\n"
+                    f"네이버 크롤링 실패로 인해 키움 OpenAPI 거래대금 상위 종목으로 매매 후보를 대체합니다.\n"
+                    f"후보: <b>{len(leaders)}개</b> 종목\n"
+                    f"• {', '.join(x['name'] for x in leaders[:10])} 등\n\n"
+                    f"🔬 RSA 정밀 분석 시작 중..."
+                )
+            self._trigger_rsa_premarket()
+            QTimer.singleShot(1000, self._register_theme_realtime)
+        except Exception as e:
+            print(f"[ERA 폴백 DB 적재 오류] {e}")
+
+    def _refresh_intraday_leaders(self):
+        if self.trading_mode not in ('stock', 'both'):
+            return
+            
+        now = datetime.now()
+        if now.weekday() >= 5: # 주말 배제
+            return
+        if not (9 <= now.hour <= 15):
+            return
+        if now.hour == 9 and now.minute < 5: # 09:05 이전 제외
+            return
+        if now.hour == 15 and now.minute > 0: # 15:00 이후 제외
+            return
+            
+        print("[ERA 장중 갱신] 키움 API를 통해 당일 거래대금 상위 종목 조회를 요청합니다...")
+        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "시장구분", "000") # 전체
+        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "관리종목제외", "1")
+        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "우선주제외", "1")
+        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "신용구분", "0")
+        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "거래대금구분", "1") # 전체
+        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "가격구분", "0")
+        self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "거래량구분", "0")
+        
+        self.kiwoom.dynamicCall(
+            "CommRqData(QString, QString, int, QString)",
+            "장중거래대금상위조회", "opt10032", 0, "0232"
+        )
+
+    def _apply_intraday_leaders(self, leaders):
+        if not leaders:
+            return
+            
+        added_names = []
+        for item in leaders:
+            code = item["code"]
+            name = item["name"]
+            if code not in self.theme_stocks:
+                self.theme_stocks[code] = name
+                added_names.append(name)
+                # 실시간 데이터 감시 등록
+                self.kiwoom.dynamicCall(
+                    "SetRealReg(QString, QString, QString, QString)",
+                    "THEME_RT", code, "10;11;12;15", "1"
+                )
+                
+        if added_names:
+            print(f"[ERA 장중 동적 편입] {len(added_names)}종목 추가 등록 완료: {added_names}")
+            if notifier:
+                notifier.send_message(
+                    f"🔥 <b>[장중 주도주 동적 편입]</b>\n"
+                    f"거래대금 급증 감지로 인해 새로운 주도주들을 감시 목록에 추가합니다.\n"
+                    f"➕ <b>추가 종목:</b> {', '.join(added_names)}\n"
+                    f"💡 <i>단타 5분 스캔 감시 실시간 연동 완료</i>"
+                )
 
     def _trigger_rsa_premarket(self):
         """테마 종목 확정 후 RSA 사전 분석 서브프로세스 기동"""
@@ -1401,6 +1546,37 @@ class ERAOrderManager:
         # 선물 과거 5분봉 자동 DB 동기화 개시
         self._start_futures_db_sync()
 
+    def _determine_sync_pages(self, code):
+        """DB에 이미 적재된 데이터의 최신 일시를 체크하여 동기화할 페이지 수 결정 (2페이지 vs 10페이지)"""
+        try:
+            conn = sqlite3.connect(self.futures_db_path, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='futures_ohlcv'")
+            if not cursor.fetchone():
+                conn.close()
+                return 10
+                
+            cursor.execute("SELECT MAX(date) FROM futures_ohlcv WHERE code = ?", (code,))
+            row = cursor.fetchone()
+            conn.close()
+            
+            if row and row[0]:
+                latest_date_str = row[0] # YYYYMMDDHHMMSS
+                latest_date = datetime.strptime(latest_date_str[:8], "%Y%m%d")
+                delta = datetime.now() - latest_date
+                if delta.days <= 2:
+                    print(f"   [ERA 선물 동기화] {code}의 로컬 DB 최신 데이터는 {latest_date_str[:8]}입니다. (공백 {delta.days}일) 2페이지 동기화 진행.")
+                    return 2
+                else:
+                    print(f"   [ERA 선물 동기화] {code}의 로컬 DB 최신 데이터는 {latest_date_str[:8]}입니다. (공백 {delta.days}일) 10페이지 전체 동기화 진행.")
+                    return 10
+            else:
+                return 10
+        except Exception as e:
+            print(f"[ERA 선물 동기화] 페이지 수 결정 에러: {e}")
+            return 10
+
     def _start_futures_db_sync(self):
         """선물 과거 5분봉 데이터베이스 자동 동기화 기동"""
         if self.futures_sync_active:
@@ -1445,6 +1621,9 @@ class ERAOrderManager:
             return
 
         code = self.futures_sync_queue[self.futures_sync_index]
+        if self.futures_sync_current_page == 0:
+            self.futures_sync_max_pages = self._determine_sync_pages(code)
+            
         print(f" -> [ERA 선물 동기화] {code} ({self.futures_sync_current_page + 1}/{self.futures_sync_max_pages} 페이지) 요청 중...")
         
         # TR 입력값 설정
