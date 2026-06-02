@@ -1,8 +1,28 @@
 @echo off
-title AMATS ERA Order Manager
 cls
+
+:: 관리자 권한 자동 승격 (UAC) 원천 확보 (net session을 이용한 안전하고 신뢰할 수 있는 방식)
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [*] 관리자 권한을 요청 중입니다... (UAC 승인 필요)
+    goto UACPrompt
+) else ( goto gotAdmin )
+
+
+:UACPrompt
+    echo Set UAC = CreateObject^("Shell.Application"^) > "%temp%\getadmin.vbs"
+    echo UAC.ShellExecute "%~s0", "", "", "runas", 1 >> "%temp%\getadmin.vbs"
+    "%temp%\getadmin.vbs"
+    exit /B
+
+:gotAdmin
+    if exist "%temp%\getadmin.vbs" ( del "%temp%\getadmin.vbs" )
+    pushd "%CD%"
+    CD /D "%~dp0"
+
+title AMATS ERA Order Manager
 echo ==========================================================
-echo   AMATS [ ERA ] Order & Risk Management Engine
+echo   AMATS [ ERA ] Order & Risk Management Engine (Admin)
 echo ==========================================================
 echo   Kiwoom OpenAPI - 32bit Python Virtual Environment
 echo ----------------------------------------------------------

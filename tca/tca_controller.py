@@ -6,14 +6,19 @@ import sys
 import json
 from datetime import datetime
 
-# 윈도우 CP949 콘솔 인코딩 에러(이모지 출력 크래시) 원천 방지 래퍼 클래스
+current_dir = os.path.dirname(os.path.abspath(__file__))
+log_file = os.path.join(current_dir, "tca_controller.log")
+
+# 윈도우 CP949 콘솔 인코딩 에러(이모지 출력 크래시) 원천 방지 래퍼 클래스 + 파일 실시간 백업 로깅
 class SafeStreamWrapper:
-    def __init__(self, original_stream):
+    def __init__(self, original_stream, log_file_path=None):
         self.original_stream = original_stream
+        self.log_file_path = log_file_path
         
     def write(self, data):
         if not data:
             return
+        # 1. 원래 스트림(콘솔) 출력 처리
         try:
             encoding = getattr(self.original_stream, 'encoding', 'cp949') or 'cp949'
             data.encode(encoding)
@@ -28,13 +33,19 @@ class SafeStreamWrapper:
                     pass  # 인코딩이 불가능한 이모지만 안전하게 발라냄
             self.original_stream.write(cleaned_data)
             
+        # 2. 파일 실시간 백업 로깅
+        if self.log_file_path:
+            try:
+                with open(self.log_file_path, "a", encoding="utf-8") as f:
+                    f.write(data)
+            except Exception:
+                pass
+            
     def flush(self):
         self.original_stream.flush()
 
-sys.stdout = SafeStreamWrapper(sys.stdout)
-sys.stderr = SafeStreamWrapper(sys.stderr)
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.stdout = SafeStreamWrapper(sys.stdout, log_file)
+sys.stderr = SafeStreamWrapper(sys.stderr, log_file)
 workspace_root = os.path.abspath(os.path.join(current_dir, ".."))
 sys.path.append(workspace_root)
 
@@ -514,6 +525,125 @@ class TCAController:
         if cmd_text == "!상태":
             msg = self.check_process_status()
             self.send_message(msg)
+
+        elif cmd_text.startswith("!로그확인"):
+            try:
+                parts = cmd_text.split()
+                lines_to_read = 30
+                if len(parts) > 1:
+                    lines_to_read = int(parts[1])
+                
+                log_path = os.path.join(self.workspace_root, "era", "era_order_manager.log")
+                if not os.path.exists(log_path):
+                    log_path = os.path.join(self.workspace_root, "era_test.log")
+                if not os.path.exists(log_path):
+                    log_path = os.path.join(self.workspace_root, "era", "era_crash.log")
+                
+                if os.path.exists(log_path):
+                    with open(log_path, "r", encoding="utf-8", errors="ignore") as lf:
+                        lines = lf.readlines()
+                    last_lines = lines[-lines_to_read:]
+                    log_text = "".join(last_lines)
+                    
+                    if len(log_text) > 3000:
+                        log_text = log_text[-3000:]
+                        
+                    self.send_message(
+                        f"📋 <b>[ERA 최근 {len(last_lines)}줄 로그 브리핑]</b>\n"
+                        f"<pre>{log_text}</pre>"
+                    )
+                else:
+                    self.send_message("⚠️ ERA 로그 파일(era_order_manager.log)을 찾을 수 없습니다. 아직 매매 봇이 시작되지 않았거나 출력이 발생하지 않았을 수 있습니다.")
+            except Exception as e:
+                self.send_message(f"❌ 로그 조회 중 오류 발생: {e}")
+
+        elif cmd_text.startswith("!TCA로그"):
+            try:
+                parts = cmd_text.split()
+                lines_to_read = 30
+                if len(parts) > 1:
+                    lines_to_read = int(parts[1])
+                
+                log_path = os.path.join(self.workspace_root, "tca", "tca_controller.log")
+                
+                if os.path.exists(log_path):
+                    with open(log_path, "r", encoding="utf-8", errors="ignore") as lf:
+                        lines = lf.readlines()
+                    last_lines = lines[-lines_to_read:]
+                    log_text = "".join(last_lines)
+                    
+                    if len(log_text) > 3000:
+                        log_text = log_text[-3000:]
+                        
+                    self.send_message(
+                        f"📋 <b>[TCA 최근 {len(last_lines)}줄 로그 브리핑]</b>\n"
+                        f"<pre>{log_text}</pre>"
+                    )
+                else:
+                    self.send_message("⚠️ TCA 로그 파일(tca_controller.log)을 찾을 수 없습니다.")
+            except Exception as e:
+                self.send_message(f"❌ TCA 로그 조회 중 오류 발생: {e}")
+
+        elif cmd_text.startswith("!AI점검"):
+            try:
+                parts = cmd_text.split(" ", 1)
+                if len(parts) < 2 or not parts[1].strip():
+                    self.send_message(
+                        "🤖 <b>[AI 브릿지 사용법]</b>\n\n"
+                        "<code>!AI점검 [원하는 지시사항]</code> 형태로 보내주세요.\n"
+                        "예: <code>!AI점검 선물 매니저 오류 분석하고 futures_order_manager.py 고쳐줘</code>"
+                    )
+                    return
+
+                user_instruction = parts[1].strip()
+                
+                # 큐 파일 경로 계산 및 기록
+                queue_path = os.path.join(self.workspace_root, "tca", "ai_bridge", "ai_task_queue.json")
+                queue_dir = os.path.dirname(queue_path)
+                if not os.path.exists(queue_dir):
+                    os.makedirs(queue_dir, exist_ok=True)
+                
+                # 기존 큐 파일 로드
+                if os.path.exists(queue_path):
+                    with open(queue_path, "r", encoding="utf-8") as f:
+                        queue_data = json.load(f)
+                else:
+                    queue_data = {"tasks": []}
+                
+                # 새로운 태스크 추가 (PENDING 상태)
+                task_id = f"task_{int(time.time())}"
+                new_task = {
+                    "task_id": task_id,
+                    "request": user_instruction,
+                    "status": "PENDING",
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                queue_data["tasks"].append(new_task)
+                
+                with open(queue_path, "w", encoding="utf-8") as f:
+                    json.dump(queue_data, f, ensure_ascii=False, indent=4)
+                
+                self.send_message(
+                    f"🔄 <b>[AI 원격 디버그 수신 완료]</b>\n\n"
+                    f"👤 <b>지시:</b> <i>{user_instruction}</i>\n\n"
+                    f"⏳ 백그라운드에서 AI 브릿지 워커(`ai_bridge_worker.py`)를 기동합니다. 분석 및 패치 완료 시 결과 알림이 전송됩니다. (약 30초 소요)"
+                )
+                
+                # 백그라운드 프로세스로 ai_bridge_worker.py 비동기 기동
+                worker_script = os.path.join(self.workspace_root, "tca", "ai_bridge", "ai_bridge_worker.py")
+                py_exec = os.path.join(self.venv32_path, "Scripts", "python.exe")
+                if not os.path.exists(py_exec):
+                    py_exec = "python"
+                
+                subprocess.Popen(
+                    [py_exec, worker_script],
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                    cwd=os.path.join(self.workspace_root, "tca")
+                )
+                print(f"[TCA] AI 워커 기동 완료 (Task: {task_id})")
+                
+            except Exception as e:
+                self.send_message(f"❌ AI 디버그 수신기 구동 에러: {e}")
 
         elif cmd_text == "!계좌확인":
             msg = self.get_account_status()
@@ -1109,7 +1239,9 @@ class TCAController:
                 "• <code>!계좌확인</code> : 감지된 주식/선물 계좌 및 예수금 확인\n"
                 "• <code>!수익률</code> : 1주, 1달, 1분기, 1년 기간별 투자 수익률 분석\n"
                 "• <code>!주식현황</code> : 가상 파티셔닝(단타/스윙) 자금 및 수익률 브리핑\n"
-                "• <code>!선물현황</code> : KOSPI200 선물 포지션 현황 브리핑\n\n"
+                "• <code>!선물현황</code> : KOSPI200 선물 포지션 현황 브리핑\n"
+                "• <code>!로그확인 [줄수]</code> : 실시간 매매 로그 확인 (기본 30줄)\n"
+                "• <code>!TCA로그 [줄수]</code> : 실시간 관제 로그 확인 (기본 30줄)\n\n"
                 "<b>[수동 제어]</b>\n"
                 "• <code>!매도 삼성전자</code> : 특정 종목 즉시 전량 청산\n"
                 "• <code>!전량매도</code> : 보유 중인 전 주식 시장가 청산\n"
@@ -1131,7 +1263,10 @@ class TCAController:
                 "• <code>!전략승인</code> : 최적 K값 파라미터 실전 즉시 적용 승인\n\n"
                 "<b>[🔁 시스템 코드 업데이트]</b>\n"
                 "• <code>!버전확인</code> : 현재 코드 버전 및 최근 커밋 확인\n"
-                "• <code>!코드업데이트</code> : GitHub 최신 코드를 시스템에 즉시 적용 (git pull)"
+                "• <code>!코드업데이트</code> : GitHub 최신 코드를 시스템에 즉시 적용 (git pull)\n\n"
+                "<b>[🤖 AI 자율 디버깅]</b>\n"
+                "• <code>!AI점검 [원하는 지시]</code> : 자연어로 원격 코드 복구 및 에러 점검\n"
+                "  (예: <code>!AI점검 선물 매니저 오류 고쳐줘</code>)"
             )
             self.send_message(help_msg)
 
@@ -1142,8 +1277,10 @@ class TCAController:
         
         self.send_message("📡 <b>AMATS 중앙 관제 에이전트(TCA) 온라인.</b>\n(도움말: `!도움말`)")
         
+        startup_time = time.time()
         offset = None
         fail_count = 0
+        first_run = True
         
         while True:
             # ── BQA 주말 자율 최적화 스케줄러 감시 (매 getUpdates 주기마다 가볍게 시간 대조) ──
@@ -1222,6 +1359,20 @@ class TCAController:
             except Exception as e:
                 print(f"[TCA Auto Research Scheduler Error] {e}")
 
+            if first_run:
+                print("[TCA] 최초 기동: 이전 백로그 청소 중...")
+                try:
+                    response = requests.get(f"{self.base_url}/getUpdates", params={'timeout': 1}, timeout=5)
+                    data = response.json()
+                    if data.get("ok") and data["result"]:
+                        max_update_id = max(r["update_id"] for r in data["result"])
+                        offset = max_update_id + 1
+                        print(f"[TCA] 이전 백로그 {len(data['result'])}개 청소 완료. Next Offset: {offset}")
+                except Exception as ex:
+                    print(f"[TCA] 백로그 청소 실패: {ex}")
+                first_run = False
+                continue
+
             try:
                 url = f"{self.base_url}/getUpdates"
                 params = {'timeout': 30}
@@ -1246,8 +1397,21 @@ class TCAController:
                                 continue
                                 
                             time_diff = time.time() - msg_date
-                            if time_diff > 300:
+                            
+                            # 봇 기동 10초 이전의 완전히 오래된 과거 백로그는 skip
+                            if msg_date < startup_time - 10:
+                                print(f"[TCA 백로그 무시] 봇 기동 이전의 메시지 (지연: {time_diff:.1f}초): {text}")
                                 continue
+                                
+                            # 만약 PC 시간이 5분 이상 빠르거나 늦어 서버와 시각 오차가 크게 날 경우 경고만 하고 명령어는 실행
+                            if abs(time_diff) > 300:
+                                print(f"[TCA 경고] PC 시간과 텔레그램 서버 시각이 {time_diff:.1f}초만큼 어긋나 있습니다.")
+                                self.send_message(
+                                    f"⚠️ <b>[시간 동기화 경고]</b>\n"
+                                    f"NUCBOX 서버 시각과 텔레그램 서버 시각이 <b>{abs(time_diff):.1f}초</b> 어긋나 있습니다.\n"
+                                    f"데이터 유실이나 매매 기록 왜곡을 방지하기 위해 윈도우 시간 동기화(<code>w32tm /resync</code>)를 실행해 주세요.\n"
+                                    f"(이 명령어는 정상적으로 처리됩니다.)"
+                                )
                                 
                             print(f"명령어 수신: {text}")
                             self.execute_command(text, current_offset=offset)

@@ -7,14 +7,19 @@ from datetime import datetime, timedelta
 import requests
 from bs4 import BeautifulSoup
 
-# 윈도우 CP949 콘솔 인코딩 에러(이모지 출력 크래시) 원천 방지 래퍼 클래스
+current_dir = os.path.dirname(os.path.abspath(__file__))
+log_file = os.path.join(current_dir, "era_order_manager.log")
+
+# 윈도우 CP949 콘솔 인코딩 에러(이모지 출력 크래시) 원천 방지 래퍼 클래스 + 파일 실시간 백업 로깅
 class SafeStreamWrapper:
-    def __init__(self, original_stream):
+    def __init__(self, original_stream, log_file_path=None):
         self.original_stream = original_stream
+        self.log_file_path = log_file_path
         
     def write(self, data):
         if not data:
             return
+        # 1. 원래 스트림(콘솔) 출력 처리
         try:
             encoding = getattr(self.original_stream, 'encoding', 'cp949') or 'cp949'
             data.encode(encoding)
@@ -29,13 +34,19 @@ class SafeStreamWrapper:
                     pass  # 인코딩이 불가능한 이모지만 안전하게 발라냄
             self.original_stream.write(cleaned_data)
             
+        # 2. 파일 실시간 백업 로깅
+        if self.log_file_path:
+            try:
+                with open(self.log_file_path, "a", encoding="utf-8") as f:
+                    f.write(data)
+            except Exception:
+                pass
+            
     def flush(self):
         self.original_stream.flush()
 
-sys.stdout = SafeStreamWrapper(sys.stdout)
-sys.stderr = SafeStreamWrapper(sys.stderr)
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.stdout = SafeStreamWrapper(sys.stdout, log_file)
+sys.stderr = SafeStreamWrapper(sys.stderr, log_file)
 
 # PyQt5 플러그인 경로를 현재 Python 실행파일 위치에서 자동 감지 (하드코딩 경로 제거)
 _exe_dir = os.path.dirname(sys.executable)
@@ -361,7 +372,7 @@ class ERAOrderManager:
         self.futures_sync_queue = []
         self.futures_sync_index = 0
         self.futures_sync_current_page = 0
-        self.futures_sync_max_pages = 2      # 수집할 과거 데이터 페이지 수 (1페이지당 약 80~100개 캔들)
+        self.futures_sync_max_pages = 10     # 수집할 과거 데이터 페이지 수 (1페이지당 약 80~100개 캔들)
         self.futures_sync_active = False
 
         # 선물 손절/익절 설정 (고정 pt)
@@ -1153,12 +1164,19 @@ class ERAOrderManager:
             for theme in themes[:10]:
                 try:
                     tres = requests.get(theme["url"], headers=_HEADERS, timeout=5)
+                    tres.raise_for_status() # HTTP 응답 상태 코드 검사 (4xx, 5xx 에러 시 예외 발생)
                     tsoup = BeautifulSoup(tres.content, "html.parser")
+                    
+                    rows = tsoup.select("table.type_5 tbody tr")
+                    if not rows:
+                        print(f"    [ERA 테마 크롤링] ⚠️ '{theme['name']}' 테마에서 종목 탐색 실패: HTML 구조 변경 또는 데이터 없음")
+                        continue # 다음 테마로 이동
+                        
                     count = 0
-                    for row in tsoup.select("table.type_5 tbody tr"):
+                    for row in rows:
                         if count >= 5:
                             break
-                        a = row.select_one("td.col_type1 a")
+                        a = row.select_one("td.name a")
                         if a:
                             sname = a.text.strip()
                             scode = a["href"].split("code=")[1]
@@ -1166,7 +1184,11 @@ class ERAOrderManager:
                                 leaders.append({"code": scode, "name": sname, "theme": theme["name"]})
                                 seen_codes.add(scode)
                                 count += 1
-                except Exception:
+                except requests.exceptions.RequestException as e:
+                    print(f"    [ERA 테마 크롤링] ⚠️ '{theme['name']}' 테마 페이지 요청 실패: {e}")
+                    continue
+                except Exception as e:
+                    print(f"    [ERA 테마 크롤링] ⚠️ '{theme['name']}' 테마 페이지 파싱 오류: {e}")
                     continue
 
             if not leaders:
