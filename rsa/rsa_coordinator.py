@@ -28,7 +28,8 @@ class RSACoordinator:
         self._init_db()
 
     def _init_db(self):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL;")
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS research_reports (
@@ -71,7 +72,8 @@ class RSACoordinator:
 
         print(f"  => 👑 종합 점수: {final_score}점")
 
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL;")
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO research_reports (
@@ -92,7 +94,8 @@ class RSACoordinator:
 
     def _is_analyzed_today(self, code):
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()
             today = datetime.now().strftime("%Y-%m-%d")
             cursor.execute(
@@ -113,7 +116,8 @@ class RSACoordinator:
         print("[RSA] 분석 워커 시작...")
         self.nsaa.reset_errors()   # 오류 추적 초기화
         today = datetime.now().strftime("%Y-%m-%d")
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL;")
         cursor = conn.cursor()
         try:
             # signals 테이블 미존재 시 자동 생성 (스윙 신호 누락 방지)
@@ -175,7 +179,8 @@ class RSACoordinator:
             if self._is_analyzed_today(code) and code not in analyzed_codes:
                 # 오늘 이미 분석됐으면 DB에서 기존 점수 로드
                 try:
-                    conn2 = sqlite3.connect(self.db_path)
+                    conn2 = sqlite3.connect(self.db_path, timeout=30)
+                    conn2.execute("PRAGMA journal_mode=WAL;")
                     c2 = conn2.cursor()
                     c2.execute(
                         "SELECT score FROM research_reports WHERE code=? AND date(timestamp)=? ORDER BY id DESC LIMIT 1",
@@ -305,7 +310,8 @@ class RSACoordinator:
         today = datetime.now().strftime("%Y-%m-%d")
         code_nsaa = {}
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()
             for isf_cfg in isf_stocks:
                 sc = isf_cfg.get("stock_code", "")

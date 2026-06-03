@@ -457,7 +457,8 @@ class TCAController:
             if not os.path.exists(db_path):
                 return "🚨 <b>데이터베이스 오류</b>\n통합 데이터베이스를 찾을 수 없습니다."
                 
-            conn = sqlite3.connect(db_path)
+            conn = sqlite3.connect(db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()
             
             # 테이블 체크
@@ -635,11 +636,18 @@ class TCAController:
                 if not os.path.exists(py_exec):
                     py_exec = "python"
                 
+                log_dir = os.path.join(self.workspace_root, "tca", "ai_bridge")
+                os.makedirs(log_dir, exist_ok=True)
+                log_path = os.path.join(log_dir, "ai_bridge_worker.log")
+                log_f = open(log_path, "ab")
                 subprocess.Popen(
                     [py_exec, worker_script],
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-                    cwd=os.path.join(self.workspace_root, "tca")
+                    cwd=os.path.join(self.workspace_root, "tca"),
+                    stdout=log_f,
+                    stderr=log_f
                 )
+                log_f.close()
                 print(f"[TCA] AI 워커 기동 완료 (Task: {task_id})")
                 
             except Exception as e:
@@ -790,7 +798,8 @@ class TCAController:
                     
                     if target_code:
                         import sqlite3
-                        conn = sqlite3.connect(self.db_path)
+                        conn = sqlite3.connect(self.db_path, timeout=30)
+                        conn.execute("PRAGMA journal_mode=WAL;")
                         cursor = conn.cursor()
                         cursor.execute('''INSERT INTO signals (code, name, strategy_type, price, status, open_price)
                                           VALUES (?, ?, 'MANUAL_SELL', 0, 'PENDING', 0)''', 
@@ -813,7 +822,8 @@ class TCAController:
                 portfolio = data.get("portfolio", {})
                 if portfolio:
                     import sqlite3
-                    conn = sqlite3.connect(self.db_path)
+                    conn = sqlite3.connect(self.db_path, timeout=30)
+                    conn.execute("PRAGMA journal_mode=WAL;")
                     cursor = conn.cursor()
                     for target_code, info in portfolio.items():
                         target_name = info['name']
@@ -918,7 +928,12 @@ class TCAController:
             rsa_script = os.path.join(workspace_root, 'rsa', 'rsa_coordinator.py')
             py32_path = os.path.join(self.venv32_path, "Scripts", "python.exe")
             python_cmd = py32_path if os.path.exists(py32_path) else "python"
-            subprocess.Popen([python_cmd, rsa_script], shell=False)
+            log_dir = os.path.join(workspace_root, "rsa")
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(log_dir, "rsa_coordinator.log")
+            log_f = open(log_path, "ab")
+            subprocess.Popen([python_cmd, rsa_script], shell=False, stdout=log_f, stderr=log_f)
+            log_f.close()
             self.send_message(
                 "🔬 <b>[RSA 분석 기동]</b>\n"
                 "단타/스윙 후보 종목에 대한 FAA·IRA·NSAA 정밀 리서치를 시작합니다.\n"
@@ -928,7 +943,12 @@ class TCAController:
         elif cmd_text == "!백테스트시작":
             self.send_message("🧪 <b>[BQA]</b> 선물 최적화(K값 스위핑) 알고리즘을 즉시 강제 기동합니다...")
             bqa_script = os.path.join(workspace_root, "bqa", "batch_optimizer.py")
-            subprocess.Popen(f"python {bqa_script}", shell=True)
+            log_dir = os.path.join(workspace_root, "bqa")
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(log_dir, "bqa_optimizer.log")
+            log_f = open(log_path, "ab")
+            subprocess.Popen(f"python {bqa_script}", shell=True, stdout=log_f, stderr=log_f)
+            log_f.close()
             self.send_message("✅ K값 최적화 엔진 기동 시작.")
 
         elif cmd_text == "!최적화결과":
@@ -964,7 +984,8 @@ class TCAController:
                 futures_count = 55328 # 디폴트
                 if os.path.exists(futures_db):
                     try:
-                        conn = sqlite3.connect(futures_db)
+                        conn = sqlite3.connect(futures_db, timeout=30)
+                        conn.execute("PRAGMA journal_mode=WAL;")
                         cursor = conn.cursor()
                         cursor.execute("SELECT COUNT(*) FROM futures_ohlcv WHERE code='10500000'")
                         futures_count = cursor.fetchone()[0]
@@ -977,7 +998,8 @@ class TCAController:
                 stock_count = 8478 # 디폴트
                 if os.path.exists(kiwoom_db):
                     try:
-                        conn = sqlite3.connect(kiwoom_db)
+                        conn = sqlite3.connect(kiwoom_db, timeout=30)
+                        conn.execute("PRAGMA journal_mode=WAL;")
                         cursor = conn.cursor()
                         cursor.execute("SELECT COUNT(*) FROM stock_ohlcv")
                         stock_count = cursor.fetchone()[0]
@@ -990,7 +1012,8 @@ class TCAController:
                 rsa_count = 0
                 if os.path.exists(unified_db):
                     try:
-                        conn = sqlite3.connect(unified_db)
+                        conn = sqlite3.connect(unified_db, timeout=30)
+                        conn.execute("PRAGMA journal_mode=WAL;")
                         cursor = conn.cursor()
                         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='research_reports'")
                         if cursor.fetchone():
@@ -1046,11 +1069,18 @@ class TCAController:
                 py32_path = os.path.join(self.venv32_path, "Scripts", "python.exe")
                 python_cmd = py32_path if os.path.exists(py32_path) else "python"
                 
+                log_dir = os.path.join(self.workspace_root, "bqa")
+                os.makedirs(log_dir, exist_ok=True)
+                log_path = os.path.join(log_dir, "auto_quant_researcher.log")
+                log_f = open(log_path, "ab")
                 subprocess.Popen(
                     [python_cmd, research_script, "--manual"],
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-                    cwd=os.path.join(self.workspace_root, "bqa")
+                    cwd=os.path.join(self.workspace_root, "bqa"),
+                    stdout=log_f,
+                    stderr=log_f
                 )
+                log_f.close()
             except Exception as e:
                 self.send_message(f"❌ AI 연구원 기동 실패: {e}")
 
@@ -1194,7 +1224,8 @@ class TCAController:
                     self.send_message("⚠️ ISF 설정 없음")
                 else:
                     db_path = os.path.join(self.workspace_root, "unified_data.db")
-                    conn = sqlite3.connect(db_path)
+                    conn = sqlite3.connect(db_path, timeout=30)
+                    conn.execute("PRAGMA journal_mode=WAL;")
                     cursor = conn.cursor()
                     msg = f"🔍 <b>[ISF 오늘 NSAA 방향 점검]</b> ({today})\n\n"
                     for item in isf_list:
@@ -1266,7 +1297,10 @@ class TCAController:
                 "• <code>!코드업데이트</code> : GitHub 최신 코드를 시스템에 즉시 적용 (git pull)\n\n"
                 "<b>[🤖 AI 자율 디버깅]</b>\n"
                 "• <code>!AI점검 [원하는 지시]</code> : 자연어로 원격 코드 복구 및 에러 점검\n"
-                "  (예: <code>!AI점검 선물 매니저 오류 고쳐줘</code>)"
+                "  (예: <code>!AI점검 선물 매니저 오류 고쳐줘</code>)\n\n"
+                "<b>[⚠️ RDP 연결 해제 주의사항]</b>\n"
+                "• 원격 데스크톱(RDP) 세션 종료 시 일반 [X] 버튼으로 닫으면 GUI 기반 Kiwoom API가 차단될 수 있습니다.\n"
+                "• 반드시 바탕화면 또는 시스템의 <code>disconnect_rdp_keep_alive.bat</code> 배치 파일을 실행하여 세션을 해제해주세요."
             )
             self.send_message(help_msg)
 
@@ -1302,12 +1336,19 @@ class TCAController:
                         bqa_script = os.path.join(self.workspace_root, "bqa", "optimizer.py")
                     
                     if os.path.exists(bqa_script):
+                        log_dir = os.path.join(self.workspace_root, "bqa")
+                        os.makedirs(log_dir, exist_ok=True)
+                        log_path = os.path.join(log_dir, "bqa_optimizer.log")
+                        log_f = open(log_path, "ab")
                         # 백그라운드로 화면 없이 조용히 기동
                         subprocess.Popen(
                             [sys.executable, bqa_script],
                             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-                            cwd=os.path.join(self.workspace_root, "bqa")
+                            cwd=os.path.join(self.workspace_root, "bqa"),
+                            stdout=log_f,
+                            stderr=log_f
                         )
+                        log_f.close()
                     else:
                         self.send_message("⚠️ BQA 최적화 스크립트 파일을 찾을 수 없습니다.")
             except Exception as e:
@@ -1351,11 +1392,18 @@ class TCAController:
                         py32_path = os.path.join(self.venv32_path, "Scripts", "python.exe")
                         python_cmd = py32_path if os.path.exists(py32_path) else "python"
                         
+                        log_dir = os.path.join(self.workspace_root, "bqa")
+                        os.makedirs(log_dir, exist_ok=True)
+                        log_path = os.path.join(log_dir, "auto_quant_researcher.log")
+                        log_f = open(log_path, "ab")
                         subprocess.Popen(
                             [python_cmd, research_script],
                             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-                            cwd=os.path.join(self.workspace_root, "bqa")
+                            cwd=os.path.join(self.workspace_root, "bqa"),
+                            stdout=log_f,
+                            stderr=log_f
                         )
+                        log_f.close()
             except Exception as e:
                 print(f"[TCA Auto Research Scheduler Error] {e}")
 

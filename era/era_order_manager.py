@@ -60,7 +60,7 @@ if os.path.exists(_qt_plugin_path):
 
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QTimer, QThread, pyqtSignal
 
 # 중앙 notifier 모듈 임포트
 sys.path.append(os.path.abspath(os.path.join(current_dir, "..")))
@@ -91,7 +91,8 @@ class AMATSDynamicAllocator:
                 futures_db = os.path.join(self.workspace_root, "futures_data.db")
                 if os.path.exists(futures_db):
                     print("[AMATS 자산 배분] 네이버 크롤링 실패 → 로컬 futures_data.db 폴백 시도...")
-                    conn = sqlite3.connect(futures_db)
+                    conn = sqlite3.connect(futures_db, timeout=30)
+                    conn.execute("PRAGMA journal_mode=WAL;")
                     db_df = pd.read_sql(
                         "SELECT date,open,high,low,close FROM futures_ohlcv WHERE code='10500000' ORDER BY date", conn
                     )
@@ -166,7 +167,8 @@ class AMATSDynamicAllocator:
         try:
             import pandas as pd
             import numpy as np
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL;")
             # stock_trades 테이블 유무 검사 및 조회
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='stock_trades'")
@@ -252,6 +254,113 @@ class AMATSDynamicAllocator:
             print(f"[AMATS 자산 배분] 설정 파일 저장 오류: {e}")
             return False
 
+class MorningPrepWorker(QThread):
+    finished_signal = pyqtSignal(bool, str, float, float, list) # success, today_regime, r_day, r_swing, leaders
+    
+    def __init__(self, workspace_root, unified_db_path, trading_mode):
+        super().__init__()
+        self.workspace_root = workspace_root
+        self.unified_db_path = unified_db_path
+        self.trading_mode = trading_mode
+
+    def run(self):
+        try:
+            print("[AMATS 자산 배분] 백그라운드 아침 장세 분석 시작...")
+            allocator = AMATSDynamicAllocator(self.workspace_root, self.unified_db_path)
+            today_regime = allocator.detect_regime()
+            r_day, r_swing = allocator.get_dynamic_allocation(today_regime)
+            allocator.apply_to_config(r_day, r_swing)
+            print(f"[AMATS 자산 배분] 백그라운드 분석 완료: regime={today_regime}, 단타={r_day}, 스윙={r_swing}")
+            
+            # 테마 크롤링 수행
+            leaders = []
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            
+            # 먼저 STA가 오늘 데이터를 저장했는지 백그라운드에서 검증
+            sta_has_data = False
+            try:
+                conn = sqlite3.connect(self.unified_db_path, timeout=30)
+                conn.execute("PRAGMA journal_mode=WAL;")
+                cursor = conn.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='top_volume_theme'")
+                if cursor.fetchone():
+                    cursor.execute("SELECT COUNT(*) FROM top_volume_theme WHERE date = ?", (today_str,))
+                    count = cursor.fetchone()[0]
+                    if count > 0:
+                        sta_has_data = True
+                conn.close()
+            except Exception:
+                pass
+                
+            if sta_has_data:
+                print("[MorningPrepWorker] STA가 이미 오늘 테마 데이터를 적재하여 크롤링을 스킵합니다.")
+            else:
+                # 직접 네이버 테마 크롤링 수행
+                leaders = self._perform_theme_crawl()
+                if leaders:
+                    try:
+                        conn = sqlite3.connect(self.unified_db_path, timeout=30)
+                        conn.execute("PRAGMA journal_mode=WAL;")
+                        cursor = conn.cursor()
+                        cursor.execute("""CREATE TABLE IF NOT EXISTS top_volume_theme
+                                          (date TEXT, code TEXT, name TEXT, volume TEXT, UNIQUE(date, code))""")
+                        cursor.execute("DELETE FROM top_volume_theme WHERE date = ?", (today_str,))
+                        for item in leaders:
+                            cursor.execute("INSERT OR REPLACE INTO top_volume_theme (date,code,name,volume) VALUES(?,?,?,?)",
+                                           (today_str, item["code"], item["name"], item["theme"]))
+                        conn.commit()
+                        conn.close()
+                    except Exception as e:
+                        print(f"[MorningPrepWorker] DB 적재 에러: {e}")
+            
+            self.finished_signal.emit(True, today_regime, r_day, r_swing, leaders)
+        except Exception as e:
+            print(f"[MorningPrepWorker] 실행 오류: {e}")
+            self.finished_signal.emit(False, "RANGE", 0.60, 0.40, [])
+
+    def _perform_theme_crawl(self):
+        _HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        _EXCLUDE = [
+            "KODEX","TIGER","KBSTAR","KINDEX","KOSEF","HANARO","ARIRANG","TREX","SOL","ACE","RISE",
+            "인버스","레버리지","선물","스팩","ETN","리츠","DR","우선주"
+        ]
+        leaders = []
+        seen_codes = set()
+        try:
+            res = requests.get("https://finance.naver.com/sise/theme.naver", headers=_HEADERS, timeout=5)
+            soup = BeautifulSoup(res.content, "html.parser")
+            themes = [
+                {"name": c.text, "url": "https://finance.naver.com" + c["href"]}
+                for r in soup.select("table.type_1 tr")
+                for c in r.select("td.col_type1 a")
+            ]
+            
+            for theme in themes[:10]:
+                try:
+                    tres = requests.get(theme["url"], headers=_HEADERS, timeout=5)
+                    tres.raise_for_status()
+                    tsoup = BeautifulSoup(tres.content, "html.parser")
+                    rows = tsoup.select("table.type_5 tbody tr")
+                    if not rows:
+                        continue
+                    count = 0
+                    for row in rows:
+                        if count >= 5:
+                            break
+                        a = row.select_one("td.name a")
+                        if a:
+                            sname = a.text.strip()
+                            scode = a["href"].split("code=")[1]
+                            if not any(kw in sname for kw in _EXCLUDE) and scode not in seen_codes:
+                                leaders.append({"code": scode, "name": sname, "theme": theme["name"]})
+                                seen_codes.add(scode)
+                                count += 1
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"[MorningPrepWorker] 크롤링 에러: {e}")
+        return leaders
+
 class ERAOrderManager:
     def __init__(self):
         self.kiwoom = QAxWidget("KHOPENAPI.KHOpenAPICtrl.1")
@@ -272,6 +381,7 @@ class ERAOrderManager:
         self.pending_futures_orders = {} # 선물 미체결/진입 대기
         self.system_halted = False
         self.current_regime = "RANGE"    # [AMATS 최적화] 실시간 감지 레짐 기본값
+        self.morning_worker = None
         
         # 자금 정보
         self.stock_total_balance = 0
@@ -452,7 +562,8 @@ class ERAOrderManager:
             import numpy as np
             if not os.path.exists(self.futures_db_path):
                 return
-            conn = sqlite3.connect(self.futures_db_path)
+            conn = sqlite3.connect(self.futures_db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL;")
             # 최근 70개 일봉(resample) 계산을 위해 충분한 분량 조회
             df = pd.read_sql(
                 "SELECT date, high, low, close FROM futures_ohlcv WHERE code='10500000' ORDER BY date DESC LIMIT 400", conn
@@ -1116,31 +1227,35 @@ class ERAOrderManager:
     # ── STA 통합: 테마 크롤링 + 실시간 OHLCV ────────────────────────────
 
     def _check_morning_prep(self):
-        """1분마다 실행 — 08:50 도달 시 테마 크롤링 자동 시작"""
+        """1분마다 실행 — 08:50 도달 시 테마 크롤링 백그라운드 QThread 시작"""
         now = datetime.now()
         today_str = now.strftime("%Y-%m-%d")
         if not (now.weekday() < 5 and now.hour == 8 and 50 <= now.minute <= 59 and self.theme_crawl_date != today_str):
             return
             
-        # [AMATS 통합 최적화] 실시간 시장 레짐 판별 및 동적 자산 배분 연동 기동
-        try:
-            print("[AMATS 자산 배분] 아침 장세 레짐 분석 및 동적 자금 분배를 가동합니다...")
-            allocator = AMATSDynamicAllocator(self.workspace_root, self.unified_db_path)
+        # 스레드가 이미 진행 중이면 중복 방지
+        if getattr(self, 'morning_worker', None) is not None and self.morning_worker.isRunning():
+            return
             
-            # 오늘 시장 레짐 판별
-            today_regime = allocator.detect_regime()
-            # 시장 레짐 & Sharpe 기반 동적 배분 비율 연산
-            r_day, r_swing = allocator.get_dynamic_allocation(today_regime)
-            allocator.apply_to_config(r_day, r_swing)
-            
-            # ERA 인스턴스에 즉시 핫-로드 (Hot-load) 반영
+        print("[ERA] 아침 장세 감지 및 테마 스캔 백그라운드 QThread 기동...")
+        self.morning_worker = MorningPrepWorker(self.workspace_root, self.unified_db_path, self.trading_mode)
+        self.morning_worker.finished_signal.connect(self._on_morning_prep_finished)
+        self.morning_worker.start()
+
+    def _on_morning_prep_finished(self, success, today_regime, r_day, r_swing, leaders):
+        now = datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        self.theme_crawl_date = today_str # 완료 마크
+        
+        if success:
+            # 1. 최적 설정 핫로드 반영
             self.load_config()
-            self.current_regime = today_regime # 실시간 레짐 동적 동기화
+            self.current_regime = today_regime
             
             # [AMATS 파생 최적화] 아침 장전 선물 동적 ATR SL/TP 실시간 갱신
             if self.trading_mode in ('futures', 'both'):
                 self.update_futures_dynamic_sl_tp()
-            
+                
             regime_lbl = {"UP": "🚀 강세 추세장", "DOWN": "📉 약세 추세장 (현금방어)", "RANGE": "⏸️ 횡보/박스장"}.get(today_regime, today_regime)
             
             if notifier:
@@ -1150,124 +1265,48 @@ class ERAOrderManager:
                     f"💰 자금 배분 비율: 단타 <b>{int(r_day*100)}%</b> / 스윙 <b>{int(r_swing*100)}%</b>\n"
                     f"💡 <i>(횡보/약세장 시 스윙을 자동 배제하여 오버나잇 휩소 손실을 방어합니다.)</i>"
                 )
-            print(f"[AMATS 자산 배분] 연동 완료: 레짐={today_regime} | 단타={r_day} | 스윙={r_swing}")
-        except Exception as alloc_err:
-            print(f"[AMATS 자산 배분] 연동 오류 발생: {alloc_err}")
-            
-        # STA ThemeTracker가 이미 오늘 데이터를 적재했으면 ERA 크롤 생략
-        try:
-            conn = sqlite3.connect(self.unified_db_path, timeout=30)
-            conn.execute("PRAGMA journal_mode=WAL;")
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='top_volume_theme'")
-            if cursor.fetchone():
-                cursor.execute("SELECT COUNT(*) FROM top_volume_theme WHERE date = ?", (today_str,))
-                count = cursor.fetchone()[0]
-                conn.close()
+                
+            # 2. 테마 대장주 알림 및 후속 작업 기동
+            # 2-A. 직접 크롤링에 성공하여 leaders가 있는 경우
+            if leaders:
+                theme_groups = {}
+                for item in leaders:
+                    theme_groups.setdefault(item["theme"], []).append(item["name"])
+                summary_lines = [f"• {t}: {', '.join(ns)}" for t, ns in list(theme_groups.items())[:5]]
+                
+                if notifier:
+                    notifier.send_message(
+                        f"🌅 <b>[08:50 RSA 분석 후보 확보 (크롤링)]</b>\n"
+                        f"총 <b>{len(leaders)}개</b> 종목 ({len(theme_groups)}개 테마)\n"
+                        + "\n".join(summary_lines) +
+                        f"\n\n🔬 RSA 정밀 분석 시작 중..."
+                    )
+                self._trigger_rsa_premarket()
+                QTimer.singleShot(1000, self._register_theme_realtime)
+            else:
+                # 2-B. 스레드 시작 시 이미 STA가 적재했거나 크롤 결과가 빈 경우 DB 재조회
+                count = 0
+                try:
+                    conn = sqlite3.connect(self.unified_db_path, timeout=30)
+                    conn.execute("PRAGMA journal_mode=WAL;")
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT COUNT(*) FROM top_volume_theme WHERE date = ?", (today_str,))
+                    count = cursor.fetchone()[0]
+                    conn.close()
+                except Exception:
+                    pass
+                    
                 if count > 0:
-                    self.theme_crawl_date = today_str
-                    print(f"[ERA] STA가 이미 {count}종목 등록 완료 → ERA 크롤 생략, RSA 기동.")
                     if notifier:
                         notifier.send_message(f"🌅 <b>[08:50 테마 준비 완료]</b>\nSTA 등록 {count}종목 활용 (스마트머니 필터 적용됨)")
                     self._trigger_rsa_premarket()
-                    # STA 데이터 사용 시에도 실시간 구독 등록
                     QTimer.singleShot(1000, self._register_theme_realtime)
-                    return
-            else:
-                conn.close()
-        except Exception:
-            pass
-        self._morning_theme_crawl()
-
-    def _morning_theme_crawl(self):
-        """네이버 금융 테마 대장주 크롤링 — 상위 10테마 × 5종목 = 최대 50개 RSA 후보"""
-        _HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        # ETF·레버리지·인버스·스팩·리츠 등 비정상 변동 종목 제외
-        _EXCLUDE = [
-            "KODEX","TIGER","KBSTAR","KINDEX","KOSEF","HANARO","ARIRANG","TREX","SOL","ACE","RISE",
-            "인버스","레버리지","선물","스팩","ETN","리츠","DR","우선주"
-        ]
-        leaders = []
-        seen_codes = set()
-        try:
-            res = requests.get("https://finance.naver.com/sise/theme.naver", headers=_HEADERS, timeout=5)
-            soup = BeautifulSoup(res.content, "html.parser")
-            themes = [
-                {"name": c.text, "url": "https://finance.naver.com" + c["href"]}
-                for r in soup.select("table.type_1 tr")
-                for c in r.select("td.col_type1 a")
-            ]
-            print(f"[ERA 테마 크롤링] 감지된 테마 수: {len(themes)}개 → 상위 10개 분석")
-
-            # 상위 10개 테마에서 각 5종목 수집 (중복 종목 제거)
-            for theme in themes[:10]:
-                try:
-                    tres = requests.get(theme["url"], headers=_HEADERS, timeout=5)
-                    tres.raise_for_status() # HTTP 응답 상태 코드 검사 (4xx, 5xx 에러 시 예외 발생)
-                    tsoup = BeautifulSoup(tres.content, "html.parser")
-                    
-                    rows = tsoup.select("table.type_5 tbody tr")
-                    if not rows:
-                        print(f"    [ERA 테마 크롤링] ⚠️ '{theme['name']}' 테마에서 종목 탐색 실패: HTML 구조 변경 또는 데이터 없음")
-                        continue # 다음 테마로 이동
-                        
-                    count = 0
-                    for row in rows:
-                        if count >= 5:
-                            break
-                        a = row.select_one("td.name a")
-                        if a:
-                            sname = a.text.strip()
-                            scode = a["href"].split("code=")[1]
-                            if not any(kw in sname for kw in _EXCLUDE) and scode not in seen_codes:
-                                leaders.append({"code": scode, "name": sname, "theme": theme["name"]})
-                                seen_codes.add(scode)
-                                count += 1
-                except requests.exceptions.RequestException as e:
-                    print(f"    [ERA 테마 크롤링] ⚠️ '{theme['name']}' 테마 페이지 요청 실패: {e}")
-                    continue
-                except Exception as e:
-                    print(f"    [ERA 테마 크롤링] ⚠️ '{theme['name']}' 테마 페이지 파싱 오류: {e}")
-                    continue
-
-            if not leaders:
-                print("[ERA 테마 크롤링] 결과 없음")
-                self._request_fallback_leaders()
-                return
-
-            today = datetime.now().strftime("%Y-%m-%d")
-            conn = sqlite3.connect(self.unified_db_path, timeout=30)
-            conn.execute("PRAGMA journal_mode=WAL;")
-            cursor = conn.cursor()
-            cursor.execute("""CREATE TABLE IF NOT EXISTS top_volume_theme
-                              (date TEXT, code TEXT, name TEXT, volume TEXT, UNIQUE(date, code))""")
-            cursor.execute("DELETE FROM top_volume_theme WHERE date = ?", (today,))
-            for item in leaders:
-                cursor.execute("INSERT OR REPLACE INTO top_volume_theme (date,code,name,volume) VALUES(?,?,?,?)",
-                               (today, item["code"], item["name"], item["theme"]))
-            conn.commit()
-            conn.close()
-            self.theme_crawl_date = today
-
-            # 테마별 그룹핑하여 요약 출력
-            theme_groups = {}
-            for item in leaders:
-                theme_groups.setdefault(item["theme"], []).append(item["name"])
-            summary_lines = [f"• {t}: {', '.join(ns)}" for t, ns in list(theme_groups.items())[:5]]
-            print(f"\n[ERA 테마 크롤링] 완료: {len(leaders)}개 후보 확보")
-
-            if notifier:
-                notifier.send_message(
-                    f"🌅 <b>[08:50 RSA 분석 후보 확보]</b>\n"
-                    f"총 <b>{len(leaders)}개</b> 종목 ({len(theme_groups)}개 테마)\n"
-                    + "\n".join(summary_lines) +
-                    f"\n\n🔬 RSA 정밀 분석 시작 중... (완료 후 추천 종목 안내)"
-                )
-            self._trigger_rsa_premarket()
-            # 크롤 완료 후 1초 뒤 실시간 구독 등록 (DB 커밋 완료 대기)
-            QTimer.singleShot(1000, self._register_theme_realtime)
-        except Exception as e:
-            print(f"[ERA 테마 크롤링 오류] {e}")
+                else:
+                    # 크롤 결과도 없고 DB에도 없으면 폴백 요청 (키움 API 조회)
+                    print("[ERA] 아침 크롤링 데이터가 없어 폴백 요청(키움 API)을 기동합니다.")
+                    self._request_fallback_leaders()
+        else:
+            print("[ERA] 아침 장전 스캔 및 배분 백그라운드 작업 실패 → 폴백 기동")
             self._request_fallback_leaders()
 
     def _request_fallback_leaders(self):
@@ -1549,7 +1588,7 @@ class ERAOrderManager:
     def _determine_sync_pages(self, code):
         """DB에 이미 적재된 데이터의 최신 일시를 체크하여 동기화할 페이지 수 결정 (2페이지 vs 10페이지)"""
         try:
-            conn = sqlite3.connect(self.futures_db_path, timeout=10)
+            conn = sqlite3.connect(self.futures_db_path, timeout=30)
             conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='futures_ohlcv'")
@@ -1691,7 +1730,7 @@ class ERAOrderManager:
         """오늘 주간 09시 첫 5분봉 시가를 DB에서 조회 (늦은 기동 시 실제 시초가 복원)"""
         try:
             today_prefix = datetime.now().strftime("%Y%m%d09")
-            conn = sqlite3.connect(self.futures_db_path, timeout=10)
+            conn = sqlite3.connect(self.futures_db_path, timeout=30)
             conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()
             # real_day_code(예: 105V6000) → DB 저장 코드(10500000) 순으로 폴백
@@ -1794,7 +1833,7 @@ class ERAOrderManager:
         if not fc:
             return
         try:
-            conn = sqlite3.connect(self.futures_db_path, timeout=10)
+            conn = sqlite3.connect(self.futures_db_path, timeout=30)
             conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()
             cursor.execute("""
@@ -1824,7 +1863,7 @@ class ERAOrderManager:
             return
         today = datetime.now().strftime("%Y-%m-%d")
         try:
-            conn = sqlite3.connect(self.unified_db_path, timeout=10)
+            conn = sqlite3.connect(self.unified_db_path, timeout=30)
             conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()
             for isf_cfg in self.isf_configs:
@@ -2078,7 +2117,7 @@ class ERAOrderManager:
         """ISF 오늘 09시 시초가 DB에서 조회"""
         try:
             today_prefix = datetime.now().strftime("%Y%m%d09")
-            conn = sqlite3.connect(self.futures_db_path, timeout=10)
+            conn = sqlite3.connect(self.futures_db_path, timeout=30)
             conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()
             cursor.execute(
@@ -2122,7 +2161,7 @@ class ERAOrderManager:
                 date_prefix = yesterday_str + "18"
             else:
                 date_prefix = today_str + "18"
-            conn = sqlite3.connect(self.futures_db_path, timeout=10)
+            conn = sqlite3.connect(self.futures_db_path, timeout=30)
             conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()
             for query_code in [code, self.futures_prefix + "00000", "10500000", "10100000"]:
@@ -2607,7 +2646,8 @@ class ERAOrderManager:
                 
                 if combined_total > 0:
                     import sqlite3
-                    db_conn = sqlite3.connect(self.unified_db_path, timeout=5)
+                    db_conn = sqlite3.connect(self.unified_db_path, timeout=30)
+                    db_conn.execute("PRAGMA journal_mode=WAL;")
                     db_cursor = db_conn.cursor()
                     db_cursor.execute("""
                     CREATE TABLE IF NOT EXISTS daily_balance_history (
@@ -2741,6 +2781,12 @@ class ERAOrderManager:
                 signal_id, code, name, strategy_type, price, open_price = row
                 print(f"\n[🚨 주식 신규 신호 감지] {name}({code}) | 유형: {strategy_type}")
                 
+                # 비정상 가격 필터 (ZeroDivisionError 원천 방지)
+                if price <= 0 and strategy_type != 'MANUAL_SELL':
+                    print(f" => [거절] 비정상 신호 가격: {price}")
+                    cursor.execute("UPDATE signals SET status = 'SKIPPED_INVALID_PRICE' WHERE id = ?", (signal_id,))
+                    continue
+
                 # 중복 진입 검사
                 if code in self.portfolio or code in self.pending_orders:
                     print(" => [거절] 이미 포트폴리오에 있거나 매매 집행 중입니다.")
@@ -2854,7 +2900,7 @@ class ERAOrderManager:
                     del self.pending_orders[code]
 
             conn.commit()
-        except sqlite3.OperationalError as e:
+        except Exception as e:
             print(f"[ERA 주식 폴링 에러] {e}")
         finally:
             conn.close()
@@ -2872,6 +2918,14 @@ class ERAOrderManager:
             if row:
                 signal_id, code, signal_type, price = row
                 print(f"\n[🚨 선물 신규 신호 감지] {code} | {signal_type} | 현재가: {price}")
+                
+                # 비정상 가격 필터 (ZeroDivisionError 원천 방지)
+                if price <= 0:
+                    print(f"  => [거절] 비정상 신호 가격: {price}")
+                    cursor.execute("UPDATE signals SET status = 'SKIPPED_INVALID_PRICE' WHERE id = ?", (signal_id,))
+                    conn.commit()
+                    conn.close()
+                    return
                 
                 if getattr(self, 'futures_fixed_qty', None) is not None:
                     qty = self.futures_fixed_qty
@@ -2930,7 +2984,7 @@ class ERAOrderManager:
                     else:
                         cursor.execute("UPDATE signals SET status = 'FAILED' WHERE id = ?", (signal_id,))
             conn.commit()
-        except sqlite3.OperationalError as e:
+        except Exception as e:
             print(f"[ERA 선물 폴링 에러] {e}")
         finally:
             conn.close()
