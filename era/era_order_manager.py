@@ -391,6 +391,7 @@ class ERAOrderManager:
         self.futures_available_balance = 0
         self.futures_margin_cap_ratio = 0.20  # [AMATS 최적화] KOSPI200 선물 20% 격리 캡
         self.isf_margin_cap_ratio = 0.05      # [AMATS 최적화] ISF 종목당 5% 격리 캡
+        self.futures_atr_cutoff = 0.5         # [AMATS 최적화] 초저변동성 구간 진입 차단 필터 기본값
         
         # 자금 분배율 (기본값)
         self.ratio_day = 0.60
@@ -486,8 +487,12 @@ class ERAOrderManager:
         self.futures_sync_active = False
 
         # 선물 손절/익절 설정 (고정 pt)
-        self.futures_stop_loss_pt = 2.0   # 고정 손절: 진입가 대비 2.0pt
-        self.futures_take_profit_pt = 5.0  # 고정 익절: 진입가 대비 5.0pt
+        self.futures_stop_loss_pt = 2.0   # 주간선물 손절 (update_futures_dynamic_sl_tp가 덮어씀)
+        self.futures_take_profit_pt = 5.0  # 주간선물 익절
+        self.futures_atr_14 = 2.0
+        # 야간선물 전용 고정 손절/익절 — ATR 동적 함수에 의해 절대 변경되지 않음
+        self.futures_night_stop_loss_pt = 3.0
+        self.futures_night_take_profit_pt = 6.0
 
         # 주간 선물 (09:00 ~ 익일 08:45)
         self.futures_day_open     = 0.0
@@ -593,6 +598,7 @@ class ERAOrderManager:
             # 동적 SL / TP 연산 (손절 = 1.0 * ATR, 익절 = 2.0 * ATR)
             self.futures_stop_loss_pt = max(round(atr_14 * 1.0, 2), 2.0)
             self.futures_take_profit_pt = max(round(atr_14 * 2.0, 2), 4.0)
+            self.futures_atr_14 = float(atr_14)
             
             print(f"[AMATS 파생 최적화] 선물 동적 ATR 적용 완료: 14일 ATR={atr_14:.2f}pt ➡️ 손절={self.futures_stop_loss_pt}pt | 익절={self.futures_take_profit_pt}pt")
         except Exception as dynamic_err:
@@ -622,6 +628,8 @@ class ERAOrderManager:
             self.ratio_swing = config.get("budget_allocation", {}).get("stock_swing_ratio", 0.40)
             self.config_stock_acc = config.get("accounts", {}).get("stock_account", "")
             self.config_futures_acc = config.get("accounts", {}).get("futures_account", "")
+            self.gemini_api_key = config.get("api_settings", {}).get("gemini_api_key", "")
+            self.apply_rsa_in_mock = config.get("features", {}).get("apply_rsa_in_mock", False)
 
             # 선물 손절/익절 설정 로드 (고정 pt) — config.json 기본값
             futures_settings = config.get("futures_settings", {})
@@ -636,11 +644,17 @@ class ERAOrderManager:
                         active = json.load(f)
                     if "stop_loss_pt" in active:
                         self.futures_stop_loss_pt = float(active["stop_loss_pt"])
+                        self.futures_night_stop_loss_pt = float(active["stop_loss_pt"])   # 야간 고정값 동기화
                     if "take_profit_pt" in active:
                         self.futures_take_profit_pt = float(active["take_profit_pt"])
+                        self.futures_night_take_profit_pt = float(active["take_profit_pt"])  # 야간 고정값 동기화
                     if "best_k" in active:
                         self.futures_best_k = float(active["best_k"])
-                    print(f"[ERA] active_strategy.json 파라미터 적용: K={self.futures_best_k} | 손절={self.futures_stop_loss_pt}pt | 익절={self.futures_take_profit_pt}pt")
+                    if "margin_cap" in active:
+                        self.futures_margin_cap_ratio = float(active["margin_cap"])
+                    if "atr_cutoff" in active:
+                        self.futures_atr_cutoff = float(active["atr_cutoff"])
+                    print(f"[ERA] active_strategy.json 파라미터 적용: K={self.futures_best_k} | 손절={self.futures_stop_loss_pt}pt | 익절={self.futures_take_profit_pt}pt | 마진캡={self.futures_margin_cap_ratio:.2f} | ATR필터={self.futures_atr_cutoff:.2f}pt")
                 except Exception as e:
                     print(f"[ERA] active_strategy.json 로드 실패 (config.json 값 유지): {e}")
 
@@ -686,7 +700,12 @@ class ERAOrderManager:
     def persist_positions(self):
         """가상 파티셔닝 정보 파일 저장"""
         try:
-            data = {code: pos['strategy'] for code, pos in self.portfolio.items()}
+            data = {}
+            for code, pos in self.portfolio.items():
+                data[code] = {
+                    "strategy": pos["strategy"],
+                    "half_sold": pos.get("half_sold", False)
+                }
             with open(self.positions_persist_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
         except Exception as e:
@@ -803,33 +822,54 @@ class ERAOrderManager:
                 self.was_disconnected = True
                 self._reconnect_attempts = 0
 
-            # 거래일 07:00 이후에만 자동 재연결 시도
-            elif is_trading and now.hour >= 7:
-                self._reconnect_attempts = getattr(self, '_reconnect_attempts', 0) + 1
-                print(f"[ERA] 자동 재연결 시도 #{self._reconnect_attempts}...")
-                
-                if self._reconnect_attempts >= 3:
-                    print("🚨 [ERA] 3회 연속 재연결 실패. 하드웨어/소프트웨어 리셋(자동 재시작)을 실행합니다.")
-                    if notifier:
-                        notifier.send_message(
-                            "🚨 <b>[ERA 연결 장애 지속]</b>\n"
-                            "3회 연속 재연결에 실패했습니다.\n"
-                            "Kiwoom OpenAPI 세션 초기화 및 ERA 엔진 자동 재구동을 진행합니다 (약 60초 소요)."
-                        )
-                    import subprocess
-                    reconnect_script = os.path.join(current_dir, "auto_reconnect_era.bat")
-                    if os.path.exists(reconnect_script):
-                        # CREATE_NEW_CONSOLE을 사용해 부모 프로세스 트리와 완전히 분리된 별도의 새 독립형 콘솔 창으로 띄웁니다.
-                        # 이로 인해 부모 파이썬 프로세스가 taskkill 당하더라도, 재연결 배치 프로세스는 안전하게 독자 생존하여 시퀀스를 완수합니다.
-                        subprocess.Popen(
-                            [reconnect_script],
-                            creationflags=subprocess.CREATE_NEW_CONSOLE,
-                            cwd=current_dir
-                        )
+            # 영업일의 활성 매매 시간대인 경우에만 자동 재연결 시도 (장외 시간대 무한 리셋 방지)
+            else:
+                is_active_hours = False
+                if is_trading:
+                    # 주식 모드 또는 통합 모드: 주식 장중 (08:30 ~ 15:40)
+                    if self.trading_mode in ('stock', 'both'):
+                        if (now.hour == 8 and now.minute >= 30) or (9 <= now.hour < 15) or (now.hour == 15 and now.minute <= 40):
+                            is_active_hours = True
+                    
+                    # 선물 모드 또는 통합 모드: 선물 장중 (주간: 08:30~15:50, 야간: 18:00~익일 04:50)
+                    if self.trading_mode in ('futures', 'both'):
+                        if (now.hour == 8 and now.minute >= 30) or (9 <= now.hour < 15) or (now.hour == 15 and now.minute <= 50):
+                            is_active_hours = True
+                        if (now.hour >= 18) or (now.hour < 4) or (now.hour == 4 and now.minute <= 50):
+                            is_active_hours = True
+
+                if is_active_hours:
+                    self._reconnect_attempts = getattr(self, '_reconnect_attempts', 0) + 1
+                    print(f"[ERA] 자동 재연결 시도 #{self._reconnect_attempts}...")
+                    
+                    if self._reconnect_attempts >= 3:
+                        print("🚨 [ERA] 3회 연속 재연결 실패. 하드웨어/소프트웨어 리셋(자동 재시작)을 실행합니다.")
+                        if notifier:
+                            notifier.send_message(
+                                "🚨 <b>[ERA 연결 장애 지속]</b>\n"
+                                "3회 연속 재연결에 실패했습니다.\n"
+                                "Kiwoom OpenAPI 세션 초기화 및 ERA 엔진 자동 재구동을 진행합니다 (약 60초 소요)."
+                            )
+                        import subprocess
+                        reconnect_script = os.path.join(current_dir, "auto_reconnect_era.bat")
+                        if os.path.exists(reconnect_script):
+                            # CREATE_NEW_CONSOLE을 사용해 부모 프로세스 트리와 완전히 분리된 별도의 새 독립형 콘솔 창으로 띄웁니다.
+                            # 이로 인해 부모 파이썬 프로세스가 taskkill 당하더라도, 재연결 배치 프로세스는 안전하게 독자 생존하여 시퀀스를 완수합니다.
+                            subprocess.Popen(
+                                [reconnect_script],
+                                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                                cwd=current_dir
+                            )
+                        else:
+                            print(f"⚠️ [오류] 재연결 스크립트가 존재하지 않습니다: {reconnect_script}")
                     else:
-                        print(f"⚠️ [오류] 재연결 스크립트가 존재하지 않습니다: {reconnect_script}")
+                        self.kiwoom.dynamicCall("CommConnect()")
                 else:
-                    self.kiwoom.dynamicCall("CommConnect()")
+                    # 대기 상태 유지, 로그 노이즈 최소화
+                    if getattr(self, '_reconnect_attempts', 0) > 0:
+                        self._reconnect_attempts = 0
+                    if now.minute == 0:
+                        print(f"[ERA] 현재 비활성 시간대({now.strftime('%H:%M')}) 또는 휴장일입니다. 재연결을 대기합니다.")
         else:
             if self.was_disconnected:
                 print("✅ [ERA] 키움증권 서버 통신 복구.")
@@ -1114,7 +1154,7 @@ class ERAOrderManager:
                 self.futures_available_balance = int(available_cash)
             print(f"\n=> 💸 [선물 계좌 자금]")
             print(f"   - 선물 예수금: {self.futures_available_balance:,}원")
-            print(f"   - 30% 캡 적용 가용금액: {int(self.futures_available_balance * self.futures_margin_cap_ratio):,}원")
+            print(f"   - {int(self.futures_margin_cap_ratio * 100)}% 캡 적용 가용금액: {int(self.futures_available_balance * self.futures_margin_cap_ratio):,}원")
             
         elif rqname == "계좌평가잔고내역요청":
             rows = self.kiwoom.dynamicCall("GetRepeatCnt(QString, QString)", trcode, rqname)
@@ -1128,7 +1168,13 @@ class ERAOrderManager:
                 current_price = int(self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "현재가").strip())
                 
                 # 저장되어 있던 가상 파티셔닝 정보 복원 (기록 없으면 스윙으로 안전 처리)
-                strategy_tag = self.persisted_strategies.get(code, "SWING")
+                persist_val = self.persisted_strategies.get(code, "SWING")
+                if isinstance(persist_val, dict):
+                    strategy_tag = persist_val.get("strategy", "SWING")
+                    half_sold = persist_val.get("half_sold", False)
+                else:
+                    strategy_tag = persist_val
+                    half_sold = False
                 
                 if code not in self.portfolio:
                     self.portfolio[code] = {
@@ -1140,11 +1186,12 @@ class ERAOrderManager:
                         'max_price': current_price,
                         'open_price': buy_price,
                         'super_trend_mode': False,
-                        'ma_10': 0, 'ma_20': 0
+                        'ma_10': 0, 'ma_20': 0,
+                        'half_sold': half_sold
                     }
                     # 실시간 데이터 감시 등록
                     self.kiwoom.dynamicCall("SetRealReg(QString, QString, QString, QString)", "0102", code, "10", "1")
-                    print(f"   - [{strategy_tag}] {name}({code}) | {qty}주 | 평단: {buy_price:,}원")
+                    print(f"   - [{strategy_tag}] {name}({code}) | {qty}주 | 평단: {buy_price:,}원 (하프매도여부: {half_sold})")
             self.export_status()
             
         elif rqname == "스윙일봉5MA조회":
@@ -1152,33 +1199,45 @@ class ERAOrderManager:
             if code in self.portfolio and self.portfolio[code]['strategy'] == 'SWING':
                 pos = self.portfolio[code]
                 
-                # 동적 이평선 기간 자동 결정 (UP: 10일선, RANGE/DOWN: 5일선)
-                ma_period = self.get_swing_exit_ma_period()
-                
                 closes = []
-                for i in range(ma_period):
+                for i in range(10): # 항상 10영업일 종가 조회
                     c = self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "현재가").strip()
                     if c:
                         closes.append(abs(int(c)))
                         
-                if len(closes) == ma_period:
-                    ma_val = sum(closes) / ma_period
+                if len(closes) >= 10:
+                    ma_5 = sum(closes[:5]) / 5
+                    ma_10 = sum(closes[:10]) / 10
                     current_price = abs(int(self.kiwoom.dynamicCall("GetCommRealData(QString, int)", code, 10)))
                     if current_price == 0:
                         current_price = closes[0]
                         
-                    print(f"   => [스윙 동적 종가 검증] {pos['name']} 현재가: {current_price:,} / {ma_period}MA: {ma_val:,.1f} (적용 레짐: {getattr(self, 'current_regime', 'RANGE')})")
+                    print(f"   => [스윙 하프익절 검증] {pos['name']} 현재가: {current_price:,} / 5MA: {ma_5:,.1f} / 10MA: {ma_10:,.1f} (하프매도여부: {pos.get('half_sold', False)})")
                     
-                    if current_price < ma_val:
-                        print(f"   🚨 [스윙 자동 청산] {pos['name']} {ma_period}일선 하향 이탈! 시장가 매도.")
+                    # 1. 10MA 하향 이탈 시: 전량 청산
+                    if current_price < ma_10:
+                        print(f"   🚨 [스윙 전량 청산] {pos['name']} 10일선 하향 이탈! 전량 매도.")
                         self.kiwoom.dynamicCall(
                             "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-                            ["[ERA_Swing_MA_Sell]", "0103", self.stock_account, 2, code, pos['qty'], 0, "03", ""]
+                            ["[ERA_Swing_10MA_Sell]", "0103", self.stock_account, 2, code, pos['qty'], 0, "03", ""]
                         )
                         if notifier:
-                            notifier.send_message(f"📉 <b>[스윙 익절/청산] {pos['name']}</b>\n• 종가 {ma_period}일선 이탈로 실계좌 시장가 전량 청산합니다. (적용 레짐: {getattr(self, 'current_regime', 'RANGE')})")
+                            notifier.send_message(f"📉 <b>[스윙 익절/청산] {pos['name']}</b>\n• 종가 10일선 이탈로 실계좌 시장가 전량 청산합니다.")
+                    # 2. 5MA 하향 이탈 시 (10MA 위이고, 아직 하프매도가 안 된 상태): 50% 분할 매도
+                    elif current_price < ma_5 and not pos.get('half_sold', False):
+                        half_qty = max(1, pos['qty'] // 2)
+                        print(f"   🚨 [스윙 하프 익절] {pos['name']} 5일선 하향 이탈! 절반({half_qty}주) 매도.")
+                        pos['half_sold'] = True
+                        self.persist_positions() # 상태 저장
+                        
+                        self.kiwoom.dynamicCall(
+                            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
+                            ["[ERA_Swing_5MA_Half]", "0103", self.stock_account, 2, code, half_qty, 0, "03", ""]
+                        )
+                        if notifier:
+                            notifier.send_message(f"📉 <b>[스윙 하프 익절] {pos['name']}</b>\n• 종가 5일선 이탈로 보유 물량의 절반({half_qty}주)을 시장가 매도합니다.")
                     else:
-                        print(f"   ✅ [스윙 오버나잇 확정] {pos['name']} {ma_period}MA 지지.")
+                        print(f"   ✅ [스윙 홀딩 확정] {pos['name']} 지지 흐름 유지.")
                         
         elif rqname == "선물과거분차트동기화":
             cnt = self.kiwoom.dynamicCall("GetRepeatCnt(QString, QString)", trcode, rqname)
@@ -1233,6 +1292,10 @@ class ERAOrderManager:
         if not (now.weekday() < 5 and now.hour == 8 and 50 <= now.minute <= 59 and self.theme_crawl_date != today_str):
             return
             
+        self._morning_theme_crawl()
+
+    def _morning_theme_crawl(self):
+        """백그라운드로 아침 장세 감지 및 테마 스캔 QThread 기동 (늦은 기동/수동 실행 지원)"""
         # 스레드가 이미 진행 중이면 중복 방지
         if getattr(self, 'morning_worker', None) is not None and self.morning_worker.isRunning():
             return
@@ -1646,6 +1709,7 @@ class ERAOrderManager:
             self.futures_sync_active = False
             print("[ERA 선물] 과거 5분봉 데이터베이스 자동 동기화 완료!")
             self._load_prev_range()
+            self.update_futures_dynamic_sl_tp()
             self.futures_strategy_active = True
             
             print(f"\n[ERA 선물 전략 활성화] K={self.futures_best_k:.2f} | 전일Range={self.futures_prev_range:.2f}pt")
@@ -1990,11 +2054,12 @@ class ERAOrderManager:
                     elif ts_enabled and max_pnl_pct >= ts_activate_pct:
                         ts_threshold = self.isf_peak_price[sc] * (1 - ts_trail_pct / 100)
                         if price <= ts_threshold:
+                            peak_snapshot = self.isf_peak_price[sc]
                             print(f"[ISF] {isf_cfg['name']} LONG 트레일링 스탑 작동: 현재 {pnl_pct:+.2f}% (고점 {max_pnl_pct:+.2f}%, 기준선 {ts_threshold:,.0f}원)")
                             self._execute_isf_order(isf_cfg, "LONG_EXIT", price)
                             self.isf_peak_price[sc] = 0.0
                             if notifier:
-                                notifier.send_message(f"✨ <b>[ISF 트레일링 스탑] {isf_cfg['name']}</b> {pnl_pct:+.2f}% | 진입:{entry:,} → {price:,}원 (최고가:{self.isf_peak_price[sc]:,.0f}원)")
+                                notifier.send_message(f"✨ <b>[ISF 트레일링 스탑] {isf_cfg['name']}</b> {pnl_pct:+.2f}% | 진입:{entry:,} → {price:,}원 (최고가:{peak_snapshot:,.0f}원)")
                     # 3. 고정 익절 (트레일링 비활성화 상태이거나 활성화 기준에 도달하지 못한 경우)
                     elif pnl_pct >= isf_cfg.get("take_profit_pct", 4.0):
                         print(f"[ISF] {isf_cfg['name']} LONG 익절: {pnl_pct:+.2f}%")
@@ -2023,11 +2088,12 @@ class ERAOrderManager:
                     elif ts_enabled and max_pnl_pct >= ts_activate_pct:
                         ts_threshold = self.isf_peak_price[sc] * (1 + ts_trail_pct / 100)
                         if price >= ts_threshold:
+                            peak_snapshot = self.isf_peak_price[sc]
                             print(f"[ISF] {isf_cfg['name']} SHORT 트레일링 스탑 작동: 현재 {pnl_pct:+.2f}% (고점 {max_pnl_pct:+.2f}%, 기준선 {ts_threshold:,.0f}원)")
                             self._execute_isf_order(isf_cfg, "SHORT_EXIT", price)
                             self.isf_peak_price[sc] = 0.0
                             if notifier:
-                                notifier.send_message(f"✨ <b>[ISF 트레일링 스탑] {isf_cfg['name']}</b> {pnl_pct:+.2f}% | 진입:{entry:,} → {price:,}원 (최저가:{self.isf_peak_price[sc]:,.0f}원)")
+                                notifier.send_message(f"✨ <b>[ISF 트레일링 스탑] {isf_cfg['name']}</b> {pnl_pct:+.2f}% | 진입:{entry:,} → {price:,}원 (최저가:{peak_snapshot:,.0f}원)")
                     # 3. 고정 익절 (트레일링 비활성화 상태이거나 활성화 기준에 도달하지 못한 경우)
                     elif pnl_pct >= isf_cfg.get("take_profit_pct", 4.0):
                         print(f"[ISF] {isf_cfg['name']} SHORT 익절: {pnl_pct:+.2f}%")
@@ -2274,12 +2340,13 @@ class ERAOrderManager:
                         ts_price = self.futures_day_peak - 2.0
                         if current_price <= ts_price:
                             realized_pnl = current_price - entry
-                            print(f"[주간선물] 🎯 LONG 트레일링 스탑 발동! 최고가:{self.futures_day_peak:.2f} 현재가(청산):{current_price:.2f} 익절:{realized_pnl:+.2f}pt")
+                            peak_snapshot = self.futures_day_peak
+                            print(f"[주간선물] 🎯 LONG 트레일링 스탑 발동! 최고가:{peak_snapshot:.2f} 현재가(청산):{current_price:.2f} 익절:{realized_pnl:+.2f}pt")
                             self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
                             self.futures_day_entry_price = 0.0
                             self.futures_day_peak = 0.0
                             if notifier:
-                                notifier.send_message(f"🎯 <b>[주간선물 트레일링 익절]</b> {realized_pnl:+.2f}pt (최고가:{self.futures_day_peak:.2f} ➡️ 청산:{current_price:.2f})")
+                                notifier.send_message(f"🎯 <b>[주간선물 트레일링 익절]</b> {realized_pnl:+.2f}pt (최고가:{peak_snapshot:.2f} ➡️ 청산:{current_price:.2f})")
                             return
 
                 elif pos['type'] == 'SHORT':
@@ -2305,12 +2372,13 @@ class ERAOrderManager:
                         ts_price = self.futures_day_peak + 2.0
                         if current_price >= ts_price:
                             realized_pnl = entry - current_price
-                            print(f"[주간선물] 🎯 SHORT 트레일링 스탑 발동! 최저가:{self.futures_day_peak:.2f} 현재가(청산):{current_price:.2f} 익절:{realized_pnl:+.2f}pt")
+                            peak_snapshot = self.futures_day_peak
+                            print(f"[주간선물] 🎯 SHORT 트레일링 스탑 발동! 최저가:{peak_snapshot:.2f} 현재가(청산):{current_price:.2f} 익절:{realized_pnl:+.2f}pt")
                             self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
                             self.futures_day_entry_price = 0.0
                             self.futures_day_peak = 0.0
                             if notifier:
-                                notifier.send_message(f"🎯 <b>[주간선물 트레일링 익절]</b> {realized_pnl:+.2f}pt (최저가:{self.futures_day_peak:.2f} ➡️ 청산:{current_price:.2f})")
+                                notifier.send_message(f"🎯 <b>[주간선물 트레일링 익절]</b> {realized_pnl:+.2f}pt (최저가:{peak_snapshot:.2f} ➡️ 청산:{current_price:.2f})")
                             return
             return  # 포지션 보유 중이면 신규 진입 불가
 
@@ -2318,6 +2386,11 @@ class ERAOrderManager:
         if not self.futures_order_locked and not self.system_halted:
             is_after_9 = (now.hour == 9 and now.minute >= 0) or (now.hour > 9)
             if is_after_9:
+                # [AMATS 최적화] 초저변동성 구간 진입 차단 필터링 (ATR Cutoff)
+                atr_val = getattr(self, 'futures_atr_14', 2.0)
+                if atr_val < self.futures_atr_cutoff:
+                    return
+
                 if current_price >= self.futures_target_long:
                     self.futures_day_entry_price = current_price
                     self.futures_day_peak = current_price # 진입 즉시 초기화
@@ -2343,14 +2416,14 @@ class ERAOrderManager:
             src_label = "DB 시초가" if db_night_open > 0 else "현재가(폴백)"
             print(f"\n[야간선물] ✅ 시초가 설정: {night_open:.2f}pt ({src_label})")
             print(f"  LONG목표: {self.futures_night_target_long:.2f}  SHORT목표: {self.futures_night_target_short:.2f}")
-            print(f"  손절: {self.futures_stop_loss_pt}pt  익절: {self.futures_take_profit_pt}pt")
+            print(f"  손절: {self.futures_night_stop_loss_pt}pt  익절: {self.futures_night_take_profit_pt}pt (고정)")
             if notifier:
                 notifier.send_message(
                     f"🌙 <b>[야간선물 목표가]</b>\n"
                     f"• 시초가: {night_open:.2f}pt ({src_label})\n"
                     f"• LONG ▲ {self.futures_night_target_long:.2f}pt\n"
                     f"• SHORT ▼ {self.futures_night_target_short:.2f}pt\n"
-                    f"• 손절: {self.futures_stop_loss_pt}pt | 익절: {self.futures_take_profit_pt}pt"
+                    f"• 손절: {self.futures_night_stop_loss_pt}pt | 익절: {self.futures_night_take_profit_pt}pt (고정)"
                 )
 
         if self.futures_night_open == 0:
@@ -2373,40 +2446,45 @@ class ERAOrderManager:
             if entry > 0:
                 if pos['type'] == 'LONG':
                     pnl_pt = current_price - entry
-                    if pnl_pt <= -self.futures_stop_loss_pt:
+                    if pnl_pt <= -self.futures_night_stop_loss_pt:
                         print(f"[야간선물] 🛑 LONG 손절 발동! 진입:{entry:.2f} 현재:{current_price:.2f} 손실:{pnl_pt:+.2f}pt")
                         self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
                         self.futures_night_entry_price = 0.0
                         if notifier:
-                            notifier.send_message(f"🛑 <b>[야간선물 손절]</b> {pnl_pt:+.2f}pt")
+                            notifier.send_message(f"🛑 <b>[야간선물 손절]</b> {pnl_pt:+.2f}pt | 기준:{self.futures_night_stop_loss_pt}pt")
                         return
-                    elif pnl_pt >= self.futures_take_profit_pt:
+                    elif pnl_pt >= self.futures_night_take_profit_pt:
                         print(f"[야간선물] 🎯 LONG 익절 발동! 진입:{entry:.2f} 현재:{current_price:.2f} 수익:{pnl_pt:+.2f}pt")
                         self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
                         self.futures_night_entry_price = 0.0
                         if notifier:
-                            notifier.send_message(f"🎯 <b>[야간선물 익절]</b> {pnl_pt:+.2f}pt")
+                            notifier.send_message(f"🎯 <b>[야간선물 익절]</b> {pnl_pt:+.2f}pt | 기준:{self.futures_night_take_profit_pt}pt")
                         return
                 elif pos['type'] == 'SHORT':
                     pnl_pt = entry - current_price
-                    if pnl_pt <= -self.futures_stop_loss_pt:
+                    if pnl_pt <= -self.futures_night_stop_loss_pt:
                         print(f"[야간선물] 🛑 SHORT 손절 발동! 진입:{entry:.2f} 현재:{current_price:.2f} 손실:{pnl_pt:+.2f}pt")
                         self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
                         self.futures_night_entry_price = 0.0
                         if notifier:
-                            notifier.send_message(f"🛑 <b>[야간선물 손절]</b> {pnl_pt:+.2f}pt")
+                            notifier.send_message(f"🛑 <b>[야간선물 손절]</b> {pnl_pt:+.2f}pt | 기준:{self.futures_night_stop_loss_pt}pt")
                         return
-                    elif pnl_pt >= self.futures_take_profit_pt:
+                    elif pnl_pt >= self.futures_night_take_profit_pt:
                         print(f"[야간선물] 🎯 SHORT 익절 발동! 진입:{entry:.2f} 현재:{current_price:.2f} 수익:{pnl_pt:+.2f}pt")
                         self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
                         self.futures_night_entry_price = 0.0
                         if notifier:
-                            notifier.send_message(f"🎯 <b>[야간선물 익절]</b> {pnl_pt:+.2f}pt")
+                            notifier.send_message(f"🎯 <b>[야간선물 익절]</b> {pnl_pt:+.2f}pt | 기준:{self.futures_night_take_profit_pt}pt")
                         return
             return  # 포지션 보유 중이면 신규 진입 불가
 
         # ── 신규 진입 조건 ──
         if not self.futures_night_order_locked and not self.system_halted:
+            # [AMATS 최적화] 초저변동성 구간 진입 차단 필터링 (ATR Cutoff)
+            atr_val = getattr(self, 'futures_atr_14', 2.0)
+            if atr_val < self.futures_atr_cutoff:
+                return
+
             if current_price >= self.futures_night_target_long:
                 self.futures_night_entry_price = current_price
                 self._execute_futures_direct("LONG_ENTER", current_price, code, pos_key)
@@ -2443,8 +2521,11 @@ class ERAOrderManager:
             else:
                 multiplier = 50000 if getattr(self, 'futures_prefix', '101') == '105' else 250000
                 margin_per = current_price * multiplier * 0.10
-                safe_budget = self.futures_available_balance * self.futures_margin_cap_ratio
-                qty = max(1, int(safe_budget // margin_per)) if margin_per > 0 else 1
+                
+                # [AMATS 최적화] active_strategy.json의 마진캡(최적화 적용값 50%)을 반영한 자본 대비 계약 수 계산
+                margin_cap = getattr(self, 'futures_margin_cap_ratio', 0.20)
+                qty = max(1, int((self.futures_available_balance * margin_cap) / margin_per)) if margin_per > 0 else 1
+                qty = min(qty, 15)  # 최대 계약수 한도 15계약으로 제약 (과도한 레버리지 노출 제약)
 
         session_label = "야간" if is_night else "주간"
         print(f"\n[{session_label}선물 주문] {label} | {current_price:.2f}pt | {qty}계약 | {order_code}")
@@ -2707,6 +2788,22 @@ class ERAOrderManager:
         now = datetime.now()
         # 1. 스윙 이평선 감시 (stock/both만)
         if self.trading_mode in ('stock', 'both'):
+            # [추가] 단타(DAY) 종목 15:15 당일 무조건 시장가 일괄 청산 (오버나잇 금지)
+            if now.hour == 15 and 15 <= now.minute < 30:
+                for code, pos in list(self.portfolio.items()):
+                    if pos.get('strategy') == 'DAY' and not pos.get('sell_ordered'):
+                        print(f"\n🚨 [단타 장마감 강제 청산 발동] {pos['name']}({code}) - 오버나잇 방지 일괄 시장가 매도 주문 전송.")
+                        pos['sell_ordered'] = True
+                        self.kiwoom.dynamicCall(
+                            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
+                            ["[ERA_Day_Flat]", "0103", self.stock_account, 2, code, pos['qty'], 0, "03", ""]
+                        )
+                        if notifier:
+                            notifier.send_message(
+                                f"🚨 <b>[주식 단타 장마감 강제 청산] {pos['name']}</b>\n"
+                                f"• 오버나잇 방지를 위해 15:15 기준 실계좌 시장가 일괄 청산(Flat)을 수행합니다."
+                            )
+
             if now.hour == 15 and now.minute >= 14 and not self.today_5ma_checked:
                 self.today_5ma_checked = True
                 print("\n[⏰ ERA 종가 익절 감시] 15:14+ 스윙 종목 5MA 체크를 시작합니다.")
@@ -2845,7 +2942,7 @@ class ERAOrderManager:
                 has_table = cursor.fetchone()
                 
                 # 모의투자 환경: RSA 테이블 자동 생성 + 기존 저점수 포함 전체 우회 (80점 강제 삽입/갱신)
-                if self.environment != "live":
+                if self.environment != "live" and not getattr(self, "apply_rsa_in_mock", False):
                     if not has_table:
                         # RSA coordinator와 동일한 11컬럼 스키마로 생성 (INSERT 호환)
                         cursor.execute("""CREATE TABLE IF NOT EXISTS research_reports (
@@ -2868,11 +2965,32 @@ class ERAOrderManager:
                     has_table = True
 
                 if has_table:
-                    cursor.execute("SELECT score FROM research_reports WHERE code = ? ORDER BY id DESC LIMIT 1", (code,))
+                    if getattr(self, "apply_rsa_in_mock", False):
+                        cursor.execute("SELECT score FROM research_reports WHERE code = ? AND strategy_type != 'MOCK' ORDER BY id DESC LIMIT 1", (code,))
+                    else:
+                        cursor.execute("SELECT score FROM research_reports WHERE code = ? ORDER BY id DESC LIMIT 1", (code,))
+                    
                     rep = cursor.fetchone()
                     if rep is None:
-                        print(f" => [보류] RSA 미평가 — PENDING 유지, 장전 RSA 분석 완료 후 자동 처리됨")
-                        continue  # status 변경 없음 → 2초 후 재시도, RSA 완료되면 자동 통과
+                        # apply_rsa_in_mock가 True인 경우 온디맨드로 분석 기동
+                        if getattr(self, "apply_rsa_in_mock", False):
+                            try:
+                                from rsa.rsa_coordinator import RSACoordinator
+                                coord = RSACoordinator()
+                                if getattr(self, "gemini_api_key", None):
+                                    coord.nsaa.api_key = self.gemini_api_key
+                                print(f" => [모의투자 RSA 온디맨드 분석 기동] {name}({code})")
+                                coord.evaluate_stock(code, name, strategy_type)
+                                
+                                # 다시 조회
+                                cursor.execute("SELECT score FROM research_reports WHERE code = ? AND strategy_type != 'MOCK' ORDER BY id DESC LIMIT 1", (code,))
+                                rep = cursor.fetchone()
+                            except Exception as rsa_err:
+                                print(f" => [모의투자 RSA 온디맨드 분석 실패] {rsa_err}")
+                        
+                        if rep is None:
+                            print(f" => [보류] RSA 미평가 — PENDING 유지, 장전 RSA 분석 완료 후 자동 처리됨")
+                            continue  # status 변경 없음 → 2초 후 재시도
                     if rep[0] < 70:
                         print(f" => [거절] RSA 종합 리서치 점수 부족 ({rep[0]}점 / 기준 70점)")
                         cursor.execute("UPDATE signals SET status = 'SKIPPED_RSA_SCORE_LOW' WHERE id = ?", (signal_id,))
@@ -3003,9 +3121,32 @@ class ERAOrderManager:
             code = self.kiwoom.dynamicCall("GetChejanData(int)", 9001).strip().replace("A", "")
             
             if status == "체결":
-                exec_price = float(self.kiwoom.dynamicCall("GetChejanData(int)", 910).strip())
-                exec_qty = int(self.kiwoom.dynamicCall("GetChejanData(int)", 911).strip())
+                order_no = self.kiwoom.dynamicCall("GetChejanData(int)", 9203).strip()
+                raw_price = float(self.kiwoom.dynamicCall("GetChejanData(int)", 910).strip())
+                raw_qty = int(self.kiwoom.dynamicCall("GetChejanData(int)", 911).strip())
                 order_gubun = self.kiwoom.dynamicCall("GetChejanData(int)", 905).strip()
+
+                # mock 모드에서는 체결량/체결가가 누적으로 들어오는 경향이 있으므로 주문번호별로 delta 처리
+                if getattr(self, "environment", "mock") == "mock":
+                    if not hasattr(self, "_mock_order_fills"):
+                        self._mock_order_fills = {}
+                    
+                    prev_qty, prev_price = self._mock_order_fills.get(order_no, (0, 0.0))
+                    delta_qty = raw_qty - prev_qty
+                    if delta_qty <= 0:
+                        return  # 이미 처리되었거나 변동이 없는 누적 이벤트 무시
+                    
+                    total_cost_now = raw_price * raw_qty
+                    total_cost_prev = prev_price * prev_qty
+                    delta_cost = total_cost_now - total_cost_prev
+                    delta_price = delta_cost / delta_qty
+                    
+                    exec_qty = delta_qty
+                    exec_price = max(0.0, delta_price)
+                    self._mock_order_fills[order_no] = (raw_qty, raw_price)
+                else:
+                    exec_qty = raw_qty
+                    exec_price = raw_price
 
                 # 개별주식선물(ISF) 체결 처리
                 if code in self.isf_code_map:
@@ -3108,6 +3249,7 @@ class ERAOrderManager:
                             'current_price': exec_price, 'max_price': exec_price, 'open_price': open_p,
                             'super_trend_mode': False, 'ma_10': 0, 'ma_20': 0,
                             'entry_date': datetime.now().strftime('%Y-%m-%d'),
+                            'half_sold': False
                         }
                     else:
                         # 부분체결 평균단가 재계산
