@@ -302,7 +302,8 @@ class UnifiedOrderManager:
                         'max_price': current_price,
                         'open_price': buy_price,  # 재시작 복원 시 매입가를 기준봉 시가로 대체 (None이면 하드스탑 미발동)
                         'super_trend_mode': False,
-                        'ma_10': 0, 'ma_20': 0
+                        'ma_10': 0, 'ma_20': 0,
+                        'half_sold': False
                     }
                     self.kiwoom.dynamicCall("SetRealReg(QString, QString, QString, QString)", "0102", code, "10", "1")
                     print(f"  - {name}({code}) | {qty}주 | 매입가: {buy_price:,}원")
@@ -313,27 +314,41 @@ class UnifiedOrderManager:
             if code in self.portfolio and self.portfolio[code]['strategy'] == 'SWING':
                 pos = self.portfolio[code]
                 closes = []
-                for i in range(5):
+                for i in range(10): # 항상 10영업일 종가 조회
                     c = self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "현재가").strip()
                     if c: closes.append(abs(int(c)))
                 
-                if len(closes) == 5:
-                    ma_5 = sum(closes) / 5
+                if len(closes) >= 10:
+                    ma_5 = sum(closes[:5]) / 5
+                    ma_10 = sum(closes[:10]) / 10
                     current_price = abs(int(self.kiwoom.dynamicCall("GetCommRealData(QString, int)", code, 10)))
                     if current_price == 0: current_price = closes[0]
                     
-                    print(f"   => [스윙] {pos['name']} 현재가: {current_price:,} / 5MA: {ma_5:,.1f}")
+                    print(f"   => [스윙 하프익절 검증] {pos['name']} 현재가: {current_price:,} / 5MA: {ma_5:,.1f} / 10MA: {ma_10:,.1f} (하프매도여부: {pos.get('half_sold', False)})")
                     
-                    if current_price < ma_5:
-                        print(f"   🚨 [스윙 청산] {pos['name']} 종가 5선 하향 이탈! 전량 매도.")
+                    # 1. 10MA 하향 이탈 시: 전량 청산
+                    if current_price < ma_10:
+                        print(f"   🚨 [스윙 전량 청산] {pos['name']} 10일선 하향 이탈! 전량 매도.")
                         self.kiwoom.dynamicCall(
                             "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-                            ["[Unified_Swing_Sell_5MA]", "0103", self.account_num, 2, code, pos['qty'], 0, "03", ""]
+                            ["[Unified_Swing_10MA_Sell]", "0103", self.account_num, 2, code, pos['qty'], 0, "03", ""]
                         )
                         if notifier:
-                            notifier.send_message(f"📉 <b>[스윙 익절/청산] {pos['name']}</b>\n• 5일선 이탈로 전량 매도합니다.")
+                            notifier.send_message(f"📉 <b>[스윙 익절/청산] {pos['name']}</b>\n• 종가 10일선 이탈로 실계좌 시장가 전량 청산합니다.")
+                    # 2. 5MA 하향 이탈 시: 50% 분할 매도
+                    elif current_price < ma_5 and not pos.get('half_sold', False):
+                        half_qty = max(1, pos['qty'] // 2)
+                        print(f"   🚨 [스윙 하프 익절] {pos['name']} 5일선 하향 이탈! 절반({half_qty}주) 매도.")
+                        pos['half_sold'] = True
+                        
+                        self.kiwoom.dynamicCall(
+                            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
+                            ["[Unified_Swing_5MA_Half]", "0103", self.account_num, 2, code, half_qty, 0, "03", ""]
+                        )
+                        if notifier:
+                            notifier.send_message(f"📉 <b>[스윙 하프 익절] {pos['name']}</b>\n• 종가 5일선 이탈로 보유 물량의 절반({half_qty}주)을 시장가 매도합니다.")
                     else:
-                        print(f"   ✅ [스윙 홀딩] {pos['name']} 5MA 지지. 오버나잇 확정.")
+                        print(f"   ✅ [스윙 홀딩 확정] {pos['name']} 지지 흐름 유지.")
 
     def export_status(self):
         """텔레그램 컨트롤러와 상태 공유를 위한 JSON 익스포트"""
@@ -385,6 +400,22 @@ class UnifiedOrderManager:
 
     def check_swing_close_time(self):
         now = datetime.now()
+        # [추가] 단타(DAY) 종목 15:15 당일 무조건 시장가 일괄 청산 (오버나잇 금지)
+        if now.hour == 15 and 15 <= now.minute < 30:
+            for code, pos in list(self.portfolio.items()):
+                if pos.get('strategy') == 'DAY' and not pos.get('sell_ordered'):
+                    print(f"\n🚨 [단타 장마감 강제 청산 발동] {pos['name']}({code}) - 오버나잇 방지 일괄 시장가 매도 주문 전송.")
+                    pos['sell_ordered'] = True
+                    self.kiwoom.dynamicCall(
+                        "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
+                        ["[Auto_Day_Flat]", "0103", self.stock_account, 2, code, pos['qty'], 0, "03", ""]
+                    )
+                    if notifier:
+                        notifier.send_message(
+                            f"🚨 <b>[주식 단타 장마감 강제 청산] {pos['name']}</b>\n"
+                            f"• 오버나잇 방지를 위해 15:15 기준 실계좌 시장가 일괄 청산(Flat)을 수행합니다."
+                        )
+
         # second==0 조건만 쓰면 타이머 오차로 영구 스킵 가능 → 범위 조건 + 당일 1회 플래그로 보호
         if now.hour == 15 and now.minute >= 14 and not self.today_5ma_checked:
             self.today_5ma_checked = True
@@ -503,9 +534,32 @@ class UnifiedOrderManager:
             code = self.kiwoom.dynamicCall("GetChejanData(int)", 9001).strip().replace("A", "")
             
             if status == "체결":
-                exec_price = int(self.kiwoom.dynamicCall("GetChejanData(int)", 910).strip())
-                exec_qty = int(self.kiwoom.dynamicCall("GetChejanData(int)", 911).strip())
+                order_no = self.kiwoom.dynamicCall("GetChejanData(int)", 9203).strip()
+                raw_price = int(self.kiwoom.dynamicCall("GetChejanData(int)", 910).strip())
+                raw_qty = int(self.kiwoom.dynamicCall("GetChejanData(int)", 911).strip())
                 order_gubun = self.kiwoom.dynamicCall("GetChejanData(int)", 905).strip()
+
+                # mock 모드에서는 체결량/체결가가 누적으로 들어오는 경향이 있으므로 주문번호별로 delta 처리
+                if not IS_LIVE:
+                    if not hasattr(self, "_mock_order_fills"):
+                        self._mock_order_fills = {}
+                    
+                    prev_qty, prev_price = self._mock_order_fills.get(order_no, (0, 0.0))
+                    delta_qty = raw_qty - prev_qty
+                    if delta_qty <= 0:
+                        return  # 이미 처리되었거나 변동이 없는 누적 이벤트 무시
+                    
+                    total_cost_now = raw_price * raw_qty
+                    total_cost_prev = prev_price * prev_qty
+                    delta_cost = total_cost_now - total_cost_prev
+                    delta_price = delta_cost / delta_qty
+                    
+                    exec_qty = delta_qty
+                    exec_price = int(max(0.0, delta_price))
+                    self._mock_order_fills[order_no] = (raw_qty, raw_price)
+                else:
+                    exec_qty = raw_qty
+                    exec_price = raw_price
                 
                 print(f"[체결 확정] {name}({code}) | {exec_price:,}원 | {exec_qty}주 | {order_gubun}")
                 
@@ -518,7 +572,8 @@ class UnifiedOrderManager:
                         self.portfolio[code] = {
                             'name': name, 'strategy': strat, 'buy_price': exec_price, 'qty': 0, 
                             'max_price': exec_price, 'open_price': open_p,
-                            'super_trend_mode': False, 'ma_10': 0, 'ma_20': 0
+                            'super_trend_mode': False, 'ma_10': 0, 'ma_20': 0,
+                            'half_sold': False
                         }
                         
                     self.portfolio[code]['qty'] += exec_qty

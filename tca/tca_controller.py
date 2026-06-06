@@ -67,6 +67,22 @@ class TCAController:
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
         self._last_bqa_run_date = ""  # BQA 무인 스케줄러 중복 가동 방지
         self._bqa_check_timer = 0     # BQA 검사 주기 조절용
+        
+        # 금일 RSA 실행 여부 초기 감지
+        self._last_rsa_run_date = ""
+        try:
+            import sqlite3
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='research_reports'")
+            if cursor.fetchone():
+                cursor.execute("SELECT COUNT(1) FROM research_reports WHERE date(timestamp) = ?", (today_str,))
+                if cursor.fetchone()[0] > 0:
+                    self._last_rsa_run_date = today_str
+            conn.close()
+        except Exception as e:
+            print(f"[TCA] 금일 RSA 이력 확인 실패: {e}")
 
     def load_config(self):
         try:
@@ -777,7 +793,11 @@ class TCAController:
             # auto_reconnect_era.bat가 60초 대기와 재기동을 처리하므로 비동기로 실행
             era_dir = os.path.join(self.workspace_root, "era")
             subprocess.Popen("start auto_reconnect_era.bat", shell=True, cwd=era_dir)
-            self.send_message("✅ <b>재연동 명령이 실행되었습니다.</b>\n60초 대기 후 스케줄러가 재활성화되고 ERA 엔진이 정상 기동됩니다.")
+        elif cmd_text == "!컴퓨터재부팅":
+            self.send_message("🚨 <b>[원격 재부팅 명령 수신]</b>\n\n5초 후 Windows 시스템을 강제로 재부팅합니다. 재부팅 완료 후 자동 로그인 설정을 통해 시스템이 순차적으로 자동 재기동됩니다.")
+            import time
+            time.sleep(2)
+            os.system("shutdown /r /t 5 /f")
             
         elif cmd_text.startswith("!매도"):
             try:
@@ -925,20 +945,14 @@ class TCAController:
                 self.send_message(f"❌ 코드 업데이트 실패: {e}")
 
         elif cmd_text == "!RSA분석":
-            rsa_script = os.path.join(workspace_root, 'rsa', 'rsa_coordinator.py')
-            py32_path = os.path.join(self.venv32_path, "Scripts", "python.exe")
-            python_cmd = py32_path if os.path.exists(py32_path) else "python"
-            log_dir = os.path.join(workspace_root, "rsa")
-            os.makedirs(log_dir, exist_ok=True)
-            log_path = os.path.join(log_dir, "rsa_coordinator.log")
-            log_f = open(log_path, "ab")
-            subprocess.Popen([python_cmd, rsa_script], shell=False, stdout=log_f, stderr=log_f)
-            log_f.close()
-            self.send_message(
-                "🔬 <b>[RSA 분석 기동]</b>\n"
-                "단타/스윙 후보 종목에 대한 FAA·IRA·NSAA 정밀 리서치를 시작합니다.\n"
-                "완료 시 자동으로 결과를 알려드립니다."
-            )
+            if self._run_rsa_analysis():
+                self.send_message(
+                    "🔬 <b>[RSA 분석 기동]</b>\n"
+                    "단타/스윙 후보 종목에 대한 FAA·IRA·NSAA 정밀 리서치를 시작합니다.\n"
+                    "완료 시 자동으로 결과를 알려드립니다."
+                )
+            else:
+                self.send_message("❌ RSA 분석 실행에 실패했습니다.")
 
         elif cmd_text == "!백테스트시작":
             self.send_message("🧪 <b>[BQA]</b> 선물 최적화(K값 스위핑) 알고리즘을 즉시 강제 기동합니다...")
@@ -1304,6 +1318,29 @@ class TCAController:
             )
             self.send_message(help_msg)
 
+    def _run_rsa_analysis(self):
+        """RSA 분석 (FAA·IRA·NSAA 정밀 리서치)을 백그라운드로 기동"""
+        rsa_script = os.path.join(self.workspace_root, 'rsa', 'rsa_coordinator.py')
+        py32_path = os.path.join(self.venv32_path, "Scripts", "python.exe")
+        python_cmd = py32_path if os.path.exists(py32_path) else "python"
+        log_dir = os.path.join(self.workspace_root, "rsa")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "rsa_coordinator.log")
+        try:
+            log_f = open(log_path, "ab")
+            subprocess.Popen(
+                [python_cmd, rsa_script],
+                shell=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                stdout=log_f,
+                stderr=log_f
+            )
+            log_f.close()
+            return True
+        except Exception as e:
+            print(f"[TCA] RSA 분석 실행 실패: {e}")
+            return False
+
     def run_controller(self):
         print("==================================================")
         print("   TCA Central Controller (Waiting for commands)")
@@ -1317,6 +1354,21 @@ class TCAController:
         first_run = True
         
         while True:
+            # ── Daily RSA 분석 자율 스케줄러 감시 ──
+            try:
+                now = datetime.now()
+                today_str = now.strftime("%Y-%m-%d")
+                # 매 영업일(월~금요일) 오전 08:00 ~ 15:30 사이이고, 금일 실행 이력이 없을 때 자동 트리거
+                if now.weekday() < 5 and (8 <= now.hour <= 15) and self._last_rsa_run_date != today_str:
+                    self._last_rsa_run_date = today_str
+                    self.send_message(
+                        "🔬 <b>[Daily RSA 자동 분석 개시]</b>\n"
+                        "금일 단타/스윙 후보 종목에 대한 FAA·IRA·NSAA 정밀 리서치를 자동으로 기동합니다."
+                    )
+                    self._run_rsa_analysis()
+            except Exception as e:
+                print(f"[TCA RSA Scheduler Error] {e}")
+
             # ── BQA 주말 자율 최적화 스케줄러 감시 (매 getUpdates 주기마다 가볍게 시간 대조) ──
             try:
                 now = datetime.now()

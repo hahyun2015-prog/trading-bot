@@ -11,7 +11,7 @@ if %errorlevel% neq 0 (
 
 :UACPrompt
     echo Set UAC = CreateObject^("Shell.Application"^) > "%temp%\getadmin.vbs"
-    echo UAC.ShellExecute "%~s0", "", "", "runas", 1 >> "%temp%\getadmin.vbs"
+    echo UAC.ShellExecute "%~s0", "%1", "", "runas", 1 >> "%temp%\getadmin.vbs"
     "%temp%\getadmin.vbs"
     exit /B
 
@@ -69,4 +69,8 @@ echo.
 echo ----------------------------------------------------------
 echo [OK] ERA Order Manager has terminated.
 echo.
+if "%1"=="auto" (
+    echo [AUTO] Skipping pause in auto mode.
+    exit
+)
 pause

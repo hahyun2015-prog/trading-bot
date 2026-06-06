@@ -291,9 +291,8 @@ class FuturesOrderManager:
                 print(f"\n[🚨 신규 주문 포착] 종목코드: {code} | 시그널: {signal_type} | 현재가: {price}")
                 
                 # ------ 동적 포지션 사이징 로직 ------
-                # 1계약 위탁증거금 계산 (승수 25만원, 증거금률 약 10% 가정)
-                # 실제 증거금률은 거래소 고시이나, 보수적으로 10% 잡고 계산
-                margin_per_contract = price * 250000 * 0.10
+                multiplier = 50000 if (code and code.startswith("105")) else 250000
+                margin_per_contract = price * multiplier * 0.10
                 safe_budget = self.available_balance * self.margin_cap_ratio
                 
                 qty = int(safe_budget // margin_per_contract)

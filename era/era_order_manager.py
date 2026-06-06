@@ -635,8 +635,11 @@ class ERAOrderManager:
             futures_settings = config.get("futures_settings", {})
             self.futures_stop_loss_pt = float(futures_settings.get("stop_loss_pt", 3.0))
             self.futures_take_profit_pt = float(futures_settings.get("take_profit_pt", 6.0))
+            # 야간선물 고정값: config.json futures_settings 기준, active_strategy.json에 의해 절대 변경 안 됨
+            self.futures_night_stop_loss_pt = float(futures_settings.get("stop_loss_pt", 3.0))
+            self.futures_night_take_profit_pt = float(futures_settings.get("take_profit_pt", 6.0))
 
-            # active_strategy.json의 백테스트 파라미터로 오버라이드 (백테스트/실전 일치)
+            # active_strategy.json의 백테스트 파라미터로 주간선물만 오버라이드 (야간선물 제외)
             active_strategy_path = os.path.join(self.workspace_root, "config", "active_strategy.json")
             if os.path.exists(active_strategy_path):
                 try:
@@ -644,17 +647,15 @@ class ERAOrderManager:
                         active = json.load(f)
                     if "stop_loss_pt" in active:
                         self.futures_stop_loss_pt = float(active["stop_loss_pt"])
-                        self.futures_night_stop_loss_pt = float(active["stop_loss_pt"])   # 야간 고정값 동기화
                     if "take_profit_pt" in active:
                         self.futures_take_profit_pt = float(active["take_profit_pt"])
-                        self.futures_night_take_profit_pt = float(active["take_profit_pt"])  # 야간 고정값 동기화
                     if "best_k" in active:
                         self.futures_best_k = float(active["best_k"])
                     if "margin_cap" in active:
                         self.futures_margin_cap_ratio = float(active["margin_cap"])
                     if "atr_cutoff" in active:
                         self.futures_atr_cutoff = float(active["atr_cutoff"])
-                    print(f"[ERA] active_strategy.json 파라미터 적용: K={self.futures_best_k} | 손절={self.futures_stop_loss_pt}pt | 익절={self.futures_take_profit_pt}pt | 마진캡={self.futures_margin_cap_ratio:.2f} | ATR필터={self.futures_atr_cutoff:.2f}pt")
+                    print(f"[ERA] active_strategy.json 파라미터 적용: K={self.futures_best_k} | 주간손절={self.futures_stop_loss_pt}pt | 주간익절={self.futures_take_profit_pt}pt | 야간손절={self.futures_night_stop_loss_pt}pt(고정) | 야간익절={self.futures_night_take_profit_pt}pt(고정) | 마진캡={self.futures_margin_cap_ratio:.2f} | ATR필터={self.futures_atr_cutoff:.2f}pt")
                 except Exception as e:
                     print(f"[ERA] active_strategy.json 로드 실패 (config.json 값 유지): {e}")
 
@@ -704,7 +705,8 @@ class ERAOrderManager:
             for code, pos in self.portfolio.items():
                 data[code] = {
                     "strategy": pos["strategy"],
-                    "half_sold": pos.get("half_sold", False)
+                    "half_sold": pos.get("half_sold", False),
+                    "open_price": pos.get("open_price", pos.get("buy_price", 0))
                 }
             with open(self.positions_persist_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
@@ -1172,9 +1174,11 @@ class ERAOrderManager:
                 if isinstance(persist_val, dict):
                     strategy_tag = persist_val.get("strategy", "SWING")
                     half_sold = persist_val.get("half_sold", False)
+                    open_price = persist_val.get("open_price", buy_price)
                 else:
                     strategy_tag = persist_val
                     half_sold = False
+                    open_price = buy_price
                 
                 if code not in self.portfolio:
                     self.portfolio[code] = {
@@ -1184,7 +1188,7 @@ class ERAOrderManager:
                         'current_price': current_price,
                         'qty': qty,
                         'max_price': current_price,
-                        'open_price': buy_price,
+                        'open_price': open_price,
                         'super_trend_mode': False,
                         'ma_10': 0, 'ma_20': 0,
                         'half_sold': half_sold
@@ -2401,7 +2405,7 @@ class ERAOrderManager:
                     self._execute_futures_direct("SHORT_ENTER", current_price, code, pos_key)
 
     def _process_night_tick(self, code, current_price, now):
-        """야간 선물 전략 (18:00 진입 → 익일 04:45 청산, 2pt 손절 / 5pt 익절)"""
+        """야간 선물 전략 (18:00 진입 → 익일 04:45 청산, config.json futures_settings 고정 SL/TP)"""
         pos_key = "KOSPI200_NIGHT"
 
         # 18:00 ~ 새벽 04:45 사이 야간 세션 중도 기동 시에도 즉시 야간 시초가 및 목표가 동적 생성
@@ -2798,10 +2802,19 @@ class ERAOrderManager:
                             "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
                             ["[ERA_Day_Flat]", "0103", self.stock_account, 2, code, pos['qty'], 0, "03", ""]
                         )
+            # [신설 - Fail-safe] 15:18 ~ 15:28 사이 미청산 단타 잔고 재차 청산 시도 (30초 주기)
+            if now.hour == 15 and 18 <= now.minute < 28 and now.second % 30 == 0:
+                for code, pos in list(self.portfolio.items()):
+                    if pos.get('strategy') == 'DAY' and pos.get('qty', 0) > 0:
+                        print(f"\n⚠️ [단타 미청산 감지] {pos['name']}({code}) - {pos['qty']}주 잔고 존재. 강제 재청산 주문 전송.")
+                        self.kiwoom.dynamicCall(
+                            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
+                            ["[ERA_Day_Retry]", "0103", self.stock_account, 2, code, pos['qty'], 0, "03", ""]
+                        )
                         if notifier:
                             notifier.send_message(
-                                f"🚨 <b>[주식 단타 장마감 강제 청산] {pos['name']}</b>\n"
-                                f"• 오버나잇 방지를 위해 15:15 기준 실계좌 시장가 일괄 청산(Flat)을 수행합니다."
+                                f"⚠️ <b>[주식 단타 미청산 비상 재청산] {pos['name']}</b>\n"
+                                f"• 미청산 잔고({pos['qty']}주)가 감지되어 재청산 주문을 다시 전송합니다."
                             )
 
             if now.hour == 15 and now.minute >= 14 and not self.today_5ma_checked:

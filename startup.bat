@@ -5,6 +5,26 @@ echo   AMATS Auto Startup Sequence
 echo ====================================================
 echo.
 
+:: 스마트플러그/재부팅 시 네트워크 카드 활성화 대기 (25초)
+echo [*] Waiting for Network Connection Stability (25s)...
+ping 127.0.0.1 -n 26 > nul
+
+:: Auto git pull updates (실패해도 로컬 코드로 계속 진행)
+cd /d "%~dp0"
+where git >nul 2>&1
+if %errorlevel% equ 0 (
+    echo [GIT] Checking latest GitHub repository updates...
+    git pull origin main --quiet 2>&1
+    if %errorlevel% equ 0 (
+        echo [GIT] GitHub code is up to date.
+    ) else (
+        echo [GIT] git pull failed. Starting with local codebase...
+    )
+) else (
+    echo [GIT] git not installed. Skipping auto-update...
+)
+echo.
+
 :: Verify venv32 python environment
 if not exist "%~dp0venv32\Scripts\python.exe" (
     echo [ERROR] venv32 not found! Please run setup_env.bat first.
