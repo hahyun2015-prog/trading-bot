@@ -26,15 +26,25 @@ class NewsSentimentAnalystAgent:
 
     def _load_gemini_key(self):
         config_path = os.path.join(workspace_root, "config", "config.json")
-        if os.path.exists(config_path):
-            try:
+        config_local_path = os.path.join(workspace_root, "config", "config_local.json")
+        config = {}
+        try:
+            if os.path.exists(config_path):
                 with open(config_path, "r", encoding="utf-8") as f:
                     config = json.load(f)
-                key = config.get("api_settings", {}).get("gemini_api_key", "")
-                if key and "YOUR_GEMINI" not in key:
-                    return key
-            except Exception as e:
-                print(f"[NSAA] 설정 파일 로드 오류: {e}")
+            if os.path.exists(config_local_path):
+                with open(config_local_path, "r", encoding="utf-8") as f:
+                    local_cfg = json.load(f)
+                for key, val in local_cfg.items():
+                    if isinstance(val, dict) and isinstance(config.get(key), dict):
+                        config[key].update(val)
+                    else:
+                        config[key] = val
+            key = config.get("api_settings", {}).get("gemini_api_key", "")
+            if key and "YOUR_GEMINI" not in key:
+                return key
+        except Exception as e:
+            print(f"[NSAA] 설정 파일 로드 오류: {e}")
         return ""
 
     def crawl_news_headlines(self, code):
