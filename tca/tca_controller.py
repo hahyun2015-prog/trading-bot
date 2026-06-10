@@ -28,17 +28,20 @@ class SafeStreamWrapper:
         # 1. 원래 스트림(콘솔) 출력 처리
         try:
             encoding = getattr(self.original_stream, 'encoding', 'cp949') or 'cp949'
-            data.encode(encoding)
-            self.original_stream.write(data)
-        except UnicodeEncodeError:
-            cleaned_data = ""
-            for char in data:
-                try:
-                    char.encode(encoding)
-                    cleaned_data += char
-                except UnicodeEncodeError:
-                    pass  # 인코딩이 불가능한 이모지만 안전하게 발라냄
-            self.original_stream.write(cleaned_data)
+            try:
+                data.encode(encoding)
+                self.original_stream.write(data)
+            except UnicodeEncodeError:
+                cleaned_data = ""
+                for char in data:
+                    try:
+                        char.encode(encoding)
+                        cleaned_data += char
+                    except UnicodeEncodeError:
+                        pass  # 인코딩이 불가능한 이모지만 안전하게 발라냄
+                self.original_stream.write(cleaned_data)
+        except Exception:
+            pass  # 콘솔 핸들 유실(OSError 등) 전체 예외 원천 방어
             
         # 2. 파일 실시간 백업 로깅
         if self.log_file_path:
