@@ -1080,6 +1080,13 @@ class ERAOrderManager:
                 self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "비밀번호", "")
                 self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", "00")
                 self.kiwoom.dynamicCall("CommRqData(QString, QString, int, QString)", "선물예수금조회", "opw20010", 0, "2001")
+                
+                # [선물 포지션 연동 추가] opw20007 선물옵션계좌평가잔고현황요청
+                self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.futures_account)
+                self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "비밀번호", "")
+                self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", "00")
+                self.kiwoom.dynamicCall("SetInputValue(QString, QString)", "조회구분", "1")
+                self.kiwoom.dynamicCall("CommRqData(QString, QString, int, QString)", "선물잔고조회", "opw20007", 0, "2002")
 
             # ── 기존 주식 보유 종목 조회 (stock/both만) ─────────────────
             if self.stock_account:
@@ -1178,6 +1185,62 @@ class ERAOrderManager:
             print(f"\n=> 💸 [선물 계좌 자금]")
             print(f"   - 선물 예수금: {self.futures_available_balance:,}원")
             print(f"   - {int(self.futures_margin_cap_ratio * 100)}% 캡 적용 가용금액: {int(self.futures_available_balance * self.futures_margin_cap_ratio):,}원")
+            
+        elif rqname == "선물잔고조회":
+            rows = self.kiwoom.dynamicCall("GetRepeatCnt(QString, QString)", trcode, rqname)
+            print(f"\n=> 📦 [기존 선물 포지션 실계좌 연동]")
+            
+            # 주간/야간 코드를 매핑하여 futures_positions 초기화용
+            real_day = getattr(self, 'real_day_code', '10100000')
+            real_night = getattr(self, 'real_night_code', '10500000')
+            
+            # 기존 잔고 초기화 (중복 방지, 실계좌 기준으로 새로 세팅)
+            self.futures_positions = {}
+            
+            for i in range(rows):
+                code = self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "종목코드").strip()
+                code = code.replace("A", "").strip()
+                
+                # 매도매수구분 (1: 매도, 2: 매수) 또는 "매도"/"매수" 문자열
+                raw_dir = self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "매도매수구분").strip()
+                qty = int(self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "수량").strip())
+                buy_price = float(self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "매입단가").strip())
+                current_price = float(self.kiwoom.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "현재가").strip())
+                
+                if qty <= 0:
+                    continue
+                
+                # 방향 판단
+                p_type = "LONG"
+                if raw_dir == "1" or "매도" in raw_dir:
+                    p_type = "SHORT"
+                
+                # 미니선물(105)인지 주간(101)/야간(105)인지 세션 키 구분
+                if real_day == real_night:
+                    # 미니선물 단일 상품인 경우 현재 시각 기준으로 임시 매핑
+                    h = datetime.now().hour
+                    is_night = (h >= 18) or (h < 5)
+                else:
+                    is_night = (code == real_night)
+                    
+                pos_key = "KOSPI200_NIGHT" if is_night else "KOSPI200"
+                
+                self.futures_positions[pos_key] = {
+                    'type': p_type,
+                    'qty': qty,
+                    'price': buy_price,
+                    'current_price': current_price
+                }
+                
+                # 프로그램 내 진입 평단가 동기화
+                if is_night:
+                    self.futures_night_entry_price = buy_price
+                else:
+                    self.futures_day_entry_price = buy_price
+                    
+                print(f"   - [선물] {code} | {p_type} | {qty}계약 | 평단: {buy_price:.2f}pt (현재가: {current_price:.2f}pt)")
+                
+            self.export_status()
             
         elif rqname == "계좌평가잔고내역요청":
             rows = self.kiwoom.dynamicCall("GetRepeatCnt(QString, QString)", trcode, rqname)
@@ -2335,13 +2398,16 @@ class ERAOrderManager:
 
         # 08:45~08:55 익일 장전 강제 청산
         if now.hour == 8 and 45 <= now.minute <= 55:
-            if pos_key in self.futures_positions:
-                pos = self.futures_positions[pos_key]
-                print(f"[주간선물] ⏰ 08:45 시간 청산 실행")
-                self._execute_futures_direct("LONG_EXIT" if pos["type"] == "LONG" else "SHORT_EXIT",
-                                             current_price, code, pos_key)
-                self.futures_day_entry_price = 0.0
-                self.futures_day_peak = 0.0
+            # 주간 및 야간 포지션 모두 강제 청산 시도 (이중 안전장치)
+            for k in ("KOSPI200", "KOSPI200_NIGHT"):
+                if k in self.futures_positions:
+                    pos = self.futures_positions[k]
+                    print(f"[선물 안전 청산] ⏰ 08:45 강제 청산 실행 ({k})")
+                    self._execute_futures_direct("LONG_EXIT" if pos["type"] == "LONG" else "SHORT_EXIT",
+                                                 current_price, code, k)
+            self.futures_day_entry_price = 0.0
+            self.futures_day_peak = 0.0
+            self.futures_night_entry_price = 0.0
             return
 
         # ── 포지션 보유 중: 손절 / 대안 C 트레일링 스탑 감시 ──
