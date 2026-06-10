@@ -725,17 +725,19 @@ class ERAOrderManager:
 
         # ── 05:00 야간선물 세션 종료 리셋 ──────────────────────────────
         night_reset_key = f"{today}_0500"
-        if now.hour == 5 and now.minute == 0 and self._night_reset_done_date != night_reset_key:
+        is_after_5am = (now.hour == 5 and now.minute >= 0) or (now.hour > 5)
+        if is_after_5am and self._night_reset_done_date != night_reset_key:
             self._night_reset_done_date = night_reset_key
             self.futures_night_open         = 0.0
             self.futures_night_target_long  = float('inf')
             self.futures_night_target_short = float('-inf')
             self.futures_night_order_locked = False
             self.futures_night_entry_price  = 0.0
-            print("[ERA 야간선물] 05:00 세션 종료 — 상태 초기화")
+            print(f"[ERA 야간선물] {now.strftime('%H:%M')} 세션 종료 — 상태 초기화")
 
-        # ── 09:00 주간선물 세션 시작 리셋 + Kill Switch 해제 ───────────
-        if now.hour == 9 and now.minute == 0 and self._daily_reset_done_date != today:
+        # ── 주간선물 세션 시작 리셋 (08:40 이후 실행) + Kill Switch 해제 ───────────
+        is_after_840 = (now.hour == 8 and now.minute >= 40) or (now.hour >= 9)
+        if is_after_840 and self._daily_reset_done_date != today:
             self._daily_reset_done_date = today
             # 월초: 월간 MDD 기준 리셋
             if now.day == 1:
@@ -752,18 +754,19 @@ class ERAOrderManager:
             self.futures_order_locked = False
             self.futures_day_entry_price = 0.0
             self._load_prev_range()
-            print("[ERA 주간선물] 09:00 세션 준비 — 전일 Range 갱신")
+            print(f"[ERA 주간선물] {now.strftime('%H:%M')} 세션 준비 — 전일 Range 갱신")
 
         # ── 18:00 야간선물 세션 시작 리셋 ──────────────────────────────
         night_start_key = f"{today}_1800"
-        if now.hour == 18 and now.minute == 0 and self._night_reset_done_date != night_start_key:
+        is_after_18pm = (now.hour == 18 and now.minute >= 0) or (now.hour > 18)
+        if is_after_18pm and self._night_reset_done_date != night_start_key:
             self._night_reset_done_date = night_start_key
             self.futures_night_open         = 0.0
             self.futures_night_target_long  = float('inf')
             self.futures_night_target_short = float('-inf')
             self.futures_night_order_locked = False
             self.futures_night_entry_price  = 0.0
-            print("[ERA 야간선물] 18:00 세션 시작 대기 — 상태 초기화")
+            print(f"[ERA 야간선물] {now.strftime('%H:%M')} 세션 시작 대기 — 상태 초기화")
 
     def _is_trading_day(self):
         """오늘이 거래일인지 확인 (주말 + KRX 휴장일)"""
@@ -907,8 +910,12 @@ class ERAOrderManager:
             self.real_day_code = ""
             self.real_night_code = ""
             
+            search_prefix = self.futures_prefix
+            if self.environment != "live":
+                search_prefix = "A01" if self.futures_prefix == "101" else "A05"
+            
             if future_list:
-                codes = [c for c in future_list.split(";") if c and c.startswith(self.futures_prefix)]
+                codes = [c for c in future_list.split(";") if c and c.startswith(search_prefix)]
                 if codes:
                     self.real_day_code = codes[0]
             
@@ -916,7 +923,7 @@ class ERAOrderManager:
             if not self.real_day_code:
                 print(" => [ERA 폴백 1단계] GetFutureList 응답 없음. GetFutureCodeByIndex 조회 시도...")
                 code_by_idx = self.kiwoom.dynamicCall("GetFutureCodeByIndex(int)", 0).strip()
-                if code_by_idx and code_by_idx.startswith("101"):
+                if code_by_idx and (code_by_idx.startswith(search_prefix) or (self.environment != "live" and (code_by_idx.startswith("A01") or code_by_idx.startswith("A05")))):
                     self.real_day_code = code_by_idx
                     print(f" => [ERA 폴백 1단계 성공] Index(0) 코드로 최근월물 인식: {self.real_day_code}")
             
@@ -929,8 +936,11 @@ class ERAOrderManager:
                 curr_day = now.day
                 
                 # 키움 연도 코드 매핑 (2026=V, 2027=W, 2028=X, 2029=Y, 2030=Z ...)
-                year_codes = {2026: "V", 2027: "W", 2028: "X", 2029: "Y", 2030: "Z"}
-                year_char = year_codes.get(curr_year, "V")
+                if self.environment != "live":
+                    year_char = str(curr_year % 10)
+                else:
+                    year_codes = {2026: "V", 2027: "W", 2028: "X", 2029: "Y", 2030: "Z"}
+                    year_char = year_codes.get(curr_year, "V")
                 
                 # 선물 만기월은 3, 6, 9, 12월. 둘째주 목요일이 만기일.
                 # 안전한 근사를 위해 현재 월을 기준으로 만기월 판단 (매월 10일 전후가 만기이므로, 11일 이후이면 다음 분기로 폴오버)
@@ -952,12 +962,15 @@ class ERAOrderManager:
                 else:
                     if curr_month == 12 and curr_day > 12:
                         # 12월 만기일 이후에는 다음 연도 3월물로 점프
-                        year_char = year_codes.get(curr_year + 1, "W")
+                        if self.environment != "live":
+                            year_char = str((curr_year + 1) % 10)
+                        else:
+                            year_char = year_codes.get(curr_year + 1, "W")
                         expiry_month_char = "3"
                     else:
                         expiry_month_char = "C"
                 
-                self.real_day_code = f"{self.futures_prefix}{year_char}{expiry_month_char}000"
+                self.real_day_code = f"{search_prefix}{year_char}{expiry_month_char}000"
                 print(f" => [ERA 폴백 2단계 성공] 알고리즘 생성 최근월물 적용: {self.real_day_code}")
             
             # 최종 야간 코드 설정 (야간 지수선물은 주간 최근월물 코드에서 앞 세 자리를 105로 교체)
@@ -966,10 +979,15 @@ class ERAOrderManager:
                 if self.futures_prefix == "105":
                     self.real_night_code = self.real_day_code
                 else:
-                    self.real_night_code = "105" + self.real_day_code[3:]
+                    night_prefix = "A05" if self.environment != "live" else "105"
+                    self.real_night_code = night_prefix + self.real_day_code[3:]
             else:
-                self.real_day_code = self.futures_prefix + "00000"
-                self.real_night_code = "10500000"
+                if self.environment != "live":
+                    self.real_day_code = "A0566000" if self.futures_prefix == "105" else "A0166000"
+                    self.real_night_code = "A0566000"
+                else:
+                    self.real_day_code = self.futures_prefix + "00000"
+                    self.real_night_code = "10500000"
             
             print(f" => [선물 최근월물 최종 인식] 주간({self.real_day_code}), 야간({self.real_night_code})")
             
@@ -1693,9 +1711,16 @@ class ERAOrderManager:
             notifier.send_message("⏳ <b>[선물 데이터 자동 동기화]</b>\n누락된 최근 5분봉 과거 데이터를 동기화 중입니다...")
             
         self.futures_sync_queue = []
-        # 주간 및 야간 동기화 대상 코드 큐 적재
-        for code in ["10100000", "10500000"]:
-            if code not in self.futures_sync_queue:
+        # 주간 및 야간 동기화 대상 코드 큐 적재 (실제 최근월물 코드 우선 등록하여 데이터 혼선 방지)
+        codes_to_sync = []
+        if getattr(self, 'real_day_code', None):
+            codes_to_sync.append(self.real_day_code)
+        if getattr(self, 'real_night_code', None):
+            codes_to_sync.append(self.real_night_code)
+        codes_to_sync.extend(["10100000", "10500000"])
+        
+        for code in codes_to_sync:
+            if code and code not in self.futures_sync_queue:
                 self.futures_sync_queue.append(code)
                 
         self.futures_sync_index = 0
@@ -1795,17 +1820,17 @@ class ERAOrderManager:
             print(f"[ERA 선물] 전일 Range 로드 실패: {e}")
 
     def _get_today_futures_open(self, code):
-        """오늘 주간 09시 첫 5분봉 시가를 DB에서 조회 (늦은 기동 시 실제 시초가 복원)"""
+        """오늘 주간 첫 5분봉 시가를 DB에서 조회 (늦은 기동 시 실제 시초가 복원 - 08:45 개장 반영)"""
         try:
-            today_prefix = datetime.now().strftime("%Y%m%d09")
+            today_str = datetime.now().strftime("%Y%m%d")
             conn = sqlite3.connect(self.futures_db_path, timeout=30)
             conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()
             # real_day_code(예: 105V6000) → DB 저장 코드(10500000) 순으로 폴백
             for query_code in [code, self.futures_prefix + "00000", "10500000", "10100000"]:
                 cursor.execute(
-                    "SELECT open FROM futures_ohlcv WHERE code = ? AND date LIKE ? ORDER BY date LIMIT 1",
-                    (query_code, today_prefix + "%")
+                    "SELECT open FROM futures_ohlcv WHERE code = ? AND date LIKE ? ORDER BY date ASC LIMIT 1",
+                    (query_code, today_str + "%")
                 )
                 row = cursor.fetchone()
                 if row and row[0] and row[0] > 0:
@@ -2505,14 +2530,16 @@ class ERAOrderManager:
             return
         setattr(self, lock_attr, True)
 
+        # ord_kind: 1: 신규, 2: 청산
+        # slby_tp: "1": 매도, "2": 매수
         direction_map = {
-            "LONG_ENTER":  (1, "LONG 진입 📈"),
-            "SHORT_ENTER": (2, "SHORT 진입 📉"),
-            "LONG_EXIT":   (2, "LONG 청산 📤"),
-            "SHORT_EXIT":  (1, "SHORT 청산 📤"),
+            "LONG_ENTER":  (1, "2", "LONG 진입 📈"),
+            "SHORT_ENTER": (1, "1", "SHORT 진입 📉"),
+            "LONG_EXIT":   (2, "1", "LONG 청산 📤"),
+            "SHORT_EXIT":  (2, "2", "SHORT 청산 📤"),
         }
-        trade_dir, label = direction_map.get(signal_type, (None, ""))
-        if trade_dir is None:
+        ord_kind, slby_tp, label = direction_map.get(signal_type, (None, None, ""))
+        if ord_kind is None:
             setattr(self, lock_attr, False)
             return
 
@@ -2534,11 +2561,10 @@ class ERAOrderManager:
         session_label = "야간" if is_night else "주간"
         print(f"\n[{session_label}선물 주문] {label} | {current_price:.2f}pt | {qty}계약 | {order_code}")
 
-        # sOrdTp: 실전투자="" 모의투자="3"(시장가) — 빈값이면 Mock 서버가 주문을 무시함
-        ord_tp = "" if self.environment == "live" else "3"
+        # sOrdTp: 시장가 주문 시 반드시 "3" 지정 (시장가 매매 시 가격은 "0"으로 전송)
         res = self.kiwoom.dynamicCall(
             "SendOrderFO(QString, QString, QString, QString, int, QString, QString, int, QString, QString)",
-            ["FuturesLive", "0200", self.futures_account, order_code, trade_dir, "03", ord_tp, qty, "0", ""]
+            ["FuturesLive", "0200", self.futures_account, order_code, ord_kind, slby_tp, "3", qty, "0", ""]
         )
 
         if res == 0:
@@ -2965,14 +2991,14 @@ class ERAOrderManager:
                             ira_score INTEGER, ira_reason TEXT,
                             nsaa_score INTEGER, nsaa_reason TEXT,
                             score INTEGER,
-                            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+                            timestamp DATETIME DEFAULT (datetime('now', 'localtime')))""")
                         has_table = True
                     cursor.execute("SELECT score FROM research_reports WHERE code = ? ORDER BY id DESC LIMIT 1", (code,))
                     existing = cursor.fetchone()
                     if existing is None or existing[0] < 70:
                         cursor.execute(
-                            "INSERT INTO research_reports (code, name, strategy_type, score) VALUES (?, ?, 'MOCK', 80)",
-                            (code, name)
+                            "INSERT INTO research_reports (code, name, strategy_type, score, timestamp) VALUES (?, ?, 'MOCK', 80, ?)",
+                            (code, name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                         )
                         print(f" => [모의투자 RSA 자동 통과] {name}({code}) 80점 삽입 (기존={existing[0] if existing else '없음'})")
                     has_table = True
@@ -3164,6 +3190,7 @@ class ERAOrderManager:
                 # 개별주식선물(ISF) 체결 처리
                 if code in self.isf_code_map:
                     sc = self.isf_code_map[code]
+                    self.isf_order_locked[sc] = False  # 체결되었으므로 주문 잠금 해제
                     isf_cfg = next((c for c in self.isf_configs if c["stock_code"] == sc), None)
                     if isf_cfg:
                         if "매수" in order_gubun or "환매" in order_gubun:
@@ -3208,6 +3235,12 @@ class ERAOrderManager:
                         is_night_fill = (_h >= 18) or (_h < 5)
                     else:
                         is_night_fill = (code == _rn)
+                    # 체결되었으므로 주문 잠금 해제
+                    if is_night_fill:
+                        self.futures_night_order_locked = False
+                    else:
+                        self.futures_order_locked = False
+
                     pos_key = "KOSPI200_NIGHT" if is_night_fill else "KOSPI200"
                     session_label = "야간" if is_night_fill else "주간"
                     print(f"[{session_label}선물 실체결 확정] {name}({code}) | {exec_price} | {exec_qty}계약 | {order_gubun}")

@@ -1,0 +1,54 @@
+@echo off
+chcp 65001 > nul
+
+cls
+echo.
+echo ==========================================================
+echo   AMATS [ TCA ]  텔레그램 중앙 관제 에이전트
+echo ==========================================================
+echo   Telegram Bot  ·  원격 명령  ·  시스템 모니터링
+echo ----------------------------------------------------------
+echo.
+echo   사용 가능한 텔레그램 명령어:
+echo   !상태  ·  !주식현황  ·  !선물현황  ·  !도움말
+echo   !시스템시작  ·  !시스템종료  ·  !긴급정지
+echo.
+echo ----------------------------------------------------------
+echo.
+
+:: 작업 디렉터리를 배치 파일 폴더로 변경 (경로 관련 이스케이프 버그 완전 차단)
+cd /d "%~dp0"
+
+:: ── 코드 자동 업데이트 (git pull) ───────────────────────────────
+where git >nul 2>&1
+if %errorlevel% equ 0 (
+    echo   [동기화]  GitHub 최신 코드 확인 중...
+    git pull origin main --quiet 2>&1
+    if %errorlevel% equ 0 (
+        echo   [동기화]  코드 최신 상태 확인 완료
+        for /f "usebackq tokens=*" %%v in (`git log --oneline -1`) do echo            버전: %%v
+    ) else (
+        echo   [동기화]  git pull 실패 — 현재 버전으로 계속 실행합니다.
+    )
+) else (
+    echo   [동기화]  git 미설치 — 코드 동기화 건너뜀
+)
+echo.
+
+if exist "venv32\Scripts\python.exe" (
+    echo   [확인]  venv32 환경으로 실행합니다.
+    echo   [시작]  TCA 관제 에이전트 구동 중...
+    echo.
+    "venv32\Scripts\python.exe" "tca\tca_controller.py"
+) else (
+    echo   [알림]  venv32 없음 — 시스템 Python 으로 실행합니다.
+    echo   [시작]  TCA 관제 에이전트 구동 중...
+    echo.
+    python "tca\tca_controller.py"
+)
+
+echo.
+echo ----------------------------------------------------------
+echo   [종료]  TCA 에이전트가 중지되었습니다.
+echo.
+pause

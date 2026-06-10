@@ -1,0 +1,16 @@
+{
+  "files.exclude": {
+    "**/venv32": true,
+    "**/.git": true,
+    "**/.tmp.driveupload": true
+  },
+  "files.watcherExclude": {
+    "**/venv32/**": true,
+    "**/.git/**": true,
+    "**/.tmp.driveupload/**": true
+  },
+  "search.exclude": {
+    "**/venv32": true,
+    "**/.git": true
+  }
+}

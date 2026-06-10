@@ -8,7 +8,7 @@ if defined _OLD_CODEPAGE (
     "%SystemRoot%\System32\chcp.com" 65001 > nul
 )
 
-set VIRTUAL_ENV=C:\antigravity\노트븍활용\ai_trader\venv32
+set VIRTUAL_ENV=C:\Antigravity\AI_T_Agent\venv32
 
 if not defined PROMPT set PROMPT=$P$G
 

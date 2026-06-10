@@ -1,0 +1,16 @@
+{
+  "005930": {
+    "direction": "LONG",
+    "nsaa_score": 85,
+    "reason": "뉴스감성 85점 ≥ 72점 → LONG",
+    "name": "삼성전자"
+  },
+  "000660": {
+    "direction": "LONG",
+    "nsaa_score": 92,
+    "reason": "뉴스감성 92점 ≥ 72점 → LONG",
+    "name": "SK하이닉스"
+  },
+  "_date": "2026-06-10",
+  "_updated": "2026-06-10 08:52:20"
+}

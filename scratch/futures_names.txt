@@ -1,0 +1,182 @@
+Total codes: 181
+[000] Code: A0166000 -> Name: F 202606
+[001] Code: A0169000 -> Name: F 202609
+[002] Code: A016C000 -> Name: F 202612
+[003] Code: A0173000 -> Name: F 202703
+[004] Code: A0176000 -> Name: F 202706
+[005] Code: A017C000 -> Name: F 202712
+[006] Code: A018C000 -> Name: F 202812
+[007] Code: D016669S -> Name: SP 2606-2609
+[008] Code: D01666CS -> Name: SP 2606-2612
+[009] Code: D016673S -> Name: SP 2606-2703
+[010] Code: D016676S -> Name: SP 2606-2706
+[011] Code: D01667CS -> Name: SP 2606-2712
+[012] Code: D01668CS -> Name: SP 2606-2812
+[013] Code: A0566000 -> Name: 미니 F 202606
+[014] Code: A0567000 -> Name: 미니 F 202607
+[015] Code: A0568000 -> Name: 미니 F 202608
+[016] Code: A0569000 -> Name: 미니 F 202609
+[017] Code: A056A000 -> Name: 미니 F 202610
+[018] Code: A056B000 -> Name: 미니 F 202611
+[019] Code: D056667S -> Name: 미니 SP 2606-2607
+[020] Code: D056668S -> Name: 미니 SP 2606-2608
+[021] Code: D056669S -> Name: 미니 SP 2606-2609
+[022] Code: D05666AS -> Name: 미니 SP 2606-2610
+[023] Code: D05666BS -> Name: 미니 SP 2606-2611
+[024] Code: A0666000 -> Name: 코스닥 F 202606
+[025] Code: A0669000 -> Name: 코스닥 F 202609
+[026] Code: A066C000 -> Name: 코스닥 F 202612
+[027] Code: A0673000 -> Name: 코스닥 F 202703
+[028] Code: A0676000 -> Name: 코스닥 F 202706
+[029] Code: A067C000 -> Name: 코스닥 F 202712
+[030] Code: A068C000 -> Name: 코스닥 F 202812
+[031] Code: D066669S -> Name: 코스닥 SP 2606-2609
+[032] Code: D06666CS -> Name: 코스닥 SP 2606-2612
+[033] Code: D066673S -> Name: 코스닥 SP 2606-2703
+[034] Code: D066676S -> Name: 코스닥 SP 2606-2706
+[035] Code: D06667CS -> Name: 코스닥 SP 2606-2712
+[036] Code: D06668CS -> Name: 코스닥 SP 2606-2812
+[037] Code: AAG66000 -> Name: 코스닥글로벌 F202606
+[038] Code: AAG69000 -> Name: 코스닥글로벌 F202609
+[039] Code: AAG6C000 -> Name: 코스닥글로벌 F202612
+[040] Code: AAG73000 -> Name: 코스닥글로벌 F202703
+[041] Code: DAG6669S -> Name: 코스닥글 SP2606-2609
+[042] Code: DAG666CS -> Name: 코스닥글 SP2606-2612
+[043] Code: DAG6673S -> Name: 코스닥글 SP2606-2703
+[044] Code: A0466000 -> Name: 변동성 F202606
+[045] Code: A0467000 -> Name: 변동성 F202607
+[046] Code: A0468000 -> Name: 변동성 F202608
+[047] Code: A0469000 -> Name: 변동성 F202609
+[048] Code: A046A000 -> Name: 변동성 F202610
+[049] Code: A046B000 -> Name: 변동성 F202611
+[050] Code: D046667S -> Name: 변동성 SP2606-2607
+[051] Code: D046668S -> Name: 변동성 SP2606-2608
+[052] Code: D046669S -> Name: 변동성 SP2606-2609
+[053] Code: D04666AS -> Name: 변동성 SP2606-2610
+[054] Code: D04666BS -> Name: 변동성 SP2606-2611
+[055] Code: AA066000 -> Name: 에너지 F202606
+[056] Code: AA069000 -> Name: 에너지 F202609
+[057] Code: AA06C000 -> Name: 에너지 F202612
+[058] Code: AA073000 -> Name: 에너지 F202703
+[059] Code: DA06669S -> Name: 에너지 SP2606-2609
+[060] Code: DA0666CS -> Name: 에너지 SP2606-2612
+[061] Code: DA06673S -> Name: 에너지 SP2606-2703
+[062] Code: AA166000 -> Name: 정보기술 F202606
+[063] Code: AA169000 -> Name: 정보기술 F202609
+[064] Code: AA16C000 -> Name: 정보기술 F202612
+[065] Code: AA173000 -> Name: 정보기술 F202703
+[066] Code: DA16669S -> Name: 정보기술 SP2606-2609
+[067] Code: DA1666CS -> Name: 정보기술 SP2606-2612
+[068] Code: DA16673S -> Name: 정보기술 SP2606-2703
+[069] Code: AA266000 -> Name: 금융지수 F202606
+[070] Code: AA269000 -> Name: 금융지수 F202609
+[071] Code: AA26C000 -> Name: 금융지수 F202612
+[072] Code: AA273000 -> Name: 금융지수 F202703
+[073] Code: DA26669S -> Name: 금융지수 SP2606-2609
+[074] Code: DA2666CS -> Name: 금융지수 SP2606-2612
+[075] Code: DA26673S -> Name: 금융지수 SP2606-2703
+[076] Code: AA366000 -> Name: 경기소비재 F202606
+[077] Code: AA369000 -> Name: 경기소비재 F202609
+[078] Code: AA36C000 -> Name: 경기소비재 F202612
+[079] Code: AA373000 -> Name: 경기소비재 F202703
+[080] Code: DA36669S -> Name: 경기소비 SP2606-2609
+[081] Code: DA3666CS -> Name: 경기소비 SP2606-2612
+[082] Code: DA36673S -> Name: 경기소비 SP2606-2703
+[083] Code: AA666000 -> Name: 건설 F202606
+[084] Code: AA669000 -> Name: 건설 F202609
+[085] Code: AA66C000 -> Name: 건설 F202612
+[086] Code: AA673000 -> Name: 건설 F202703
+[087] Code: DA66669S -> Name: 건설 SP2606-2609
+[088] Code: DA6666CS -> Name: 건설 SP2606-2612
+[089] Code: DA66673S -> Name: 건설 SP2606-2703
+[090] Code: AA766000 -> Name: 중공업 F202606
+[091] Code: AA769000 -> Name: 중공업 F202609
+[092] Code: AA76C000 -> Name: 중공업 F202612
+[093] Code: AA773000 -> Name: 중공업 F202703
+[094] Code: DA76669S -> Name: 중공업 SP2606-2609
+[095] Code: DA7666CS -> Name: 중공업 SP2606-2612
+[096] Code: DA76673S -> Name: 중공업 SP2606-2703
+[097] Code: AA866000 -> Name: 헬스케어 F202606
+[098] Code: AA869000 -> Name: 헬스케어 F202609
+[099] Code: AA86C000 -> Name: 헬스케어 F202612
+[100] Code: AA873000 -> Name: 헬스케어 F202703
+[101] Code: DA86669S -> Name: 헬스케어 SP2606-2609
+[102] Code: DA8666CS -> Name: 헬스케어 SP2606-2612
+[103] Code: DA86673S -> Name: 헬스케어 SP2606-2703
+[104] Code: AA966000 -> Name: 철강소재 F202606
+[105] Code: AA969000 -> Name: 철강소재 F202609
+[106] Code: AA96C000 -> Name: 철강소재 F202612
+[107] Code: AA973000 -> Name: 철강소재 F202703
+[108] Code: DA96669S -> Name: 철강소재 SP2606-2609
+[109] Code: DA9666CS -> Name: 철강소재 SP2606-2612
+[110] Code: DA96673S -> Name: 철강소재 SP2606-2703
+[111] Code: AAA66000 -> Name: 생활소비재 F202606
+[112] Code: AAA69000 -> Name: 생활소비재 F202609
+[113] Code: AAA6C000 -> Name: 생활소비재 F202612
+[114] Code: AAA73000 -> Name: 생활소비재 F202703
+[115] Code: DAA6669S -> Name: 생활소비 SP2606-2609
+[116] Code: DAA666CS -> Name: 생활소비 SP2606-2612
+[117] Code: DAA6673S -> Name: 생활소비 SP2606-2703
+[118] Code: AAB66000 -> Name: 산업재 F202606
+[119] Code: AAB69000 -> Name: 산업재 F202609
+[120] Code: AAB6C000 -> Name: 산업재 F202612
+[121] Code: AAB73000 -> Name: 산업재 F202703
+[122] Code: DAB6669S -> Name: 산업재 SP2606-2609
+[123] Code: DAB666CS -> Name: 산업재 SP2606-2612
+[124] Code: DAB6673S -> Name: 산업재 SP2606-2703
+[125] Code: AA466000 -> Name: 고배당50 F202606
+[126] Code: AA469000 -> Name: 고배당50 F202609
+[127] Code: AA46C000 -> Name: 고배당50 F202612
+[128] Code: AA473000 -> Name: 고배당50 F202703
+[129] Code: DA46669S -> Name: 고배당50 SP2606-2609
+[130] Code: DA4666CS -> Name: 고배당50 SP2606-2612
+[131] Code: DA46673S -> Name: 고배당50 SP2606-2703
+[132] Code: AA566000 -> Name: 배당성장50 F202606
+[133] Code: AA569000 -> Name: 배당성장50 F202609
+[134] Code: AA56C000 -> Name: 배당성장50 F202612
+[135] Code: AA573000 -> Name: 배당성장50 F202703
+[136] Code: DA56669S -> Name: 배당성장 SP2606-2609
+[137] Code: DA5666CS -> Name: 배당성장 SP2606-2612
+[138] Code: DA56673S -> Name: 배당성장 SP2606-2703
+[139] Code: A0866000 -> Name: KRX300 F 202606
+[140] Code: A0869000 -> Name: KRX300 F 202609
+[141] Code: A086C000 -> Name: KRX300 F 202612
+[142] Code: A0873000 -> Name: KRX300 F 202703
+[143] Code: D086669S -> Name: KRX300 SP 2606-2609
+[144] Code: D08666CS -> Name: KRX300 SP 2606-2612
+[145] Code: D086673S -> Name: KRX300 SP 2606-2703
+[146] Code: AAC66000 -> Name: BBIG F202606
+[147] Code: AAC69000 -> Name: BBIG F202609
+[148] Code: AAC6C000 -> Name: BBIG F202612
+[149] Code: AAC73000 -> Name: BBIG F202703
+[150] Code: DAC6669S -> Name: BBIG SP 2606-2609
+[151] Code: DAC666CS -> Name: BBIG SP 2606-2612
+[152] Code: DAC6673S -> Name: BBIG SP 2606-2703
+[153] Code: AAD66000 -> Name: 2차전지TOP10 F202606
+[154] Code: AAD69000 -> Name: 2차전지TOP10 F202609
+[155] Code: AAD6C000 -> Name: 2차전지TOP10 F202612
+[156] Code: AAD73000 -> Name: 2차전지TOP10 F202703
+[157] Code: DAD6669S -> Name: 2차전지 SP 2606-2609
+[158] Code: DAD666CS -> Name: 2차전지 SP 2606-2612
+[159] Code: DAD6673S -> Name: 2차전지 SP 2606-2703
+[160] Code: AAE66000 -> Name: 바이오 TOP10 F202606
+[161] Code: AAE69000 -> Name: 바이오 TOP10 F202609
+[162] Code: AAE6C000 -> Name: 바이오 TOP10 F202612
+[163] Code: AAE73000 -> Name: 바이오 TOP10 F202703
+[164] Code: DAE6669S -> Name: 바이오 SP 2606-2609
+[165] Code: DAE666CS -> Name: 바이오 SP 2606-2612
+[166] Code: DAE6673S -> Name: 바이오 SP 2606-2703
+[167] Code: AAH66000 -> Name: 코리아밸류업 F202606
+[168] Code: AAH69000 -> Name: 코리아밸류업 F202609
+[169] Code: AAH6C000 -> Name: 코리아밸류업 F202612
+[170] Code: AAH73000 -> Name: 코리아밸류업 F202703
+[171] Code: DAH6669S -> Name: 코리아밸 SP2606-2609
+[172] Code: DAH666CS -> Name: 코리아밸 SP2606-2612
+[173] Code: DAH6673S -> Name: 코리아밸 SP2606-2703
+[174] Code: AAL66000 -> Name: 반도체 F 202606
+[175] Code: AAL69000 -> Name: 반도체 F 202609
+[176] Code: AAL6C000 -> Name: 반도체 F 202612
+[177] Code: AAL73000 -> Name: 반도체 F 202703
+[178] Code: DAL6669S -> Name: 반도체 SP 2606-2609
+[179] Code: DAL666CS -> Name: 반도체 SP 2606-2612
+[180] Code: DAL6673S -> Name: 반도체 SP 2606-2703

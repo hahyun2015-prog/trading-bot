@@ -1,0 +1,35 @@
+@echo off
+chcp 65001 > nul
+
+cls
+echo.
+echo ==========================================================
+echo   AMATS [ TDA ]  텔레그램 중앙 관제 에이전트 (TCA 폴백)
+echo ==========================================================
+echo   Telegram Bot  ·  원격 명령  ·  시스템 모니터링
+echo ----------------------------------------------------------
+echo.
+echo   사용 가능한 텔레그램 명령어:
+echo   !상태  ·  !주식현황  ·  !선물현황  ·  !도움말
+echo   !시스템시작  ·  !시스템종료  ·  !긴급정지
+echo.
+echo ----------------------------------------------------------
+echo.
+
+if exist "%~dp0venv32\Scripts\python.exe" (
+    echo   [확인]  venv32 환경으로 실행합니다.
+    echo   [시작]  TDA/TCA 관제 에이전트 구동 중...
+    echo.
+    "%~dp0venv32\Scripts\python.exe" "%~dp0tca\tca_controller.py"
+) else (
+    echo   [알림]  venv32 없음 — 시스템 Python 으로 실행합니다.
+    echo   [시작]  TDA/TCA 관제 에이전트 구동 중...
+    echo.
+    python "%~dp0tca\tca_controller.py"
+)
+
+echo.
+echo ----------------------------------------------------------
+echo   [종료]  TDA 에이전트가 중지되었습니다.
+echo.
+pause

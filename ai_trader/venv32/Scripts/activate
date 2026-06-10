@@ -38,7 +38,7 @@ deactivate () {
 # unset irrelevant variables
 deactivate nondestructive
 
-VIRTUAL_ENV="C:\antigravity\노트븍활용\ai_trader\venv32"
+VIRTUAL_ENV="C:\Antigravity\AI_T_Agent\venv32"
 export VIRTUAL_ENV
 
 _OLD_VIRTUAL_PATH="$PATH"

@@ -44,7 +44,7 @@ class RSACoordinator:
                 nsaa_score INTEGER,
                 nsaa_reason TEXT,
                 score INTEGER,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                timestamp DATETIME DEFAULT (datetime('now', 'localtime'))
             )
         ''')
         conn.commit()
@@ -81,13 +81,13 @@ class RSACoordinator:
                 faa_score, faa_reason,
                 ira_score, ira_reason,
                 nsaa_score, nsaa_reason,
-                score
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                score, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (code, name, strategy_type,
               faa_score, faa_reason,
               ira_score, ira_reason,
               nsaa_score, nsaa_reason,
-              final_score))
+              final_score, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         conn.commit()
         conn.close()
         return final_score

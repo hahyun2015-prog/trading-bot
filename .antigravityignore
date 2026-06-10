@@ -1,0 +1,6 @@
+venv32/
+.git/
+.tmp.driveupload/
+*.db
+*.pyc
+__pycache__/

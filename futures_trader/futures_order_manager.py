@@ -37,6 +37,40 @@ class FuturesOrderManager:
         
         self.positions = {} # 현재 포지션 정보 기록 (코드: {종류(Long/Short), 단가, 수량})
         self.system_halted = False
+
+        # 환경설정 로드 및 prefix 설정
+        self.day_code = "10100000"
+        self.night_code = "10500000"
+        self.environment = "mock"
+        
+        try:
+            # workspace_root 기준 경로 찾기
+            workspace_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            config_path = os.path.join(workspace_root, "config", "config.json")
+            local_config_path = os.path.join(workspace_root, "config", "config_local.json")
+            
+            config = {}
+            if os.path.exists(config_path):
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+            if os.path.exists(local_config_path):
+                with open(local_config_path, "r", encoding="utf-8") as f:
+                    local_overrides = json.load(f)
+                for key, val in local_overrides.items():
+                    if isinstance(val, dict) and isinstance(config.get(key), dict):
+                        config[key].update(val)
+                    else:
+                        config[key] = val
+            
+            self.environment = config.get("environment", "mock")
+            futures_settings = config.get("futures_settings", {})
+            if futures_settings:
+                self.day_code = futures_settings.get("target_code_day", self.day_code)
+                self.night_code = futures_settings.get("target_code_night", self.night_code)
+        except Exception as e:
+            print(f"설정 파일 로드 실패 (기본값 사용): {e}")
+            
+        self.futures_prefix = self.day_code[:3] if len(self.day_code) >= 3 else "101"
         
         print("==========================================================")
         print("  국내선물 전용 실시간 주문 모듈 (Order Manager) 시작")
@@ -102,14 +136,12 @@ class FuturesOrderManager:
                 self.was_disconnected = False
 
     def request_futures_data(self):
-        day_code = "10100000"
-        night_code = "10500000" # 사용자 환경에 맞는 야간선물 코드로 변경 가능
         now = time.localtime()
         if now.tm_hour >= 17 or now.tm_hour < 6:
-            self.api_req_code = night_code
+            self.api_req_code = self.night_code
             print(f"\n[Data] 야간장 5분봉 시세 수집 요청 (코드: {self.api_req_code})")
         else:
-            self.api_req_code = day_code
+            self.api_req_code = self.day_code
             print(f"\n[Data] 주간장 5분봉 시세 수집 요청 (코드: {self.api_req_code})")
             
         self.db_save_code = self.api_req_code
@@ -124,14 +156,84 @@ class FuturesOrderManager:
             
             # --- 최근월물 코드 동적 추출 (주문용 진짜 코드) ---
             future_list = self.kiwoom.dynamicCall("GetFutureList()").strip()
-            self.real_day_code = "10100000"
-            self.real_night_code = "10500000"
+            self.real_day_code = ""
+            self.real_night_code = ""
+            
+            search_prefix = self.futures_prefix
+            if self.environment != "live":
+                search_prefix = "A01" if self.futures_prefix == "101" else "A05"
+            
             if future_list:
-                codes = [c for c in future_list.split(";") if c and c.startswith("101")]
+                codes = [c for c in future_list.split(";") if c and c.startswith(search_prefix)]
                 if codes:
-                    self.real_day_code = codes[0] # 예: 101V6000
-                    self.real_night_code = "105" + self.real_day_code[3:]
-                    print(f" => [System] 최근월물 자동 인식 완료: 주간({self.real_day_code}), 야간({self.real_night_code})")
+                    self.real_day_code = codes[0]
+            
+            # 폴백 1단계: GetFutureList가 실패했거나 비어있을 시 GetFutureCodeByIndex 시도
+            if not self.real_day_code:
+                print(" => [System 폴백 1단계] GetFutureList 응답 없음. GetFutureCodeByIndex 조회 시도...")
+                code_by_idx = self.kiwoom.dynamicCall("GetFutureCodeByIndex(int)", 0).strip()
+                if code_by_idx and (code_by_idx.startswith(search_prefix) or (self.environment != "live" and (code_by_idx.startswith("A01") or code_by_idx.startswith("A05")))):
+                    self.real_day_code = code_by_idx
+                    print(f" => [System 폴백 1단계 성공] Index(0) 코드로 최근월물 인식: {self.real_day_code}")
+            
+            # 폴백 2단계: API 조회가 모두 실패할 시 날짜 기반 동적 연산 알고리즘 가동
+            if not self.real_day_code:
+                print(" => [System 폴백 2단계] 키움 API 최근월물 조회 실패. 날짜 기반 가상 알고리즘 가동...")
+                now = datetime.now()
+                curr_year = now.year
+                curr_month = now.month
+                curr_day = now.day
+                
+                if self.environment != "live":
+                    year_char = str(curr_year % 10)
+                else:
+                    year_codes = {2026: "V", 2027: "W", 2028: "X", 2029: "Y", 2030: "Z"}
+                    year_char = year_codes.get(curr_year, "V")
+                
+                # 선물 만기월은 3, 6, 9, 12월. 둘째주 목요일이 만기일.
+                if curr_month <= 3:
+                    if curr_month == 3 and curr_day > 12:
+                        expiry_month_char = "6"
+                    else:
+                        expiry_month_char = "3"
+                elif curr_month <= 6:
+                    if curr_month == 6 and curr_day > 12:
+                        expiry_month_char = "9"
+                    else:
+                        expiry_month_char = "6"
+                elif curr_month <= 9:
+                    if curr_month == 9 and curr_day > 12:
+                        expiry_month_char = "C"
+                    else:
+                        expiry_month_char = "9"
+                else:
+                    if curr_month == 12 and curr_day > 12:
+                        if self.environment != "live":
+                            year_char = str((curr_year + 1) % 10)
+                        else:
+                            year_char = year_codes.get(curr_year + 1, "W")
+                        expiry_month_char = "3"
+                    else:
+                        expiry_month_char = "C"
+                
+                self.real_day_code = f"{search_prefix}{year_char}{expiry_month_char}000"
+                print(f" => [System 폴백 2단계 성공] 알고리즘 생성 최근월물 적용: {self.real_day_code}")
+                
+            if self.real_day_code:
+                if self.futures_prefix == "105":
+                    self.real_night_code = self.real_day_code
+                else:
+                    night_prefix = "A05" if self.environment != "live" else "105"
+                    self.real_night_code = night_prefix + self.real_day_code[3:]
+            else:
+                if self.environment != "live":
+                    self.real_day_code = "A0566000" if self.futures_prefix == "105" else "A0166000"
+                    self.real_night_code = "A0566000"
+                else:
+                    self.real_day_code = self.futures_prefix + "00000"
+                    self.real_night_code = "10500000"
+                    
+            print(f" => [System] 최근월물 자동 인식 완료: 주간({self.real_day_code}), 야간({self.real_night_code})")
             
             # 계좌번호 추출
             accounts_str = self.kiwoom.dynamicCall("GetLoginInfo(QString)", "ACCNO")

@@ -20,11 +20,29 @@ class FuturesStrategyEngine:
         self._init_db()
         
     def _set_target_code(self):
+        # 환경설정 로드 시도 (상위 폴더의 config 기준)
+        target_day = "10100000"
+        target_night = "10500000"
+        try:
+            # 여러 경로 후보 탐색
+            paths = ["../config/config_local.json", "config/config_local.json", "../config/config.json", "config/config.json"]
+            for p in paths:
+                if os.path.exists(p):
+                    with open(p, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                        futures_settings = cfg.get("futures_settings", {})
+                        if futures_settings:
+                            target_day = futures_settings.get("target_code_day", target_day)
+                            target_night = futures_settings.get("target_code_night", target_night)
+                            break
+        except Exception as e:
+            print(f"설정 파일 로드 실패 (기본값 사용): {e}")
+
         now = time.localtime()
         if now.tm_hour >= 17 or now.tm_hour < 6:
-            self.target_code = "10500000"
+            self.target_code = target_night
         else:
-            self.target_code = "10100000"
+            self.target_code = target_day
         
     def _init_db(self):
         conn = sqlite3.connect(self.db_path)

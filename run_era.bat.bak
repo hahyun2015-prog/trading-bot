@@ -1,0 +1,55 @@
+@echo off
+chcp 65001 > nul
+
+cls
+echo.
+echo ==========================================================
+echo   AMATS [ ERA ]  주문 / 리스크 관리 엔진
+echo ==========================================================
+echo   Kiwoom OpenAPI  ·  32bit Python  ·  실시간 자동매매
+echo ----------------------------------------------------------
+echo.
+
+:: 작업 디렉터리를 배치 파일 폴더로 변경 (경로 관련 이스케이프 버그 완전 차단)
+cd /d "%~dp0"
+
+if not exist "venv32\Scripts\python.exe" (
+    echo   [오류]  venv32 가상환경을 찾을 수 없습니다.
+    echo   [조치]  setup_env.bat 을 먼저 실행하세요.
+    echo.
+    pause
+    exit /b 1
+)
+
+echo   [확인]  venv32 가상환경 감지됨
+echo.
+
+:: ── 코드 자동 업데이트 (git pull) ───────────────────────────────
+where git >nul 2>&1
+if %errorlevel% equ 0 (
+    echo   [동기화]  GitHub 최신 코드 확인 중...
+    git pull origin main --quiet 2>&1
+    if %errorlevel% equ 0 (
+        echo   [동기화]  코드 최신 상태 확인 완료
+        for /f "usebackq tokens=*" %%v in (`git log --oneline -1`) do echo            버전: %%v
+    ) else (
+        echo   [동기화]  git pull 실패 — 현재 버전으로 계속 실행합니다.
+    )
+) else (
+    echo   [동기화]  git 미설치 — 코드 동기화 건너뜀
+)
+echo.
+
+echo   [시작]  ERA 엔진 구동 중...
+echo          종료: Ctrl+C 또는 창 닫기
+echo.
+echo ----------------------------------------------------------
+echo.
+
+"venv32\Scripts\python.exe" "era\era_order_manager.py"
+
+echo.
+echo ----------------------------------------------------------
+echo   [종료]  ERA 엔진이 중지되었습니다.
+echo.
+pause
