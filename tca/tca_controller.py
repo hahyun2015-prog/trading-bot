@@ -865,6 +865,72 @@ class TCAController:
             except Exception as e:
                 self.send_message(f"❌ 전량 매도 명령 처리 중 오류: {e}")
 
+        elif cmd_text in ["!선물매수", "!선물매도", "!선물청산"]:
+            try:
+                import sqlite3
+                from datetime import datetime
+                db_path = os.path.join(self.workspace_root, "futures_data.db")
+                conn = sqlite3.connect(db_path, timeout=30)
+                conn.execute("PRAGMA journal_mode=WAL;")
+                cursor = conn.cursor()
+
+                # 1. 현재 시간에 따라 주간(10100000) / 야간(10500000) 코드 결정
+                now_hour = datetime.now().hour
+                active_code = "10500000" if (now_hour >= 17 or now_hour < 6) else "10100000"
+                session_label = "야간" if active_code == "10500000" else "주간"
+
+                # 2. DB에서 가장 최근 수신된 종목 가격 조회
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS futures_ohlcv (
+                        code TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL, volume INTEGER,
+                        UNIQUE(code, date)
+                    )
+                """)
+                cursor.execute("SELECT close FROM futures_ohlcv WHERE code = ? ORDER BY date DESC LIMIT 1", (active_code,))
+                row = cursor.fetchone()
+                current_price = row[0] if row else 400.0
+
+                if cmd_text == "!선물매수":
+                    cursor.execute("""
+                        INSERT INTO signals (code, signal_type, price, status)
+                        VALUES (?, 'LONG_ENTER', ?, 'PENDING')
+                    """, (active_code, current_price))
+                    conn.commit()
+                    self.send_message(f"✅ <b>[{session_label}선물]</b> 수동 매수(LONG) 진입 명령이 전달되었습니다. (기준가: {current_price:.2f}pt)")
+
+                elif cmd_text == "!선물매도":
+                    cursor.execute("""
+                        INSERT INTO signals (code, signal_type, price, status)
+                        VALUES (?, 'SHORT_ENTER', ?, 'PENDING')
+                    """, (active_code, current_price))
+                    conn.commit()
+                    self.send_message(f"✅ <b>[{session_label}선물]</b> 수동 매도(SHORT) 진입 명령이 전달되었습니다. (기준가: {current_price:.2f}pt)")
+
+                elif cmd_text == "!선물청산":
+                    _, futures_data, single_data = self._load_all_status()
+                    data = futures_data or single_data or {}
+                    positions = data.get("futures_positions", {})
+                    pos_found = False
+                    for pos_key, pos_info in positions.items():
+                        p_type = pos_info.get("type")
+                        qty = pos_info.get("qty", 0)
+                        if qty > 0 and p_type in ["LONG", "SHORT"]:
+                            exit_signal = "LONG_EXIT" if p_type == "LONG" else "SHORT_EXIT"
+                            cursor.execute("""
+                                INSERT INTO signals (code, signal_type, price, status)
+                                VALUES (?, ?, ?, 'PENDING')
+                            """, (active_code, exit_signal, current_price))
+                            conn.commit()
+                            pos_found = True
+                            self.send_message(f"✅ <b>[{session_label}선물]</b> 수동 청산({exit_signal}) 명령이 전달되었습니다. (보유: {p_type} {qty}계약, 기준가: {current_price:.2f}pt)")
+                            break
+                    if not pos_found:
+                        self.send_message("⚠️ 현재 보유 중인 선물 포지션이 없습니다. (상태 파일에 포지션 없음)")
+
+                conn.close()
+            except Exception as e:
+                self.send_message(f"❌ 선물 수동 명령 처리 중 오류: {e}")
+
         elif cmd_text == "긴급정지" or cmd_text == "!긴급정지":
             self.send_message("🚨 <b>긴급 정지 시퀀스 가동!</b> 🚨\n\n1. ERA 주문 엔진에 긴급정지 플래그 전송 중...")
 
@@ -1297,6 +1363,7 @@ class TCAController:
                 "<b>[수동 제어]</b>\n"
                 "• <code>!매도 삼성전자</code> : 특정 종목 즉시 전량 청산\n"
                 "• <code>!전량매도</code> : 보유 중인 전 주식 시장가 청산\n"
+                "• <code>!선물매수</code> / <code>!선물매도</code> / <code>!선물청산</code> : 수동 선물 진입 및 청산\n"
                 "• <code>!계약수량 1</code> : 선물 계약 수량 수동 제어 (숫자/자동)\n"
                 "• <code>!시스템시작</code> / <code>!시스템종료</code> : 32비트 API 엔진 강제 온/오프\n"
                 "• <code>!재연동</code> / <code>!시스템재시작</code> : 시스템 통합 프로세스 정리 후 안전 재기동 (추천)\n\n"
