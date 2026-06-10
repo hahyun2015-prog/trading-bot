@@ -34,3 +34,7 @@ venv*/
 
 # 동기화 임시 파일
 sync_dump/
+
+# Google Drive / Drive Upload 임시 파일
+.tmp.driveupload/
+
