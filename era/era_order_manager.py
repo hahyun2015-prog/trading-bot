@@ -2650,6 +2650,10 @@ class ERAOrderManager:
                 if day_open <= 0 or current_price <= 0:
                     continue
 
+                # [안전장치] 5,000원 이하 초저가 종목 단타 진입 차단 필터
+                if current_price <= 5000:
+                    continue
+
                 is_breakout    = current_price >= day_open * 1.02       # 시가 대비 +2% 돌파
                 is_vol_surge   = avg_volume > 0 and current_volume >= avg_volume * 1.5
                 change_pct = (current_price / day_open - 1) * 100
@@ -2921,6 +2925,12 @@ class ERAOrderManager:
                 if price <= 0 and strategy_type != 'MANUAL_SELL':
                     print(f" => [거절] 비정상 신호 가격: {price}")
                     cursor.execute("UPDATE signals SET status = 'SKIPPED_INVALID_PRICE' WHERE id = ?", (signal_id,))
+                    continue
+
+                # [안전장치] 5,000원 이하 종목 진입 차단 필터 (수동 매도는 허용)
+                if strategy_type != 'MANUAL_SELL' and price <= 5000:
+                    print(f" => [거절] 최소 가격 제한 미달 (현재 {price:,}원 / 기준 5,000원 초과)")
+                    cursor.execute("UPDATE signals SET status = 'SKIPPED_PRICE_TOO_LOW' WHERE id = ?", (signal_id,))
                     continue
 
                 # 중복 진입 검사
