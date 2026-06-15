@@ -38,6 +38,10 @@ echo.
 echo [3/3] Restarting ERA Trading Engine...
 start "" "%~dp0..\run_era.bat"
 
+:: Re-enable Windows Task Scheduler task to ensure auto-start on next boot
+echo Re-enabling Windows Task Scheduler AutoStart...
+schtasks /change /tn "AMATS AutoStart" /enable >nul 2>&1
+
 echo.
 echo Reconnection sequence completed. This window will now close.
 timeout /t 3 >nul

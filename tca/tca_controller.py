@@ -1592,6 +1592,11 @@ class TCAController:
                                 
                             print(f"명령어 수신: {text}")
                             self.execute_command(text, current_offset=offset)
+                else:
+                    error_desc = data.get("description", "Unknown error")
+                    err_code = data.get("error_code", "Unknown code")
+                    print(f"[TCA ERROR] Telegram API returned ok=False. Code: {err_code}, Description: {error_desc}")
+                    time.sleep(10)
                             
             except Exception as e:
                 print(f"Exception: {e}")
@@ -1611,6 +1616,14 @@ if __name__ == "__main__":
         print("[TCA ERROR] 이미 다른 TCA 컨트롤러가 실행 중입니다 (Port 9990 Lock). 실행을 중단합니다.")
         sys.exit(0)
 
+    tca_pid_file = os.path.join(current_dir, "tca.pid")
+    try:
+        with open(tca_pid_file, "w") as _f:
+            _f.write(str(os.getpid()))
+        print(f"[TCA] PID {os.getpid()} 기록 완료 ({tca_pid_file})")
+    except Exception as e:
+        print(f"[TCA] PID 기록 실패: {e}")
+
     try:
         import ctypes
         ctypes.windll.kernel32.SetThreadExecutionState(0x80000003)
@@ -1618,11 +1631,19 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[TCA] 절전 방지 실패: {e}")
 
+    # Ensure Windows Task Scheduler task is enabled on startup
+    try:
+        import subprocess
+        subprocess.run('schtasks /change /tn "AMATS AutoStart" /enable', shell=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        print("[TCA] AMATS AutoStart 스케줄러 자동 활성화 완료.")
+    except Exception as e:
+        print(f"[TCA] 스케줄러 활성화 실패: {e}")
+
     try:
         controller = TCAController()
         controller.run_controller()
     finally:
-        if os.path.exists(tca_pid_file):
+        if 'tca_pid_file' in locals() and os.path.exists(tca_pid_file):
             try:
                 os.remove(tca_pid_file)
             except:

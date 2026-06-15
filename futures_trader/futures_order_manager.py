@@ -420,9 +420,9 @@ class FuturesOrderManager:
                     elif signal_type == "SHORT_ENTER":
                         ord_kind, slby_tp = 1, 1 # 신규, 매도
                     elif signal_type == "LONG_EXIT":
-                        ord_kind, slby_tp = 2, 1 # 청산, 매도 (전매도)
+                        ord_kind, slby_tp = 1, 1 # 신규(청산), 매도 (전매도)
                     elif signal_type == "SHORT_EXIT":
-                        ord_kind, slby_tp = 2, 2 # 청산, 매수 (환매수)
+                        ord_kind, slby_tp = 1, 2 # 신규(청산), 매수 (환매수)
                     else:
                         print(f"  => 알 수 없는 시그널 타입({signal_type}). 무시합니다.")
                         cursor.execute("UPDATE signals SET status = 'ERROR' WHERE id = ?", (signal_id,))

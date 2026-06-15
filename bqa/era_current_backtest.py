@@ -102,15 +102,6 @@ def era_current_strategy(df, K, initial_capital=50_000_000, margin_cap_ratio=0.3
                 if not pd.isna(pr) and pr > 0:
                     prev_range = pr
 
-        # ── 09:00 시초가 확정 ──
-        if t.hour == 9 and t.minute < 5 and day_open == 0:
-            day_open = price
-            target_long = day_open + prev_range * K
-            target_short = day_open - prev_range * K
-
-        if day_open == 0:
-            continue
-
         # ── 08:45~08:55 익일 장전 강제 청산 ──
         if t.hour == 8 and 45 <= t.minute <= 55:
             if pos != 0:
@@ -140,6 +131,15 @@ def era_current_strategy(df, K, initial_capital=50_000_000, margin_cap_ratio=0.3
                 equity.append(capital)
                 pos = 0
                 order_locked = False
+            continue
+
+        # ── 09:00 시초가 확정 ──
+        if t.hour == 9 and day_open == 0:
+            day_open = row['open']
+            target_long = day_open + prev_range * K
+            target_short = day_open - prev_range * K
+
+        if day_open == 0:
             continue
 
         # ── 진입 조건 (현행 ERA 그대로) ──
@@ -303,14 +303,6 @@ def era_with_fixed_stoploss(df, K, stop_pt=2.0, initial_capital=50_000_000):
                 if not pd.isna(pr) and pr > 0:
                     prev_range = pr
 
-        if t.hour == 9 and t.minute < 5 and day_open == 0:
-            day_open = price
-            target_long = day_open + prev_range * K
-            target_short = day_open - prev_range * K
-
-        if day_open == 0:
-            continue
-
         # 포지션 보유 중 — 손절/시간청산 확인
         if pos != 0:
             exit_reason = None
@@ -335,6 +327,14 @@ def era_with_fixed_stoploss(df, K, stop_pt=2.0, initial_capital=50_000_000):
                 order_locked = False
             if t.hour == 8 and 45 <= t.minute <= 55:
                 continue
+
+        if t.hour == 9 and day_open == 0:
+            day_open = row['open']
+            target_long = day_open + prev_range * K
+            target_short = day_open - prev_range * K
+
+        if day_open == 0:
+            continue
 
         if pos == 0 and not order_locked:
             if price >= target_long:
@@ -405,12 +405,6 @@ def era_with_stop_and_target(df, K, stop_pt=2.0, target_pt=3.0, initial_capital=
             if day_str in daily.index:
                 pr = daily.loc[day_str, 'prev_range']
                 if not pd.isna(pr) and pr > 0: prev_range = pr
-        if t.hour == 9 and t.minute < 5 and day_open == 0:
-            day_open = price
-            target_long = day_open + prev_range * K
-            target_short = day_open - prev_range * K
-        if day_open == 0: continue
-
         if pos != 0:
             exit_reason = None
             if t.hour == 8 and 45 <= t.minute <= 55: exit_reason = "TIME"
@@ -428,6 +422,12 @@ def era_with_stop_and_target(df, K, stop_pt=2.0, target_pt=3.0, initial_capital=
                 equity.append(capital)
                 pos = 0; order_locked = False
             if t.hour == 8 and 45 <= t.minute <= 55: continue
+
+        if t.hour == 9 and day_open == 0:
+            day_open = row['open']
+            target_long = day_open + prev_range * K
+            target_short = day_open - prev_range * K
+        if day_open == 0: continue
 
         if pos == 0 and not order_locked:
             if price >= target_long:

@@ -132,6 +132,15 @@
             "status": "FAILED",
             "created_at": "2026-06-05 11:50:11",
             "error": "Cancelled due to system restart"
+        },
+        {
+            "task_id": "task_test_001",
+            "request": "TCA 컨트롤러의 최근 10줄 로그 확인하고 정상인지 분석해줘",
+            "status": "FAILED",
+            "created_at": "2026-06-10 21:00:00",
+            "started_at": "2026-06-10 20:59:48",
+            "error": "'candidates'",
+            "completed_at": "2026-06-10 20:59:49"
         }
     ]
 }
