@@ -635,10 +635,10 @@ class ERAOrderManager:
             if len(daily) < 15:
                 return
                 
-            # TR 계산
+            # TR 계산 (첫 행의 NaN 값을 high - low로 채워 Kalman Filter 전파 차단)
             daily['tr'] = np.maximum(daily['high'] - daily['low'], 
                                      np.maximum(abs(daily['high'] - daily['close'].shift(1)), 
-                                                abs(daily['low'] - daily['close'].shift(1))))
+                                                abs(daily['low'] - daily['close'].shift(1)))).fillna(daily['high'] - daily['low'])
             # 1차원 칼만 필터를 적용하여 지연 없는 변동성(Kalman ATR) 산출
             kf_atr = None
             P_atr = 1.0
