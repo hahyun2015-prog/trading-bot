@@ -181,7 +181,7 @@ def run_simulation(df, daily_tr, sorted_days, test_days, floor_mode='fixed_2.0',
             if pos == 1:
                 if c_high > peak: peak = c_high
                 # Live bot had atr_14 = 2.0, so the cap is 1.2 * 2.0 = 2.40
-                sl_limit = max(min(3.4 * std_error, 1.2 * current_atr), sl_floor)
+                sl_limit = max(min(3.4 * std_error, 1.2 * current_atr), 2.0)
                 target_tp = kf_price + 3.0 * std_error
                 
                 if c_low <= entry_price - sl_limit:
@@ -207,7 +207,7 @@ def run_simulation(df, daily_tr, sorted_days, test_days, floor_mode='fixed_2.0',
                         
             elif pos == -1:
                 if c_low < peak or peak == 0: peak = c_low
-                sl_limit = max(min(3.4 * std_error, 1.2 * current_atr), sl_floor)
+                sl_limit = max(min(3.4 * std_error, 1.2 * current_atr), 2.0)
                 target_tp = kf_price - 3.0 * std_error
                 
                 if c_high >= entry_price + sl_limit:

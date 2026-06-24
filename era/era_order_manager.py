@@ -3157,10 +3157,7 @@ class ERAOrderManager:
                             bb_tp = self.bb_upper  # LONG 익절: 상단 밴드 터치
                             if pnl_pt <= -sl_limit:
                                 self.futures_day_consecutive_losses += 1
-                                if self.futures_day_consecutive_losses >= 3:
-                                    self.futures_day_trade_count = self.futures_max_trades_day
-                                    if notifier:
-                                        notifier.send_message("🚨 <b>[주간선물 거래정지]</b>\n3회 연속 손실 발생으로 인해 금일 주간 거래가 정지되었습니다.")
+                                # BB 전략은 3회 연속 손절 시에도 당일 거래정지(Circuit Breaker)를 생략합니다.
                                 print(f"[주간선물(BB)] 🛑 LONG 손절! 진입:{entry:.2f} 현재:{current_price:.2f} 손실:{pnl_pt:+.2f}pt (SL:{sl_limit:.2f}pt)")
                                 self.save_futures_exit_state()
                                 self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
@@ -3297,10 +3294,7 @@ class ERAOrderManager:
                             bb_tp = self.bb_lower  # SHORT 익절: 하단 밴드 터치
                             if pnl_pt <= -sl_limit:
                                 self.futures_day_consecutive_losses += 1
-                                if self.futures_day_consecutive_losses >= 3:
-                                    self.futures_day_trade_count = self.futures_max_trades_day
-                                    if notifier:
-                                        notifier.send_message("🚨 <b>[주간선물 거래정지]</b>\n3회 연속 손실 발생으로 인해 금일 주간 거래가 정지되었습니다.")
+                                # BB 전략은 3회 연속 손절 시에도 당일 거래정지(Circuit Breaker)를 생략합니다.
                                 print(f"[주간선물(BB)] 🛑 SHORT 손절! 진입:{entry:.2f} 현재:{current_price:.2f} 손실:{pnl_pt:+.2f}pt (SL:{sl_limit:.2f}pt)")
                                 self.save_futures_exit_state()
                                 self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
@@ -3396,7 +3390,9 @@ class ERAOrderManager:
 
         # ── 신규 진입 조건 (09:00 장 초반 15분 노이즈 필터 연동) ──
         if not self.futures_order_locked and not self.system_halted:
-            if self.futures_day_trade_count >= self.futures_max_trades_day:
+            # Parabolic SAR / Bollinger Band 전략은 거래 횟수 제한 제외
+            is_unlimited = getattr(self, "futures_strategy_type", "") in ["parabolic_sar", "bollinger_band"]
+            if not is_unlimited and self.futures_day_trade_count >= self.futures_max_trades_day:
                 return
             is_after_9 = (now.hour == 9 and now.minute >= 0) or (now.hour > 9)
             if is_after_9:
@@ -3638,7 +3634,9 @@ class ERAOrderManager:
 
         # ── 신규 진입 조건 ──
         if not self.futures_night_order_locked and not self.system_halted:
-            if self.futures_night_trade_count >= self.futures_max_trades_night:
+            # Parabolic SAR / Bollinger Band 전략은 거래 횟수 제한 제외
+            is_unlimited = getattr(self, "futures_strategy_type", "") in ["parabolic_sar", "bollinger_band"]
+            if not is_unlimited and self.futures_night_trade_count >= self.futures_max_trades_night:
                 return
             # [AMATS 최적화] 초저변동성 구간 진입 차단 필터링 (ATR Cutoff)
             atr_val = getattr(self, 'futures_atr_14', 2.0)
