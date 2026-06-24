@@ -33,12 +33,12 @@ def load_data(db_path):
         print(f"데이터 로드 에러: {e}")
         return pd.DataFrame()
 
-def run_backtest_with_k(df, K, stop_loss_pt=2.0, take_profit_pt=5.0):
+def run_backtest_with_k(df, K, stop_loss_pt=5.0, take_profit_pt=10.0):
     """
     ERA 실전 로직과 동일한 백테스트:
       - 진입: K값 변동성 돌파 (high/low >= target)
-      - 손절: -stop_loss_pt (기본 2.0pt)
-      - 익절: +take_profit_pt (기본 5.0pt)
+      - 손절: -stop_loss_pt (기본 5.0pt)
+      - 익절: +take_profit_pt (기본 10.0pt)
       - 강제 청산: 08:45~08:50
     """
     if len(df) < 50:
@@ -152,7 +152,7 @@ def run_backtest_with_k(df, K, stop_loss_pt=2.0, take_profit_pt=5.0):
     }
 
 def optimize():
-    print(f"[{datetime.now()}] ERA 실전 로직 반영 K값 최적화 시작 (손절 2pt / 익절 5pt)...")
+    print(f"[{datetime.now()}] ERA 실전 로직 반영 K값 최적화 시작 (손절 5pt / 익절 10pt)...")
     db_path = os.path.join(workspace_root, "futures_data.db")
     df = load_data(db_path)
     if df.empty:
@@ -229,8 +229,8 @@ def optimize():
         'approved_at':     approved_time,
         'strategy':       'era_realworld_v1',
         'best_k':         best_k,
-        'stop_loss_pt':   2.0,
-        'take_profit_pt': 5.0,
+        'stop_loss_pt':   5.0,
+        'take_profit_pt': 10.0,
         'top_strategies': top_results,
     }
 

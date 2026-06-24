@@ -433,7 +433,10 @@ def main():
     # Month-by-month performance breakdown
     monthly_data = pd.DataFrame({'equity': portfolio_equity})
     monthly_data.index = pd.to_datetime(monthly_data.index)
-    monthly_grouped = monthly_data.resample('M').last()
+    try:
+        monthly_grouped = monthly_data.resample('ME').last()
+    except ValueError:
+        monthly_grouped = monthly_data.resample('M').last()
     
     print("\n[월별 성과 분해]")
     print(f" {'연월':<8} │ {'자산 가치 (원)':>16} │ {'월 수익률':>10} │ {'누적 수익률':>12}")

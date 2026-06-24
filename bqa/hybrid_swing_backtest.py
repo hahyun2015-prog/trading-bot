@@ -44,7 +44,7 @@ def run_backtest_individual(exit_ma_period):
                     sell_date = next_row['date']
                     
                     pnl_pct = ((sell_price / buy_price) - 1.0) * 100
-                    pnl_pct_net = pnl_pct - 0.20 # round trip trading cost (slippage + tax)
+                    pnl_pct_net = pnl_pct - 0.18 # round trip trading cost (slippage + tax)
                     
                     all_trades.append({
                         'code': code,
@@ -109,7 +109,7 @@ def run_backtest_hybrid():
                     sell_date = next_row['date']
                     
                     pnl_pct = ((sell_price / buy_price) - 1.0) * 100
-                    pnl_pct_net = pnl_pct - 0.20
+                    pnl_pct_net = pnl_pct - 0.18
                     
                     all_trades.append({
                         'code': code,
@@ -140,7 +140,7 @@ def run_backtest_hybrid():
                     pnl_1 = ((half_sell_price / buy_price) - 1.0) * 100
                     pnl_2 = ((sell_price / buy_price) - 1.0) * 100
                     pnl_combined = 0.5 * pnl_1 + 0.5 * pnl_2
-                    pnl_pct_net = pnl_combined - 0.20
+                    pnl_pct_net = pnl_combined - 0.18
                     
                     all_trades.append({
                         'code': code,

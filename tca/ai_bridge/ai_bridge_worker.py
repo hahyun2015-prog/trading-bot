@@ -209,8 +209,8 @@ JSON schema:
 }}
 """
 
-    # Gemini REST API 호출
-    api_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key={api_key}"
+    # Gemini REST API 호출 (모델 풀백 루프 적용)
+    models_to_try = ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-2.0-flash"]
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{
@@ -222,10 +222,27 @@ JSON schema:
 
     ai_analysis = "분석 실패"
     success = False
+    res_json = None
+    
+    for model in models_to_try:
+        api_url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={api_key}"
+        try:
+            print(f"[AI Worker] Trying model {model}...")
+            response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+            if response.status_code == 200:
+                res_json = response.json()
+                print(f"[AI Worker] Model {model} succeeded.")
+                break
+            else:
+                err_desc = response.json().get("error", {}).get("message", "Unknown error")
+                print(f"[AI Worker] Model {model} failed: {err_desc}")
+        except Exception as e:
+            print(f"[AI Worker] Model {model} request exception: {e}")
+
+    if res_json is None:
+        raise ValueError("모든 Gemini 모델 호출에 실패하여 분석을 완료할 수 없습니다.")
     
     try:
-        response = requests.post(api_url, headers=headers, json=payload, timeout=30)
-        res_json = response.json()
         
         # 텍스트 추출
         text_response = res_json['candidates'][0]['content']['parts'][0]['text'].strip()

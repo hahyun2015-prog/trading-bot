@@ -118,6 +118,9 @@ class TCAController:
             self.bot_token = dev_token if (dev_token and env != "live") else telegram_cfg.get("bot_token", "")
             self.allowed_chat_id = telegram_cfg.get("allowed_chat_id", 0)
             self.trading_mode = config.get("trading_mode", "both")
+            self.features = config.get("features", {})
+            self.futures_settings = config.get("futures_settings", {})
+            self.isf_configs = config.get("individual_stock_futures", [])
 
             # venv32 경로
             venv32_rel = config.get("paths", {}).get("venv32_path", "venv32")
@@ -145,6 +148,8 @@ class TCAController:
             self.bot_token = ""
             self.allowed_chat_id = 0
             self.trading_mode = "both"
+            self.features = {}
+            self.isf_configs = []
             self.venv32_path = os.path.join(workspace_root, "venv32")
             self.smb_path = ""
             self.gdrive_path = ""
@@ -222,7 +227,27 @@ class TCAController:
             try:
                 with open(self.era_pid_file, "r") as f:
                     pid = f.read().strip()
-                subprocess.run(f"taskkill /f /pid {pid}", shell=True)
+                if not pid:
+                    return False
+                pid_int = int(pid)
+                
+                import psutil
+                try:
+                    if psutil.pid_exists(pid_int):
+                        proc = psutil.Process(pid_int)
+                        cmdline = proc.cmdline()
+                        is_era = any("era_order_manager" in arg for arg in cmdline)
+                        if is_era:
+                            proc.kill()
+                            proc.wait(timeout=3)
+                except (psutil.NoSuchProcess, psutil.AccessDenied) as pe:
+                    print(f"[TCA] Process kill exception: {pe}")
+
+                # 프로세스가 실제로 종료되었는지 최종 검증
+                if psutil.pid_exists(pid_int):
+                    print(f"[TCA] ERA 프로세스(PID: {pid}) 종료 실패 (권한 부족 등)")
+                    return False
+
                 try:
                     os.remove(self.era_pid_file)
                 except OSError:
@@ -263,11 +288,21 @@ class TCAController:
                 except Exception:
                     pass
                 
+            cmds = []
+            if self.trading_mode in ('stock', 'both'):
+                cmds.append("!주식현황")
+            if self.trading_mode in ('futures', 'both'):
+                cmds.append("!선물현황")
+            if self.trading_mode in ('futures', 'both') and self.isf_configs:
+                cmds.append("!ISF상태")
+            cmds.append("!최적화결과")
+            cmd_str = ", ".join(cmds)
+
             msg = (
                 "📊 <b>[AMATS 통합 시스템 가동 상태]</b>\n\n"
                 f"💼 ERA 주문/리스크 엔진: {era_status}\n"
                 f"📱 TCA 중앙 관제 컨트롤러: {tca_status}\n\n"
-                "<i>(명령어: !주식현황, !선물현황, !최적화결과)</i>"
+                f"<i>(명령어: {cmd_str})</i>"
             )
             return msg
         except Exception as e:
@@ -337,13 +372,23 @@ class TCAController:
             avail_balance = data.get("futures_balance", 0)
             positions = data.get("futures_positions", {})
             
-            k_val = data.get("futures_strategy", {}).get("K")
-            prev_range = data.get("futures_strategy", {}).get("prev_range")
-            
+            strat_info = data.get("futures_strategy", {})
+            k_val = strat_info.get("K")
+            prev_range = strat_info.get("prev_range")
+            strat_type = strat_info.get("strategy_type", "volatility_breakout")
+
             msg = f"📉 <b>[국내 선물 계좌 현황]</b>\n"
             msg += f"💸 주문가능 현금: {avail_balance:,}원\n"
             msg += f"🛡️ 위탁증거금 30% 캡 가용액: {int(avail_balance * 0.3):,}원\n"
-            if k_val is not None:
+            if strat_type == "kalman":
+                trend = strat_info.get("trend_direction", "NEUTRAL")
+                night_trend = strat_info.get("night_trend_direction", "NEUTRAL")
+                std_error = strat_info.get("std_error", 0.5)
+                kf_sl_mult = strat_info.get("kf_sl_mult", 3.4)
+                msg += f"🧠 전략: <b>칼만 필터(Kalman)</b>\n"
+                msg += f"📐 주간 추세: <b>{trend}</b> | 야간 추세: <b>{night_trend}</b>\n"
+                msg += f"📊 잔차 표준편차: {std_error:.2f} | 손절 배수: {kf_sl_mult:.1f}배 (하이브리드 동적) | 익절: 동적 3-Sigma\n"
+            elif k_val is not None:
                 msg += f"🎯 현재 적용 K값: <b>{k_val:.2f}</b>"
                 if prev_range is not None:
                     msg += f" | 전일 Range: <b>{prev_range:.2f} pt</b>"
@@ -1141,11 +1186,15 @@ class TCAController:
                     
                 best_k = res_data.get('best_k', 0.5)
                 res_data['approved_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                
+
                 with open(self.active_strategy_file, "w", encoding="utf-8") as f:
                     json.dump(res_data, f, ensure_ascii=False, indent=4)
-                    
-                self.send_message(f"✅ <b>전략 핫-리로드 완료!</b>\n\n실전 선물 변동성 돌파 K값 매개변수(K={best_k})가 즉시 적용 승인되었습니다. ERA가 다음 사이클에 즉시 자동 로드합니다.")
+
+                strat_type = res_data.get('futures_strategy_type', self.futures_settings.get('futures_strategy_type', 'volatility_breakout'))
+                if strat_type == "kalman":
+                    self.send_message(f"✅ <b>전략 핫-리로드 완료!</b>\n\n실전 선물 칼만 필터(Kalman) 전략 매개변수가 즉시 적용 승인되었습니다. ERA가 다음 사이클에 즉시 자동 로드합니다.")
+                else:
+                    self.send_message(f"✅ <b>전략 핫-리로드 완료!</b>\n\n실전 선물 변동성 돌파 K값 매개변수(K={best_k})가 즉시 적용 승인되었습니다. ERA가 다음 사이클에 즉시 자동 로드합니다.")
             except Exception as e:
                 self.send_message(f"❌ 전략 승인 중 오류 발생: {e}")
 
@@ -1353,45 +1402,100 @@ class TCAController:
                 self.send_message(f"❌ ISF 방향 조회 오류: {e}")
 
         elif cmd_text == "/start" or cmd_text == "!도움말":
-            help_msg = (
-                "🤖 <b>AMATS AI 원격 제어 작동 시작</b>\n\n"
-                "<b>[실시간 관제]</b>\n"
-                "• <code>!상태</code> : 시스템 가동 여부 점검\n"
-                "• <code>!계좌확인</code> : 감지된 주식/선물 계좌 및 예수금 확인\n"
-                "• <code>!수익률</code> : 1주, 1달, 1분기, 1년 기간별 투자 수익률 분석\n"
-                "• <code>!주식현황</code> : 가상 파티셔닝(단타/스윙) 자금 및 수익률 브리핑\n"
-                "• <code>!선물현황</code> : KOSPI200 선물 포지션 현황 브리핑\n"
-                "• <code>!로그확인 [줄수]</code> : 실시간 매매 로그 확인 (기본 30줄)\n"
-                "• <code>!TCA로그 [줄수]</code> : 실시간 관제 로그 확인 (기본 30줄)\n\n"
-                "<b>[수동 제어]</b>\n"
-                "• <code>!매도 삼성전자</code> : 특정 종목 즉시 전량 청산\n"
-                "• <code>!전량매도</code> : 보유 중인 전 주식 시장가 청산\n"
-                "• <code>!선물매수</code> / <code>!선물매도</code> / <code>!선물청산</code> : 수동 선물 진입 및 청산\n"
-                "• <code>!계약수량 1</code> : 선물 계약 수량 수동 제어 (숫자/자동)\n"
-                "• <code>!시스템시작</code> / <code>!시스템종료</code> : 32비트 API 엔진 강제 온/오프\n"
-                "• <code>!재연동</code> / <code>!시스템재시작</code> : 시스템 통합 프로세스 정리 후 안전 재기동 (추천)\n\n"
-                "<b>[🚨 긴급 제어]</b>\n"
-                "• <code>!긴급정지</code> : 모든 포지션 청산 후 봇 완전 킬\n\n"
-                "<b>[📊 ISF 개별주식선물]</b>\n"
-                "• <code>!ISF상태</code> : 삼성전자/SK하이닉스 선물 설정·방향·포지션 확인\n"
-                "• <code>!ISF방향</code> : 오늘 NSAA 점수 기반 Long/Short/Neutral 방향 조회\n"
-                "• <code>!ISF코드 005930 선물코드</code> : 선물 코드 직접 입력\n\n"
-                "<b>[🔬 RSA AI 리서치]</b>\n"
-                "• <code>!RSA분석</code> : 테마 단타/스윙 후보 종목 AI 정밀 분석 (FAA·IRA·NSAA)\n"
-                "• <code>!연구개시</code> : 30일 주기 AI 퀀트 연구원 리포트 즉시 분석 및 발송\n\n"
-                "<b>[🧪 BQA 퀀트 최적화]</b>\n"
+            monitoring_items = [
+                "• <code>!상태</code> : 시스템 가동 여부 점검",
+                "• <code>!계좌확인</code> : 감지된 주식/선물 계좌 및 예수금 확인",
+                "• <code>!수익률</code> : 1주, 1달, 1분기, 1년 기간별 투자 수익률 분석"
+            ]
+            
+            show_stock = self.trading_mode in ('stock', 'both')
+            if show_stock:
+                monitoring_items.append("• <code>!주식현황</code> : 가상 파티셔닝(단타/스윙) 자금 및 수익률 브리핑")
+                
+            show_futures = self.trading_mode in ('futures', 'both')
+            if show_futures:
+                monitoring_items.append("• <code>!선물현황</code> : KOSPI200 선물 포지션 현황 브리핑")
+                
+            monitoring_items.extend([
+                "• <code>!로그확인 [줄수]</code> : 실시간 매매 로그 확인 (기본 30줄)",
+                "• <code>!TCA로그 [줄수]</code> : 실시간 관제 로그 확인 (기본 30줄)"
+            ])
+            
+            # 2. 수동 제어 파트 구성
+            control_items = []
+            if show_stock:
+                control_items.append("• <code>!매도 삼성전자</code> : 특정 종목 즉시 전량 청산")
+                control_items.append("• <code>!전량매도</code> : 보유 중인 전 주식 시장가 청산")
+            if show_futures:
+                control_items.append("• <code>!선물매수</code> / <code>!선물매도</code> / <code>!선물청산</code> : 수동 선물 진입 및 청산")
+                control_items.append("• <code>!계약수량 1</code> : 선물 계약 수량 수동 제어 (숫자/자동)")
+                
+            control_items.extend([
+                "• <code>!시스템시작</code> / <code>!시스템종료</code> : 32비트 API 엔진 강제 온/오프",
+                "• <code>!재연동</code> / <code>!시스템재시작</code> : 시스템 통합 프로세스 정리 후 안전 재기동 (추천)"
+            ])
+            
+            # 3. 🚨 긴급 제어
+            emergency_items = [
+                "• <code>!긴급정지</code> : 모든 포지션 청산 후 봇 완전 킬"
+            ]
+            
+            # 4. ISF 개별주식선물 파트 (설정이 있을 때만 표시)
+            isf_active = show_futures and bool(self.isf_configs)
+            isf_text = ""
+            if isf_active:
+                isf_text = (
+                    "\n<b>[📊 ISF 개별주식선물]</b>\n"
+                    "• <code>!ISF상태</code> : 삼성전자/SK하이닉스 선물 설정·방향·포지션 확인\n"
+                    "• <code>!ISF방향</code> : 오늘 NSAA 점수 기반 Long/Short/Neutral 방향 조회\n"
+                    "• <code>!ISF코드 005930 선물코드</code> : 선물 코드 직접 입력\n"
+                )
+                
+            # 5. RSA AI 리서치
+            rsa_text = (
+                "\n<b>[🔬 RSA AI 리서치]</b>\n"
+                "• <code>!RSA분석</code> : 후보 종목 AI 정밀 분석 (FAA·IRA·NSAA)\n"
+                "• <code>!연구개시</code> : 30일 주기 AI 퀀트 연구원 리포트 즉시 분석 및 발송\n"
+            )
+            
+            # 6. BQA 퀀트 최적화
+            bqa_text = (
+                "\n<b>[🧪 BQA 퀀트 최적화]</b>\n"
                 "• <code>!백테스트시작</code> : K값 스위핑 백테스트 강제 구동\n"
                 "• <code>!최적화결과</code> : 최적화 완료된 상위 CAGR 매개변수 브리핑\n"
-                "• <code>!전략승인</code> : 최적 K값 파라미터 실전 즉시 적용 승인\n\n"
-                "<b>[🔁 시스템 코드 업데이트]</b>\n"
+                "• <code>!전략승인</code> : 최적 K값 파라미터 실전 즉시 적용 승인\n"
+            )
+            
+            # 7. 시스템 코드 업데이트 및 AI 자율 디버깅
+            system_items = (
+                "\n<b>[🔁 시스템 코드 업데이트]</b>\n"
                 "• <code>!버전확인</code> : 현재 코드 버전 및 최근 커밋 확인\n"
                 "• <code>!코드업데이트</code> : GitHub 최신 코드를 시스템에 즉시 적용 (git pull)\n\n"
                 "<b>[🤖 AI 자율 디버깅]</b>\n"
                 "• <code>!AI점검 [원하는 지시]</code> : 자연어로 원격 코드 복구 및 에러 점검\n"
-                "  (예: <code>!AI점검 선물 매니저 오류 고쳐줘</code>)\n\n"
-                "<b>[⚠️ RDP 연결 해제 주의사항]</b>\n"
+                "  (예: <code>!AI점검 선물 매니저 오류 고쳐줘</code>)\n"
+            )
+            
+            # RDP 주의사항
+            rdp_warning = (
+                "\n<b>[⚠️ RDP 연결 해제 주의사항]</b>\n"
                 "• 원격 데스크톱(RDP) 세션 종료 시 일반 [X] 버튼으로 닫으면 GUI 기반 Kiwoom API가 차단될 수 있습니다.\n"
                 "• 반드시 바탕화면 또는 시스템의 <code>disconnect_rdp_keep_alive.bat</code> 배치 파일을 실행하여 세션을 해제해주세요."
+            )
+            
+            help_msg = (
+                "🤖 <b>AMATS AI 원격 제어 작동 시작</b>\n\n"
+                "<b>[실시간 관제]</b>\n"
+                + "\n".join(monitoring_items) + "\n\n"
+                + "<b>[수동 제어]</b>\n"
+                + "\n".join(control_items) + "\n\n"
+                + "<b>[🚨 긴급 제어]</b>\n"
+                + "\n".join(emergency_items)
+                + isf_text
+                + rsa_text
+                + bqa_text
+                + system_items
+                + rdp_warning
             )
             self.send_message(help_msg)
 
@@ -1418,6 +1522,22 @@ class TCAController:
             print(f"[TCA] RSA 분석 실행 실패: {e}")
             return False
 
+    def _create_session(self):
+        """TCP 연결 재사용을 위한 requests.Session 생성"""
+        session = requests.Session()
+        # keep-alive 연결 풀링으로 Read Timeout 대폭 감소
+        adapter = requests.adapters.HTTPAdapter(
+            max_retries=requests.packages.urllib3.util.retry.Retry(
+                total=2,
+                backoff_factor=1,
+                status_forcelist=[502, 503, 504]
+            ),
+            pool_connections=1,
+            pool_maxsize=2
+        )
+        session.mount('https://', adapter)
+        return session
+
     def run_controller(self):
         print("==================================================")
         print("   TCA Central Controller (Waiting for commands)")
@@ -1429,6 +1549,7 @@ class TCAController:
         offset = None
         fail_count = 0
         first_run = True
+        session = self._create_session()
         
         while True:
             # ── Daily RSA 분석 자율 스케줄러 감시 ──
@@ -1539,12 +1660,16 @@ class TCAController:
             if first_run:
                 print("[TCA] 최초 기동: 이전 백로그 청소 중...")
                 try:
-                    response = requests.get(f"{self.base_url}/getUpdates", params={'timeout': 1}, timeout=5)
+                    response = session.get(f"{self.base_url}/getUpdates", params={'timeout': 1}, timeout=5)
                     data = response.json()
                     if data.get("ok") and data["result"]:
                         max_update_id = max(r["update_id"] for r in data["result"])
                         offset = max_update_id + 1
                         print(f"[TCA] 이전 백로그 {len(data['result'])}개 청소 완료. Next Offset: {offset}")
+                    elif not data.get("ok") and data.get("error_code") == 409:
+                        # 409 Conflict: 다른 봇 인스턴스가 getUpdates를 호출 중
+                        print(f"[TCA 경고] 409 Conflict 감지 - 다른 봇 인스턴스와 충돌. 3초 후 재시도...")
+                        time.sleep(3)
                 except Exception as ex:
                     print(f"[TCA] 백로그 청소 실패: {ex}")
                 first_run = False
@@ -1556,7 +1681,7 @@ class TCAController:
                 if offset:
                     params['offset'] = offset
                     
-                response = requests.get(url, params=params, timeout=40)
+                response = session.get(url, params=params, timeout=40)
                 data = response.json()
                 fail_count = 0
                 
@@ -1596,24 +1721,49 @@ class TCAController:
                     error_desc = data.get("description", "Unknown error")
                     err_code = data.get("error_code", "Unknown code")
                     print(f"[TCA ERROR] Telegram API returned ok=False. Code: {err_code}, Description: {error_desc}")
-                    time.sleep(10)
+                    
+                    # 409 Conflict: 다른 봇 인스턴스의 getUpdates와 충돌
+                    if err_code == 409:
+                        print("[TCA] 409 Conflict 자동 복구: 세션 재생성 및 백로그 재청소 후 재시도합니다.")
+                        session.close()
+                        session = self._create_session()
+                        time.sleep(3)
+                        # 백로그 재청소로 offset 갱신
+                        try:
+                            resp = session.get(f"{self.base_url}/getUpdates", params={'timeout': 1}, timeout=5)
+                            rdata = resp.json()
+                            if rdata.get("ok") and rdata["result"]:
+                                offset = max(r["update_id"] for r in rdata["result"]) + 1
+                                print(f"[TCA] 409 복구 완료. New Offset: {offset}")
+                        except Exception as ex:
+                            print(f"[TCA] 409 복구 중 백로그 청소 실패: {ex}")
+                    else:
+                        time.sleep(10)
                             
             except Exception as e:
                 print(f"Exception: {e}")
                 fail_count += 1
                 if fail_count >= 5:
-                    print(f"[TCA 에러] 5회 연속 통신 실패. 재연결 대기.")
+                    print(f"[TCA] 5회 연속 통신 실패. HTTP 세션을 재생성합니다...")
+                    session.close()
+                    session = self._create_session()
+                    fail_count = 0
                     time.sleep(10)
-                time.sleep(5)
+                else:
+                    time.sleep(5)
 
 if __name__ == "__main__":
-    import socket
-    # 물리적 소켓 바인딩 락 (Port: 9990) - Singleton 보장
+    # ── Singleton 보장: 파일 잠금 (msvcrt exclusive lock) ──
+    # 소켓 바인딩보다 더 신뢰할 수 있는 Windows 파일 잠금 사용
+    import msvcrt
+    _lock_file_path = os.path.join(current_dir, "tca.lock")
     try:
-        _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        _lock_socket.bind(('127.0.0.1', 9990))
-    except socket.error:
-        print("[TCA ERROR] 이미 다른 TCA 컨트롤러가 실행 중입니다 (Port 9990 Lock). 실행을 중단합니다.")
+        _lock_fh = open(_lock_file_path, "w")
+        msvcrt.locking(_lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+        _lock_fh.write(str(os.getpid()))
+        _lock_fh.flush()
+    except (IOError, OSError):
+        print("[TCA] 이미 다른 TCA 컨트롤러가 실행 중입니다 (File Lock). 중복 실행을 방지하고 종료합니다.")
         sys.exit(0)
 
     tca_pid_file = os.path.join(current_dir, "tca.pid")
@@ -1631,13 +1781,8 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[TCA] 절전 방지 실패: {e}")
 
-    # Ensure Windows Task Scheduler task is enabled on startup
-    try:
-        import subprocess
-        subprocess.run('schtasks /change /tn "AMATS AutoStart" /enable', shell=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-        print("[TCA] AMATS AutoStart 스케줄러 자동 활성화 완료.")
-    except Exception as e:
-        print(f"[TCA] 스케줄러 활성화 실패: {e}")
+    # Note: schtasks /enable은 여기서 호출하지 않음 (startup.bat 재트리거로 인한 중복 실행 방지)
+    # !재연동 명령에서 disable/enable 쌍이 필요한 경우에만 명시적으로 처리합니다.
 
     try:
         controller = TCAController()

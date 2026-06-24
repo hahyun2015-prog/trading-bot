@@ -260,7 +260,7 @@ STOP_LOSS_PCT   = 0.02   # -2%
 TAKE_PROFIT_PCT = 0.03   # +3%
 VOL_MULT        = 1.5    # 거래량 1.5배 조건
 BREAKOUT_PCT    = 0.02   # 시가 +2% 돌파 조건
-FEE_RATE        = 0.0015 # 증권사 수수료 + 거래세 합산
+FEE_RATE        = 0.0018 # 2025년 기준: 수수료 왕복 0.03% + 거래세 0.15%
 
 def _load_stock(db_path):
     conn = sqlite3.connect(db_path)

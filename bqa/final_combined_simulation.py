@@ -511,7 +511,7 @@ def main():
     # Monthly breakdown
     monthly_data = pd.DataFrame({'equity': portfolio_equity})
     monthly_data.index = pd.to_datetime(monthly_data.index)
-    monthly_grouped = monthly_data.resample('M').last()
+    monthly_grouped = monthly_data.resample('ME').last()
 
     print("\n[월별 종합 성과 추이]")
     print(f" {'연월':<8} │ {'자산 평가액 (원)':>18} │ {'월 수익률':>10} │ {'누적 수익률':>12}")

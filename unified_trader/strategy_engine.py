@@ -23,11 +23,16 @@ def calculate_vwap(df):
     """당일 기준 VWAP (Volume Weighted Average Price) 계산"""
     df['date_only'] = df.index.date
     df['typ_price'] = (df['high'] + df['low'] + df['close']) / 3
-    def _group_vwap(x):
-        cum_vol = x['volume'].cumsum()
-        cum_vol = cum_vol.where(cum_vol > 0, 1)  # volume=0 봉으로 인한 ZeroDivision 방지
-        return (x['typ_price'] * x['volume']).cumsum() / cum_vol
-    df['vwap'] = df.groupby('date_only').apply(_group_vwap).reset_index(level=0, drop=True)
+    df['typ_price_vol'] = df['typ_price'] * df['volume']
+    
+    # groupby-cumsum 연산을 통한 벡터화 계산 (apply 배제로 에러 방지 및 속도 향상)
+    cum_vol = df.groupby('date_only')['volume'].cumsum()
+    cum_vol = cum_vol.where(cum_vol > 0, 1)  # volume=0 봉으로 인한 ZeroDivision 방지
+    
+    df['vwap'] = df.groupby('date_only')['typ_price_vol'].cumsum() / cum_vol
+    
+    # 임시 컬럼 정리
+    df.drop(columns=['typ_price_vol'], inplace=True, errors='ignore')
     return df
 
 def apply_rsi(df, window=14):

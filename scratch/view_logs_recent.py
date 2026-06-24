@@ -8,7 +8,7 @@ def print_tail(title, path, num_lines=50):
         print("File does not exist.")
         return
     try:
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        with open(path, 'r', encoding='cp949', errors='ignore') as f:
             lines = f.readlines()
             tail_lines = lines[-num_lines:]
             for line in tail_lines:

@@ -462,7 +462,14 @@ class ERAOrderManager:
         self.pending_5ma_checks = []
         self.today_5ma_checked = False
         self._daily_reset_done_date = ""   # 09:00 일일 리셋 중복 실행 방지
-        self._night_reset_done_date = ""   # 18:00/05:00 야간 리셋 중복 실행 방지
+        self._night_reset_done_date = ""   # 05:00 야간 리셋 중복 실행 방지
+        self._night_start_done_date = ""   # 18:00 야간 세션 시작 중복 실행 방지
+        self.futures_day_consecutive_losses = 0
+        self.futures_night_consecutive_losses = 0
+        self.futures_day_trade_count = 0
+        self.futures_night_trade_count = 0
+        self.futures_max_trades_day = 4
+        self.futures_max_trades_night = 4
 
         # 월간 MDD 자동 중단 (월간 손실 25% 초과 시 Kill Switch)
         self.stock_monthly_loss = 0
@@ -519,20 +526,32 @@ class ERAOrderManager:
         self.futures_day_open     = 0.0
         self.futures_target_long  = float('inf')
         self.futures_target_short = float('-inf')
+        self.futures_tp_price_long = 0.0        # Overshoot 3-Sigma 주간 LONG 익절 타겟
+        self.futures_tp_price_short = 0.0       # Overshoot 3-Sigma 주간 SHORT 익절 타겟
         self.futures_order_locked = False
         self.futures_day_entry_price = 0.0  # 주간 진입가 기록
         self.futures_day_peak = 0.0         # [대안 C] 주간 트레일링 스탑용 최고/최저가 추적
         self.futures_last_long_exit_price = 0.0  # 재진입 방지용 최종 청산가
         self.futures_last_short_exit_price = 0.0
+        self.futures_std_error = 0.5            # Kalman Filter 최근 주간 잔차 표준편차
+        self.futures_kf_sl_mult = 3.4           # Kalman Filter 하이브리드 손절 배수 (최적값 3.4)
+        self.futures_trend_direction = "NEUTRAL" # 60분봉 장기 칼만 추세 필터
+        self.futures_day_session_high = 0.0     # 금일 주간 세션 고가
+        self.futures_day_session_low = 0.0      # 금일 주간 세션 저가
 
         # 야간 선물 (18:00 ~ 익일 04:45)
         self.futures_night_open         = 0.0
         self.futures_night_target_long  = float('inf')
         self.futures_night_target_short = float('-inf')
+        self.futures_night_tp_price_long = 0.0   # Overshoot 3-Sigma 야간 LONG 익절 타겟
+        self.futures_night_tp_price_short = 0.0  # Overshoot 3-Sigma 야간 SHORT 익절 타겟
         self.futures_night_order_locked = False
         self.futures_night_entry_price = 0.0  # 야간 진입가 기록
+        self.futures_night_peak = 0.0         # 야간 트레일링 스탑용 최고/최저가 추적
         self.futures_night_last_long_exit_price = 0.0  # 야간 재진입 방지용 최종 청산가
         self.futures_night_last_short_exit_price = 0.0
+        self.futures_night_std_error = 0.5      # Kalman Filter 최근 야간 잔차 표준편차
+        self.futures_night_trend_direction = "NEUTRAL"
 
         # ── STA 통합: 테마 크롤링 + 실시간 OHLCV ─────────────────────────
         self.theme_stocks = {}        # {code: name} 오늘 실시간 구독 종목
@@ -620,19 +639,182 @@ class ERAOrderManager:
             daily['tr'] = np.maximum(daily['high'] - daily['low'], 
                                      np.maximum(abs(daily['high'] - daily['close'].shift(1)), 
                                                 abs(daily['low'] - daily['close'].shift(1))))
-            atr_14 = daily['tr'].rolling(14).mean().iloc[-1]
+            # 1차원 칼만 필터를 적용하여 지연 없는 변동성(Kalman ATR) 산출
+            kf_atr = None
+            P_atr = 1.0
+            Q_atr = 0.002
+            R_atr = 0.2
+            for tr_val in daily['tr'].values:
+                if kf_atr is None:
+                    kf_atr = tr_val
+                else:
+                    P_atr = P_atr + Q_atr
+                    K_atr = P_atr / (P_atr + R_atr)
+                    kf_atr = kf_atr + K_atr * (tr_val - kf_atr)
+                    P_atr = (1 - K_atr) * P_atr
             
-            if pd.isna(atr_14) or atr_14 <= 0:
+            atr_val = kf_atr
+            if pd.isna(atr_val) or atr_val <= 0:
                 return
                 
             # 동적 SL / TP 연산 (손절 = 1.0 * ATR, 익절 = 2.0 * ATR)
-            self.futures_stop_loss_pt = max(round(atr_14 * 1.0, 2), 2.0)
-            self.futures_take_profit_pt = max(round(atr_14 * 2.0, 2), 4.0)
-            self.futures_atr_14 = float(atr_14)
+            self.futures_stop_loss_pt = max(round(atr_val * 1.0, 2), 2.0)
+            self.futures_take_profit_pt = max(round(atr_val * 2.0, 2), 4.0)
+            self.futures_atr_14 = float(atr_val)
             
-            print(f"[AMATS 파생 최적화] 선물 동적 ATR 적용 완료: 14일 ATR={atr_14:.2f}pt ➡️ 손절={self.futures_stop_loss_pt}pt | 익절={self.futures_take_profit_pt}pt")
+            print(f"[AMATS 파생 최적화] 선물 동적 Kalman ATR 적용 완료: Kalman ATR={atr_val:.2f}pt ➡️ 손절={self.futures_stop_loss_pt}pt | 익절={self.futures_take_profit_pt}pt")
         except Exception as dynamic_err:
             print(f"[AMATS 파생 최적화] 동적 익손절 계산 에러 (기본 고정값 유지): {dynamic_err}")
+
+    def _get_today_futures_high_low(self, code):
+        """오늘 주간 5분봉 중 최고가와 최저가를 DB에서 조회"""
+        try:
+            today_str = datetime.now().strftime("%Y%m%d")
+            conn = sqlite3.connect(self.futures_db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            cursor = conn.cursor()
+            for query_code in [code, self.futures_prefix + "00000", "10500000", "10100000"]:
+                cursor.execute(
+                    "SELECT MAX(high), MIN(low) FROM futures_ohlcv WHERE code = ? AND date LIKE ?",
+                    (query_code, today_str + "%")
+                )
+                row = cursor.fetchone()
+                if row and row[0] is not None and row[1] is not None:
+                    conn.close()
+                    return float(row[0]), float(row[1])
+            conn.close()
+        except Exception as e:
+            print(f"[주간선물] 금일 고/저가 DB 조회 실패: {e}")
+        return 0.0, 0.0
+
+    def update_kalman_targets(self, code):
+        """로컬 DB의 최근 5분봉 데이터를 활용해 칼만 필터 예측값 및 오차 표준편차를 구하고 돌파 타점을 설정하며, 60분봉 장기 추세 필터를 계산합니다."""
+        try:
+            import sqlite3
+            import pandas as pd
+            import numpy as np
+            
+            if not os.path.exists(self.futures_db_path):
+                print(f"[ERA 칼만] DB 파일 없음: {self.futures_db_path}")
+                return
+                
+            conn = sqlite3.connect(self.futures_db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            
+            # 최근 300개 5분봉 조회 (60분봉 리샘플링을 위한 충분한 윈도우 확보)
+            df = pd.read_sql(
+                "SELECT date, close FROM futures_ohlcv WHERE code = ? ORDER BY date DESC LIMIT 300",
+                conn,
+                params=(code,)
+            )
+            conn.close()
+            
+            if df.empty or len(df) < 40:
+                print(f"[ERA 칼만] 데이터 부족 ({len(df)}개)")
+                return
+                
+            # 시간순(과거 -> 현재) 정렬
+            df = df.iloc[::-1].reset_index(drop=True)
+            
+            # 단계 1. 단기 5분봉 칼만 필터 예측값 계산 (상위 40개 활용)
+            df_short = df.tail(40).reset_index(drop=True)
+            closes_short = df_short['close'].values
+            
+            q = getattr(self, 'futures_kf_q', 0.0001)
+            r = getattr(self, 'futures_kf_r', 0.5)
+            mult = getattr(self, 'futures_kf_mult', 1.0)
+            
+            kf_prices = []
+            x = None
+            P = 1.0
+            for z in closes_short:
+                if x is None:
+                    x = z
+                else:
+                    P = P + q
+                    K = P / (P + r)
+                    x = x + K * (z - x)
+                    P = (1 - K) * P
+                kf_prices.append(x)
+                
+            kf_prices = np.array(kf_prices)
+            errors = closes_short - kf_prices
+            
+            std_error = np.std(errors[-20:])
+            if pd.isna(std_error) or std_error <= 0:
+                std_error = 0.5
+                
+            kf_price = kf_prices[-1]
+            band = std_error * mult
+            
+            # 단계 2. 60분봉 리샘플링 장기 칼만 추세 필터 계산
+            trend_direction = "NEUTRAL"
+            try:
+                df_temp = df.copy()
+                df_temp['dt'] = pd.to_datetime(df_temp['date'], format='%Y%m%d%H%M%S', errors='coerce')
+                df_resampled = df_temp.dropna(subset=['dt']).set_index('dt')
+                df_60m = df_resampled['close'].resample('60Min').last().dropna().reset_index()
+                
+                if len(df_60m) >= 5:
+                    closes_60m = df_60m['close'].values
+                    # 장기 칼만 필터 파라미터 (q_long=0.001, r_long=1.0)
+                    q_long = 0.001
+                    r_long = 1.0
+                    kf_long = []
+                    x_l = None
+                    P_l = 1.0
+                    for z_l in closes_60m:
+                        if x_l is None:
+                            x_l = z_l
+                        else:
+                            P_l = P_l + q_long
+                            K_l = P_l / (P_l + r_long)
+                            x_l = x_l + K_l * (z_l - x_l)
+                            P_l = (1 - K_l) * P_l
+                        kf_long.append(x_l)
+                    
+                    if len(kf_long) >= 2:
+                        slope = kf_long[-1] - kf_long[-2]
+                        if slope > 0.01:
+                            trend_direction = "UP"
+                        elif slope < -0.01:
+                            trend_direction = "DOWN"
+                        else:
+                            trend_direction = "NEUTRAL"
+            except Exception as trend_err:
+                print(f"[ERA 칼만] 장기 추세 필터 연산 에러 (NEUTRAL 기본 설정): {trend_err}")
+            
+            # 주간/야간 구분하여 설정
+            is_night = (code == getattr(self, 'real_night_code', '10500000').replace("A", ""))
+            if getattr(self, 'real_day_code', '10100000').replace("A", "") == getattr(self, 'real_night_code', '10500000').replace("A", ""):
+                h = datetime.now().hour
+                is_night = (h >= 18) or (h < 5)
+                
+            if is_night:
+                old_trend = self.futures_night_trend_direction
+                self.futures_night_target_long = kf_price + band
+                self.futures_night_target_short = kf_price - band
+                self.futures_night_tp_price_long = kf_price + 3.0 * std_error
+                self.futures_night_tp_price_short = kf_price - 3.0 * std_error
+                self.futures_night_std_error = std_error
+                self.futures_night_trend_direction = trend_direction
+                print(f"[ERA 칼만 야간] 타점 설정 완료 | 코드={code} | KF={kf_price:.2f}pt | std_err={std_error:.2f}pt | band={band:.2f}pt | LONG={self.futures_night_target_long:.2f}pt | SHORT={self.futures_night_target_short:.2f}pt | 3Sig LONG TP={self.futures_night_tp_price_long:.2f}pt | 3Sig SHORT TP={self.futures_night_tp_price_short:.2f}pt | 장기추세(60M)={self.futures_night_trend_direction}")
+                if notifier and trend_direction != old_trend:
+                    notifier.send_message(f"📈 <b>[야간선물 칼만 추세 필터 전환]</b>\n이전: {old_trend} ➡️ 현재: {trend_direction}\n타점이 실시간으로 갱신되었습니다.")
+            else:
+                old_trend = self.futures_trend_direction
+                self.futures_target_long = kf_price + band
+                self.futures_target_short = kf_price - band
+                self.futures_tp_price_long = kf_price + 3.0 * std_error
+                self.futures_tp_price_short = kf_price - 3.0 * std_error
+                self.futures_std_error = std_error
+                self.futures_trend_direction = trend_direction
+                print(f"[ERA 칼만 주간] 타점 설정 완료 | 코드={code} | KF={kf_price:.2f}pt | std_err={std_error:.2f}pt | band={band:.2f}pt | LONG={self.futures_target_long:.2f}pt | SHORT={self.futures_target_short:.2f}pt | 3Sig LONG TP={self.futures_tp_price_long:.2f}pt | 3Sig SHORT TP={self.futures_tp_price_short:.2f}pt | 장기추세(60M)={self.futures_trend_direction}")
+                if notifier and trend_direction != old_trend:
+                    notifier.send_message(f"📈 <b>[주간선물 칼만 추세 필터 전환]</b>\n이전: {old_trend} ➡️ 현재: {trend_direction}\n타점이 실시간으로 갱신되었습니다.")
+                
+        except Exception as ex:
+            print(f"[ERA 칼만] 실시간 타점 연산 중 에러 발생: {ex}")
 
     def load_config(self):
         try:
@@ -669,6 +851,15 @@ class ERAOrderManager:
             # 야간선물 고정값: config.json futures_settings 기준, active_strategy.json에 의해 절대 변경 안 됨
             self.futures_night_stop_loss_pt = float(futures_settings.get("stop_loss_pt", 3.0))
             self.futures_night_take_profit_pt = float(futures_settings.get("take_profit_pt", 6.0))
+            self.futures_max_trades_day = int(futures_settings.get("max_trades_day", 4))
+            self.futures_max_trades_night = int(futures_settings.get("max_trades_night", 4))
+            
+            # 칼만 필터 기본값 설정
+            self.futures_strategy_type = futures_settings.get("futures_strategy_type", "volatility_breakout")
+            self.futures_kf_q = float(futures_settings.get("kf_q", 0.0001))
+            self.futures_kf_r = float(futures_settings.get("kf_r", 0.5))
+            self.futures_kf_mult = float(futures_settings.get("kf_mult", 1.0))
+            self.futures_kf_sl_mult = float(futures_settings.get("kf_sl_mult", 3.4))
 
             # active_strategy.json의 백테스트 파라미터로 주간선물만 오버라이드 (야간선물 제외)
             active_strategy_path = os.path.join(self.workspace_root, "config", "active_strategy.json")
@@ -686,7 +877,17 @@ class ERAOrderManager:
                         self.futures_margin_cap_ratio = float(active["margin_cap"])
                     if "atr_cutoff" in active:
                         self.futures_atr_cutoff = float(active["atr_cutoff"])
-                    print(f"[ERA] active_strategy.json 파라미터 적용: K={self.futures_best_k} | 주간손절={self.futures_stop_loss_pt}pt | 주간익절={self.futures_take_profit_pt}pt | 야간손절={self.futures_night_stop_loss_pt}pt(고정) | 야간익절={self.futures_night_take_profit_pt}pt(고정) | 마진캡={self.futures_margin_cap_ratio:.2f} | ATR필터={self.futures_atr_cutoff:.2f}pt")
+                    if "futures_strategy_type" in active:
+                        self.futures_strategy_type = active["futures_strategy_type"]
+                    if "kf_q" in active:
+                        self.futures_kf_q = float(active["kf_q"])
+                    if "kf_r" in active:
+                        self.futures_kf_r = float(active["kf_r"])
+                    if "kf_mult" in active:
+                        self.futures_kf_mult = float(active["kf_mult"])
+                    if "kf_sl_mult" in active:
+                        self.futures_kf_sl_mult = float(active["kf_sl_mult"])
+                    print(f"[ERA] active_strategy.json 파라미터 적용: K={self.futures_best_k} | 주간손절={self.futures_stop_loss_pt}pt | 주간익절={self.futures_take_profit_pt}pt | 야간손절={self.futures_night_stop_loss_pt}pt(고정) | 야간익절={self.futures_night_take_profit_pt}pt(고정) | 마진캡={self.futures_margin_cap_ratio:.2f} | ATR필터={self.futures_atr_cutoff:.2f}pt | 전략타입={self.futures_strategy_type}")
                 except Exception as e:
                     print(f"[ERA] active_strategy.json 로드 실패 (config.json 값 유지): {e}")
 
@@ -751,6 +952,10 @@ class ERAOrderManager:
         self.futures_last_short_exit_price = 0.0
         self.futures_night_last_long_exit_price = 0.0
         self.futures_night_last_short_exit_price = 0.0
+        self.futures_day_consecutive_losses = 0
+        self.futures_night_consecutive_losses = 0
+        self.futures_day_trade_count = 0
+        self.futures_night_trade_count = 0
         
         path = os.path.join(self.workspace_root, "era", "futures_exit_state.json")
         if os.path.exists(path):
@@ -761,9 +966,15 @@ class ERAOrderManager:
                 self.futures_last_short_exit_price = float(state.get("last_short_exit_price", 0.0))
                 self.futures_night_last_long_exit_price = float(state.get("night_last_long_exit_price", 0.0))
                 self.futures_night_last_short_exit_price = float(state.get("night_last_short_exit_price", 0.0))
-                print(f"[ERA] 선물 재진입 방지 청산가 복원 완료: "
+                self.futures_day_consecutive_losses = int(state.get("day_consecutive_losses", 0))
+                self.futures_night_consecutive_losses = int(state.get("night_consecutive_losses", 0))
+                self.futures_day_trade_count = int(state.get("day_trade_count", 0))
+                self.futures_night_trade_count = int(state.get("night_trade_count", 0))
+                print(f"[ERA] 선물 재진입 방지 청산가 및 거래제한 정보 복원 완료: "
                       f"주간LONG={self.futures_last_long_exit_price}, 주간SHORT={self.futures_last_short_exit_price}, "
-                      f"야간LONG={self.futures_night_last_long_exit_price}, 야간SHORT={self.futures_night_last_short_exit_price}")
+                      f"야간LONG={self.futures_night_last_long_exit_price}, 야간SHORT={self.futures_night_last_short_exit_price}, "
+                      f"주간연속손절={self.futures_day_consecutive_losses}, 야간연속손절={self.futures_night_consecutive_losses}, "
+                      f"주간거래횟수={self.futures_day_trade_count}, 야간거래횟수={self.futures_night_trade_count}")
             except Exception as e:
                 print(f"[ERA] 선물 청산가 복원 실패: {e}")
 
@@ -775,7 +986,11 @@ class ERAOrderManager:
                 "last_long_exit_price": self.futures_last_long_exit_price,
                 "last_short_exit_price": self.futures_last_short_exit_price,
                 "night_last_long_exit_price": self.futures_night_last_long_exit_price,
-                "night_last_short_exit_price": self.futures_night_last_short_exit_price
+                "night_last_short_exit_price": self.futures_night_last_short_exit_price,
+                "day_consecutive_losses": self.futures_day_consecutive_losses,
+                "night_consecutive_losses": self.futures_night_consecutive_losses,
+                "day_trade_count": self.futures_day_trade_count,
+                "night_trade_count": self.futures_night_trade_count
             }
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=4)
@@ -869,9 +1084,12 @@ class ERAOrderManager:
             self.futures_day_entry_price = 0.0
             self.futures_last_long_exit_price = 0.0
             self.futures_last_short_exit_price = 0.0
+            self.futures_day_consecutive_losses = 0
+            self.futures_day_trade_count = 0
+            self.ohlcv_buffer.clear()
             self.save_futures_exit_state()
             self._load_prev_range()
-            print(f"[ERA 주간선물] {now.strftime('%H:%M')} 세션 준비 — 전일 Range 갱신")
+            print(f"[ERA 주간선물] {now.strftime('%H:%M')} 세션 준비 — 전일 Range 갱신 및 카운터 초기화")
             
             # 주간 세션 시작 전 (08:40) 실계좌 포지션과 동기화하여 청산 정확도 향상
             QTimer.singleShot(2000, self.sync_futures_positions_and_balance)
@@ -879,17 +1097,19 @@ class ERAOrderManager:
         # ── 18:00 야간선물 세션 시작 리셋 ──────────────────────────────
         night_start_key = f"{today}_1800"
         is_after_18pm = (now.hour == 18 and now.minute >= 0) or (now.hour > 18)
-        if is_after_18pm and self._night_reset_done_date != night_start_key:
-            self._night_reset_done_date = night_start_key
+        if is_after_18pm and self._night_start_done_date != night_start_key:
+            self._night_start_done_date = night_start_key
             self.futures_night_open         = 0.0
             self.futures_night_target_long  = float('inf')
             self.futures_night_target_short = float('-inf')
             self.futures_night_order_locked = False
             self.futures_night_last_long_exit_price = 0.0
             self.futures_night_last_short_exit_price = 0.0
+            self.futures_night_consecutive_losses = 0
+            self.futures_night_trade_count = 0
             self.save_futures_exit_state()
             self.futures_night_entry_price  = 0.0
-            print(f"[ERA 야간선물] {now.strftime('%H:%M')} 세션 시작 대기 — 상태 초기화")
+            print(f"[ERA 야간선물] {now.strftime('%H:%M')} 세션 시작 대기 — 상태 및 카운터 초기화")
 
     def _is_trading_day(self):
         """오늘이 거래일인지 확인 (주말 + KRX 휴장일)"""
@@ -1913,7 +2133,12 @@ class ERAOrderManager:
             self.ohlcv_buffer[code] = {}
         buf = self.ohlcv_buffer[code]
         if period_str not in buf:
+            is_new_candle = len(buf) > 0
             buf[period_str] = {'o': price, 'h': price, 'l': price, 'c': price, 'v': 1}
+            if is_new_candle:
+                self._flush_ohlcv_buffer()
+                if getattr(self, "futures_strategy_type", "volatility_breakout") == "kalman":
+                    self.update_kalman_targets(code)
         else:
             c = buf[period_str]
             if price > c['h']:
@@ -2756,23 +2981,69 @@ class ERAOrderManager:
             db_open = self._get_today_futures_open(code)
             day_open = db_open if db_open > 0 else current_price
             self.futures_day_open     = day_open
-            self.futures_target_long  = day_open + self.futures_prev_range * self.futures_best_k
-            self.futures_target_short = day_open - self.futures_prev_range * self.futures_best_k
-            src_label = "DB 시초가" if db_open > 0 else "현재가(폴백)"
-            print(f"\n[주간선물] ✅ 시초가 설정: {day_open:.2f}pt ({src_label})")
-            print(f"  LONG목표: {self.futures_target_long:.2f}  SHORT목표: {self.futures_target_short:.2f}")
-            print(f"  손절: {self.futures_stop_loss_pt}pt | 대안 C 트레일링 스탑 적용 (3pt 이상 상승 시 가동 ➡️ 최고가 대비 -2pt 청산)")
-            if notifier:
-                notifier.send_message(
-                    f"🌅 <b>[주간선물 목표가]</b>\n"
-                    f"• 시초가: {day_open:.2f}pt ({src_label})\n"
-                    f"• LONG ▲ {self.futures_target_long:.2f}pt\n"
-                    f"• SHORT ▼ {self.futures_target_short:.2f}pt\n"
-                    f"• <b>[대안 C 적용]</b> 3pt 가동 ➡️ 최고가 -2pt 트레일링 스탑"
-                )
+            
+            # 금일 주간 세션 고가/저가 DB 복원 또는 초기화
+            db_high, db_low = self._get_today_futures_high_low(code)
+            self.futures_day_session_high = db_high if db_high > 0 else current_price
+            self.futures_day_session_low = db_low if db_low > 0 else current_price
+
+            # 칼만 필터 전략인 경우 타점을 덮어쓰지 않고 필요시 초기화
+            if getattr(self, "futures_strategy_type", "volatility_breakout") == "kalman":
+                if self.futures_target_long == float('inf') or self.futures_target_short == float('-inf'):
+                    self.update_kalman_targets(code)
+                src_label = "DB 시초가" if db_open > 0 else "현재가(폴백)"
+                print(f"\n[주간선물(칼만)] ✅ 시초가 설정: {day_open:.2f}pt ({src_label})")
+                print(f"  LONG목표: {self.futures_target_long:.2f}  SHORT목표: {self.futures_target_short:.2f}")
+                print(f"  손절: 하이브리드 동적 ({self.futures_kf_sl_mult:.2f}배) | 익절: 동적 3-Sigma")
+                if notifier:
+                    notifier.send_message(
+                        f"🌅 <b>[주간선물(칼만) 목표가]</b>\n"
+                        f"• 시초가: {day_open:.2f}pt ({src_label})\n"
+                        f"• LONG ▲ {self.futures_target_long:.2f}pt (3Sig TP: {getattr(self, 'futures_tp_price_long', 0.0):.2f}pt)\n"
+                        f"• SHORT ▼ {self.futures_target_short:.2f}pt (3Sig TP: {getattr(self, 'futures_tp_price_short', 0.0):.2f}pt)\n"
+                        f"• 손절: 하이브리드 동적 ({self.futures_kf_sl_mult:.2f}배) | 익절: 동적 3-Sigma"
+                    )
+            else:
+                self.futures_target_long  = day_open + self.futures_prev_range * self.futures_best_k
+                self.futures_target_short = day_open - self.futures_prev_range * self.futures_best_k
+                src_label = "DB 시초가" if db_open > 0 else "현재가(폴백)"
+                print(f"\n[주간선물] ✅ 시초가 설정: {day_open:.2f}pt ({src_label})")
+                print(f"  LONG목표: {self.futures_target_long:.2f}  SHORT목표: {self.futures_target_short:.2f}")
+                print(f"  손절: {self.futures_stop_loss_pt}pt | 익절: {self.futures_take_profit_pt}pt (고정)")
+                if notifier:
+                    notifier.send_message(
+                        f"🌅 <b>[주간선물 목표가]</b>\n"
+                        f"• 시초가: {day_open:.2f}pt ({src_label})\n"
+                        f"• LONG ▲ {self.futures_target_long:.2f}pt\n"
+                        f"• SHORT ▼ {self.futures_target_short:.2f}pt\n"
+                        f"• 손절: {self.futures_stop_loss_pt}pt | 익절: {self.futures_take_profit_pt}pt (고정)"
+                    )
 
         if self.futures_day_open == 0:
             return
+
+        # 실시간 금일 주간 세션 고가/저가 업데이트
+        if current_price > self.futures_day_session_high:
+            self.futures_day_session_high = current_price
+        if current_price < self.futures_day_session_low or self.futures_day_session_low == 0:
+            self.futures_day_session_low = current_price
+
+        # 제안 C: 고변동성 세션 마감 강제 청산 (Overnight Risk Control)
+        is_market_close_time = (now.hour == 15 and 35 <= now.minute <= 45)
+        if is_market_close_time:
+            session_range = self.futures_day_session_high - self.futures_day_session_low
+            if session_range > 15.0:
+                if pos_key in self.futures_positions and not self.futures_positions[pos_key].get('is_exiting', False):
+                    pos = self.futures_positions[pos_key]
+                    msg = f"[주간선물] ⚠️ 고변동성 세션 마감 강제 청산 (변동폭: {session_range:.2f}pt > 15.0pt) | 진입가: {self.futures_day_entry_price:.2f} ➡️ 청산가: {current_price:.2f}"
+                    print(msg)
+                    self._execute_futures_direct("LONG_EXIT" if pos["type"] == "LONG" else "SHORT_EXIT",
+                                                 current_price, code, pos_key)
+                    self.futures_day_entry_price = 0.0
+                    self.futures_day_peak = 0.0
+                    if notifier:
+                        notifier.send_message(f"⚠️ <b>[고변동성 마감 청산]</b>\n• 당일 변동폭: {session_range:.2f}pt (기준 15pt 초과)\n• 포지션 강제 청산 완료 ({pos['type']})")
+                    return
 
         # ── 포지션 보유 중: 손절 / 대안 C 트레일링 스탑 감시 ──
         if pos_key in self.futures_positions:
@@ -2780,6 +3051,14 @@ class ERAOrderManager:
                 pos = self.futures_positions[pos_key]
                 entry = self.futures_day_entry_price
                 if entry > 0:
+                    is_kalman = (getattr(self, "futures_strategy_type", "volatility_breakout") == "kalman")
+                    if is_kalman:
+                        c_std = getattr(self, "futures_std_error", 0.5)
+                        # 제안 A: 변동성 비례 동적 손절 상한선 (Dynamic Cap)
+                        sl_limit = max(min(self.futures_kf_sl_mult * c_std, 1.2 * getattr(self, "futures_atr_14", 5.0)), 2.0)
+                    else:
+                        sl_limit = self.futures_stop_loss_pt
+                        
                     if pos['type'] == 'LONG':
                         # 최고가 추적 및 갱신
                         if current_price > self.futures_day_peak:
@@ -2788,65 +3067,139 @@ class ERAOrderManager:
                         pnl_pt = current_price - entry
                         max_pnl_pt = self.futures_day_peak - entry # 진입 후 도달한 최고 수익폭
                         
-                        # 1. 고정 손절 감시 (트레일링 가동 전까지 계좌 보호)
-                        if pnl_pt <= -self.futures_stop_loss_pt:
-                            print(f"[주간선물] 🛑 LONG 손절 발동! 진입:{entry:.2f} 현재:{current_price:.2f} 손실:{pnl_pt:+.2f}pt")
+                        # 1. 고정 손절 감시
+                        if pnl_pt <= -sl_limit:
+                            print(f"[주간선물] 🛑 LONG 손절 발동! 진입:{entry:.2f} 현재:{current_price:.2f} 손실:{pnl_pt:+.2f}pt (SL:{sl_limit:.2f}pt)")
+                            self.futures_day_consecutive_losses += 1
+                            if self.futures_day_consecutive_losses >= 3:
+                                self.futures_day_trade_count = self.futures_max_trades_day
+                                if notifier:
+                                    notifier.send_message("🚨 <b>[주간선물 거래정지]</b>\n3회 연속 손실 발생으로 인해 금일 주간 거래가 정지되었습니다.")
+                            self.save_futures_exit_state()
                             self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
                             self.futures_day_entry_price = 0.0
                             self.futures_day_peak = 0.0
                             if notifier:
-                                notifier.send_message(f"🛑 <b>[주간선물 손절]</b> {pnl_pt:+.2f}pt | 진입:{entry:.2f} → 청산:{current_price:.2f}")
+                                notifier.send_message(f"🛑 <b>[주간선물 손절]</b> {pnl_pt:+.2f}pt | 진입:{entry:.2f} → 청산:{current_price:.2f} (SL:{sl_limit:.2f}pt)")
                             return
                         
-                        # 2. 대안 C 트레일링 스탑 감시 (최고 수익이 +3.0 pt 이상 도달했을 때부터 기동)
-                        elif max_pnl_pt >= 3.0:
-                            ts_price = self.futures_day_peak - 2.0
-                            if current_price <= ts_price:
-                                realized_pnl = current_price - entry
-                                peak_snapshot = self.futures_day_peak
-                                print(f"[주간선물] 🎯 LONG 트레일링 스탑 발동! 최고가:{peak_snapshot:.2f} 현재가(청산):{current_price:.2f} 익절:{realized_pnl:+.2f}pt")
+                        # 2. 익절 감시
+                        if is_kalman:
+                            tp_price = getattr(self, 'futures_tp_price_long', 0.0)
+                            if tp_price > 0 and current_price >= tp_price:
+                                print(f"[주간선물(칼만)] 🎯 LONG 3-Sigma 익절 청산! 진입가:{entry:.2f} 현재가:{current_price:.2f} 목표가:{tp_price:.2f}pt")
+                                self.futures_day_consecutive_losses = 0
+                                self.save_futures_exit_state()
                                 self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
                                 self.futures_day_entry_price = 0.0
                                 self.futures_day_peak = 0.0
                                 if notifier:
-                                    notifier.send_message(f"🎯 <b>[주간선물 트레일링 익절]</b> {realized_pnl:+.2f}pt (최고가:{peak_snapshot:.2f} ➡️ 청산:{current_price:.2f})")
+                                    notifier.send_message(f"🎯 <b>[주간선물(칼만) 3-Sigma 익절]</b> {pnl_pt:+.2f}pt | 진입가:{entry:.2f} ➡️ 현재가:{current_price:.2f} (목표가:{tp_price:.2f}pt)")
                                 return
+                            # 제안 B: 트레일링 스탑 적용
+                            elif max_pnl_pt >= 1.5 * c_std:
+                                ts_price = self.futures_day_peak - 0.5 * c_std
+                                if current_price <= ts_price:
+                                    realized_pnl = current_price - entry
+                                    peak_snapshot = self.futures_day_peak
+                                    print(f"[주간선물(칼만)] 💎 LONG 트레일링 스탑 청산! 최고수익:{max_pnl_pt:.2f}pt (피크:{peak_snapshot:.2f}) ➡️ 현재가:{current_price:.2f} (이익보전:{realized_pnl:+.2f}pt)")
+                                    self.futures_day_consecutive_losses = 0
+                                    self.save_futures_exit_state()
+                                    self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
+                                    self.futures_day_entry_price = 0.0
+                                    self.futures_day_peak = 0.0
+                                    if notifier:
+                                        notifier.send_message(f"💎 <b>[주간선물(칼만) 트레일링 익절]</b> {realized_pnl:+.2f}pt | 최고가:{peak_snapshot:.2f} ➡️ 현재가:{current_price:.2f} (TS 가동:1.5*std ➡️ 되돌림:0.5*std)")
+                                    return
+                        else:
+                            if max_pnl_pt >= 3.0:
+                                ts_price = self.futures_day_peak - 2.0
+                                if current_price <= ts_price:
+                                    realized_pnl = current_price - entry
+                                    peak_snapshot = self.futures_day_peak
+                                    print(f"[주간선물] 🎯 LONG 트레일링 스탑 발동! 최고가:{peak_snapshot:.2f} 현재가(청산):{current_price:.2f} 익절:{realized_pnl:+.2f}pt")
+                                    self.futures_day_consecutive_losses = 0
+                                    self.save_futures_exit_state()
+                                    self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
+                                    self.futures_day_entry_price = 0.0
+                                    self.futures_day_peak = 0.0
+                                    if notifier:
+                                        notifier.send_message(f"🎯 <b>[주간선물 트레일링 익절]</b> {realized_pnl:+.2f}pt (최고가:{peak_snapshot:.2f} ➡️ 청산:{current_price:.2f})")
+                                    return
 
                     elif pos['type'] == 'SHORT':
-                        # 최저가(숏 포지션이므로 가격이 낮아질수록 최고 수익) 추적 및 갱신
+                        # 최저가 추적 및 갱신
                         if current_price < self.futures_day_peak or self.futures_day_peak == 0:
                             self.futures_day_peak = current_price
                         
                         pnl_pt = entry - current_price
-                        max_pnl_pt = entry - self.futures_day_peak # 진입 후 도달한 최고 수익폭
+                        max_pnl_pt = entry - self.futures_day_peak
                         
                         # 1. 고정 손절 감시
-                        if pnl_pt <= -self.futures_stop_loss_pt:
-                            print(f"[주간선물] 🛑 SHORT 손절 발동! 진입:{entry:.2f} 현재:{current_price:.2f} 손실:{pnl_pt:+.2f}pt")
+                        if pnl_pt <= -sl_limit:
+                            print(f"[주간선물] 🛑 SHORT 손절 발동! 진입:{entry:.2f} 현재:{current_price:.2f} 손실:{pnl_pt:+.2f}pt (SL:{sl_limit:.2f}pt)")
+                            self.futures_day_consecutive_losses += 1
+                            if self.futures_day_consecutive_losses >= 3:
+                                self.futures_day_trade_count = self.futures_max_trades_day
+                                if notifier:
+                                    notifier.send_message("🚨 <b>[주간선물 거래정지]</b>\n3회 연속 손실 발생으로 인해 금일 주간 거래가 정지되었습니다.")
+                            self.save_futures_exit_state()
                             self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
                             self.futures_day_entry_price = 0.0
                             self.futures_day_peak = 0.0
                             if notifier:
-                                notifier.send_message(f"🛑 <b>[주간선물 손절]</b> {pnl_pt:+.2f}pt | 진입:{entry:.2f} → 청산:{current_price:.2f}")
+                                notifier.send_message(f"🛑 <b>[주간선물 손절]</b> {pnl_pt:+.2f}pt | 진입:{entry:.2f} → 청산:{current_price:.2f} (SL:{sl_limit:.2f}pt)")
                             return
                         
-                        # 2. 대안 C 트레일링 스탑 감시 (최고 수익이 +3.0 pt 이상 도달했을 때부터 기동)
-                        elif max_pnl_pt >= 3.0:
-                            ts_price = self.futures_day_peak + 2.0
-                            if current_price >= ts_price:
-                                realized_pnl = entry - current_price
-                                peak_snapshot = self.futures_day_peak
-                                print(f"[주간선물] 🎯 SHORT 트레일링 스탑 발동! 최저가:{peak_snapshot:.2f} 현재가(청산):{current_price:.2f} 익절:{realized_pnl:+.2f}pt")
+                        # 2. 익절 감시
+                        if is_kalman:
+                            tp_price = getattr(self, 'futures_tp_price_short', 0.0)
+                            if tp_price > 0 and current_price <= tp_price:
+                                print(f"[주간선물(칼만)] 🎯 SHORT 3-Sigma 익절 청산! 진입가:{entry:.2f} 현재가:{current_price:.2f} 목표가:{tp_price:.2f}pt")
+                                self.futures_day_consecutive_losses = 0
+                                self.save_futures_exit_state()
                                 self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
                                 self.futures_day_entry_price = 0.0
                                 self.futures_day_peak = 0.0
                                 if notifier:
-                                    notifier.send_message(f"🎯 <b>[주간선물 트레일링 익절]</b> {realized_pnl:+.2f}pt (최저가:{peak_snapshot:.2f} ➡️ 청산:{current_price:.2f})")
+                                    notifier.send_message(f"🎯 <b>[주간선물(칼만) 3-Sigma 익절]</b> {pnl_pt:+.2f}pt | 진입가:{entry:.2f} ➡️ 현재가:{current_price:.2f} (목표가:{tp_price:.2f}pt)")
                                 return
+                            # 제안 B: 트레일링 스탑 적용
+                            elif max_pnl_pt >= 1.5 * c_std:
+                                ts_price = self.futures_day_peak + 0.5 * c_std
+                                if current_price >= ts_price:
+                                    realized_pnl = entry - current_price
+                                    peak_snapshot = self.futures_day_peak
+                                    print(f"[주간선물(칼만)] 💎 SHORT 트레일링 스탑 청산! 최고수익:{max_pnl_pt:.2f}pt (피크:{peak_snapshot:.2f}) ➡️ 현재가:{current_price:.2f} (이익보전:{realized_pnl:+.2f}pt)")
+                                    self.futures_day_consecutive_losses = 0
+                                    self.save_futures_exit_state()
+                                    self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
+                                    self.futures_day_entry_price = 0.0
+                                    self.futures_day_peak = 0.0
+                                    if notifier:
+                                        notifier.send_message(f"💎 <b>[주간선물(칼만) 트레일링 익절]</b> {realized_pnl:+.2f}pt | 최저가:{peak_snapshot:.2f} ➡️ 현재가:{current_price:.2f} (TS 가동:1.5*std ➡️ 되돌림:0.5*std)")
+                                    return
+                        else:
+                            if max_pnl_pt >= 3.0:
+                                ts_price = self.futures_day_peak + 2.0
+                                if current_price >= ts_price:
+                                    realized_pnl = entry - current_price
+                                    peak_snapshot = self.futures_day_peak
+                                    print(f"[주간선물] 🎯 SHORT 트레일링 스탑 발동! 최저가:{peak_snapshot:.2f} 현재가(청산):{current_price:.2f} 익절:{realized_pnl:+.2f}pt")
+                                    self.futures_day_consecutive_losses = 0
+                                    self.save_futures_exit_state()
+                                    self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
+                                    self.futures_day_entry_price = 0.0
+                                    self.futures_day_peak = 0.0
+                                    if notifier:
+                                        notifier.send_message(f"🎯 <b>[주간선물 트레일링 익절]</b> {realized_pnl:+.2f}pt (최저가:{peak_snapshot:.2f} ➡️ 청산:{current_price:.2f})")
+                                    return
             return  # 포지션 보유 중이면 (체결 대기 상태 포함) 신규 진입 불가
 
         # ── 신규 진입 조건 (09:00 장 초반 15분 노이즈 필터 연동) ──
         if not self.futures_order_locked and not self.system_halted:
+            if self.futures_day_trade_count >= self.futures_max_trades_day:
+                return
             is_after_9 = (now.hour == 9 and now.minute >= 0) or (now.hour > 9)
             if is_after_9:
                 # [AMATS 최적화] 초저변동성 구간 진입 차단 필터링 (ATR Cutoff)
@@ -2854,15 +3207,29 @@ class ERAOrderManager:
                 if atr_val < self.futures_atr_cutoff:
                     return
 
+                # 장기 칼만 필터 추세 필터링 (Proposal 3)
+                is_kalman = (getattr(self, "futures_strategy_type", "volatility_breakout") == "kalman")
+                trend = getattr(self, "futures_trend_direction", "NEUTRAL") if is_kalman else "NEUTRAL"
+
                 if current_price >= self.futures_target_long:
+                    # 장기 추세가 하락세(DOWN)일 때 LONG 진입 무시
+                    if is_kalman and trend == "DOWN":
+                        return
                     if self._is_reentry_allowed("LONG", current_price, is_night=False):
                         self.futures_day_entry_price = current_price
                         self.futures_day_peak = current_price # 진입 즉시 초기화
+                        self.futures_day_trade_count += 1
+                        self.save_futures_exit_state()
                         self._execute_futures_direct("LONG_ENTER", current_price, code, pos_key)
                 elif current_price <= self.futures_target_short:
+                    # 장기 추세가 상승세(UP)일 때 SHORT 진입 무시
+                    if is_kalman and trend == "UP":
+                        return
                     if self._is_reentry_allowed("SHORT", current_price, is_night=False):
                         self.futures_day_entry_price = current_price
                         self.futures_day_peak = current_price # 진입 즉시 초기화
+                        self.futures_day_trade_count += 1
+                        self.save_futures_exit_state()
                         self._execute_futures_direct("SHORT_ENTER", current_price, code, pos_key)
 
     def _process_night_tick(self, code, current_price, now):
@@ -2886,20 +3253,38 @@ class ERAOrderManager:
             db_night_open = self._get_today_night_open(code, now)
             night_open = db_night_open if db_night_open > 0 else current_price
             self.futures_night_open         = night_open
-            self.futures_night_target_long  = night_open + self.futures_prev_range * self.futures_best_k
-            self.futures_night_target_short = night_open - self.futures_prev_range * self.futures_best_k
-            src_label = "DB 시초가" if db_night_open > 0 else "현재가(폴백)"
-            print(f"\n[야간선물] ✅ 시초가 설정: {night_open:.2f}pt ({src_label})")
-            print(f"  LONG목표: {self.futures_night_target_long:.2f}  SHORT목표: {self.futures_night_target_short:.2f}")
-            print(f"  손절: {self.futures_night_stop_loss_pt}pt  익절: {self.futures_night_take_profit_pt}pt (고정)")
-            if notifier:
-                notifier.send_message(
-                    f"🌙 <b>[야간선물 목표가]</b>\n"
-                    f"• 시초가: {night_open:.2f}pt ({src_label})\n"
-                    f"• LONG ▲ {self.futures_night_target_long:.2f}pt\n"
-                    f"• SHORT ▼ {self.futures_night_target_short:.2f}pt\n"
-                    f"• 손절: {self.futures_night_stop_loss_pt}pt | 익절: {self.futures_night_take_profit_pt}pt (고정)"
-                )
+            
+            # 칼만 필터 전략인 경우 타점을 덮어쓰지 않고 필요시 초기화
+            if getattr(self, "futures_strategy_type", "volatility_breakout") == "kalman":
+                if self.futures_night_target_long == float('inf') or self.futures_night_target_short == float('-inf'):
+                    self.update_kalman_targets(code)
+                src_label = "DB 시초가" if db_night_open > 0 else "현재가(폴백)"
+                print(f"\n[야간선물(칼만)] ✅ 시초가 설정: {night_open:.2f}pt ({src_label})")
+                print(f"  LONG목표: {self.futures_night_target_long:.2f}  SHORT목표: {self.futures_night_target_short:.2f}")
+                print(f"  손절: 하이브리드 동적 ({self.futures_kf_sl_mult:.2f}배) | 익절: 동적 3-Sigma")
+                if notifier:
+                    notifier.send_message(
+                        f"🌙 <b>[야간선물(칼만) 목표가]</b>\n"
+                        f"• 시초가: {night_open:.2f}pt ({src_label})\n"
+                        f"• LONG ▲ {self.futures_night_target_long:.2f}pt (3Sig TP: {getattr(self, 'futures_night_tp_price_long', 0.0):.2f}pt)\n"
+                        f"• SHORT ▼ {self.futures_night_target_short:.2f}pt (3Sig TP: {getattr(self, 'futures_night_tp_price_short', 0.0):.2f}pt)\n"
+                        f"• 손절: 하이브리드 동적 ({self.futures_kf_sl_mult:.2f}배) | 익절: 동적 3-Sigma"
+                    )
+            else:
+                self.futures_night_target_long  = night_open + self.futures_prev_range * self.futures_best_k
+                self.futures_night_target_short = night_open - self.futures_prev_range * self.futures_best_k
+                src_label = "DB 시초가" if db_night_open > 0 else "현재가(폴백)"
+                print(f"\n[야간선물] ✅ 시초가 설정: {night_open:.2f}pt ({src_label})")
+                print(f"  LONG목표: {self.futures_night_target_long:.2f}  SHORT목표: {self.futures_night_target_short:.2f}")
+                print(f"  손절: {self.futures_night_stop_loss_pt}pt  익절: {self.futures_night_take_profit_pt}pt (고정)")
+                if notifier:
+                    notifier.send_message(
+                        f"🌙 <b>[야간선물 목표가]</b>\n"
+                        f"• 시초가: {night_open:.2f}pt ({src_label})\n"
+                        f"• LONG ▲ {self.futures_night_target_long:.2f}pt\n"
+                        f"• SHORT ▼ {self.futures_night_target_short:.2f}pt\n"
+                        f"• 손절: {self.futures_night_stop_loss_pt}pt | 익절: {self.futures_night_take_profit_pt}pt (고정)"
+                    )
 
         if self.futures_night_open == 0:
             return
@@ -2910,54 +3295,167 @@ class ERAOrderManager:
                 pos = self.futures_positions[pos_key]
                 entry = self.futures_night_entry_price
                 if entry > 0:
+                    is_kalman = (getattr(self, "futures_strategy_type", "volatility_breakout") == "kalman")
+                    if is_kalman:
+                        c_std = getattr(self, "futures_night_std_error", 0.5)
+                        # 제안 A: 변동성 비례 동적 손절 상한선 (Dynamic Cap)
+                        sl_limit = max(min(self.futures_kf_sl_mult * c_std, 1.2 * getattr(self, "futures_atr_14", 5.0)), 2.0)
+                    else:
+                        sl_limit = self.futures_night_stop_loss_pt
+                        
                     if pos['type'] == 'LONG':
+                        # 최고가 추적 및 갱신
+                        if current_price > self.futures_night_peak:
+                            self.futures_night_peak = current_price
+                            
                         pnl_pt = current_price - entry
-                        if pnl_pt <= -self.futures_night_stop_loss_pt:
-                            print(f"[야간선물] 🛑 LONG 손절 발동! 진입:{entry:.2f} 현재:{current_price:.2f} 손실:{pnl_pt:+.2f}pt")
+                        max_pnl_pt = self.futures_night_peak - entry
+                        
+                        # 1. 손절 검사
+                        if pnl_pt <= -sl_limit:
+                            print(f"[야간선물] 🚨 LONG 손절 청산! 진입가:{entry:.2f} 현재가:{current_price:.2f} 손익:{pnl_pt:+.2f}pt (SL:{sl_limit:.2f}pt)")
+                            self.futures_night_consecutive_losses += 1
+                            if self.futures_night_consecutive_losses >= 3:
+                                self.futures_night_trade_count = self.futures_max_trades_night
+                                if notifier:
+                                    notifier.send_message("🚨 <b>[야간선물 거래정지]</b>\n3회 연속 손실 발생으로 인해 금일 야간 거래가 정지되었습니다.")
+                            self.save_futures_exit_state()
                             self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
                             self.futures_night_entry_price = 0.0
                             if notifier:
-                                notifier.send_message(f"🛑 <b>[야간선물 손절]</b> {pnl_pt:+.2f}pt | 기준:{self.futures_night_stop_loss_pt}pt")
+                                notifier.send_message(f"🚨 <b>[야간선물 손절]</b> {pnl_pt:+.2f}pt | 진입가:{entry:.2f} ➡️ 현재가:{current_price:.2f} (SL:{sl_limit:.2f}pt)")
                             return
-                        elif pnl_pt >= self.futures_night_take_profit_pt:
-                            print(f"[야간선물] 🎯 LONG 익절 발동! 진입:{entry:.2f} 현재:{current_price:.2f} 수익:{pnl_pt:+.2f}pt")
-                            self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
-                            self.futures_night_entry_price = 0.0
-                            if notifier:
-                                notifier.send_message(f"🎯 <b>[야간선물 익절]</b> {pnl_pt:+.2f}pt | 기준:{self.futures_night_take_profit_pt}pt")
-                            return
+                        
+                        # 2. 익절 검사
+                        if is_kalman:
+                            tp_price = getattr(self, 'futures_night_tp_price_long', 0.0)
+                            if tp_price > 0 and current_price >= tp_price:
+                                print(f"[야간선물(칼만)] 🎯 LONG 3-Sigma 익절 청산! 진입가:{entry:.2f} 현재가:{current_price:.2f} 목표가:{tp_price:.2f}pt")
+                                self.futures_night_consecutive_losses = 0
+                                self.save_futures_exit_state()
+                                self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
+                                self.futures_night_entry_price = 0.0
+                                if notifier:
+                                    notifier.send_message(f"🎯 <b>[야간선물(칼만) 3-Sigma 익절]</b> {pnl_pt:+.2f}pt | 진입가:{entry:.2f} ➡️ 현재가:{current_price:.2f} (목표가:{tp_price:.2f}pt)")
+                                return
+                            # 제안 B: 트레일링 스탑 적용
+                            elif max_pnl_pt >= 1.5 * c_std:
+                                ts_price = self.futures_night_peak - 0.5 * c_std
+                                if current_price <= ts_price:
+                                    realized_pnl = current_price - entry
+                                    peak_snapshot = self.futures_night_peak
+                                    print(f"[야간선물(칼만)] 💎 LONG 트레일링 스탑 청산! 최고수익:{max_pnl_pt:.2f}pt (피크:{peak_snapshot:.2f}) ➡️ 현재가:{current_price:.2f} (이익보전:{realized_pnl:+.2f}pt)")
+                                    self.futures_night_consecutive_losses = 0
+                                    self.save_futures_exit_state()
+                                    self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
+                                    self.futures_night_entry_price = 0.0
+                                    if notifier:
+                                        notifier.send_message(f"💎 <b>[야간선물(칼만) 트레일링 익절]</b> {realized_pnl:+.2f}pt | 최고가:{peak_snapshot:.2f} ➡️ 현재가:{current_price:.2f} (TS 가동:1.5*std ➡️ 되돌림:0.5*std)")
+                                    return
+                        else:
+                            if pnl_pt >= self.futures_night_take_profit_pt:
+                                print(f"[야간선물] 🎯 LONG 익절 청산! 진입가:{entry:.2f} 현재가:{current_price:.2f} 손익:{pnl_pt:+.2f}pt")
+                                self.futures_night_consecutive_losses = 0
+                                self.save_futures_exit_state()
+                                self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
+                                self.futures_night_entry_price = 0.0
+                                if notifier:
+                                    notifier.send_message(f"🎯 <b>[야간선물 익절]</b> {pnl_pt:+.2f}pt | 진입가:{entry:.2f} ➡️ 현재가:{current_price:.2f} (고정)")
+                                return
+
                     elif pos['type'] == 'SHORT':
+                        # 최저가 추적 및 갱신
+                        if current_price < self.futures_night_peak or self.futures_night_peak == 0:
+                            self.futures_night_peak = current_price
+                            
                         pnl_pt = entry - current_price
-                        if pnl_pt <= -self.futures_night_stop_loss_pt:
-                            print(f"[야간선물] 🛑 SHORT 손절 발동! 진입:{entry:.2f} 현재:{current_price:.2f} 손실:{pnl_pt:+.2f}pt")
+                        max_pnl_pt = entry - self.futures_night_peak
+                        
+                        # 1. 손절 검사
+                        if pnl_pt <= -sl_limit:
+                            print(f"[야간선물] 🚨 SHORT 손절 청산! 진입가:{entry:.2f} 현재가:{current_price:.2f} 손익:{pnl_pt:+.2f}pt (SL:{sl_limit:.2f}pt)")
+                            self.futures_night_consecutive_losses += 1
+                            if self.futures_night_consecutive_losses >= 3:
+                                self.futures_night_trade_count = self.futures_max_trades_night
+                                if notifier:
+                                    notifier.send_message("🚨 <b>[야간선물 거래정지]</b>\n3회 연속 손실 발생으로 인해 금일 야간 거래가 정지되었습니다.")
+                            self.save_futures_exit_state()
                             self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
                             self.futures_night_entry_price = 0.0
                             if notifier:
-                                notifier.send_message(f"🛑 <b>[야간선물 손절]</b> {pnl_pt:+.2f}pt | 기준:{self.futures_night_stop_loss_pt}pt")
+                                notifier.send_message(f"🚨 <b>[야간선물 손절]</b> {pnl_pt:+.2f}pt | 진입가:{entry:.2f} ➡️ 현재가:{current_price:.2f} (SL:{sl_limit:.2f}pt)")
                             return
-                        elif pnl_pt >= self.futures_night_take_profit_pt:
-                            print(f"[야간선물] 🎯 SHORT 익절 발동! 진입:{entry:.2f} 현재:{current_price:.2f} 수익:{pnl_pt:+.2f}pt")
-                            self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
-                            self.futures_night_entry_price = 0.0
-                            if notifier:
-                                notifier.send_message(f"🎯 <b>[야간선물 익절]</b> {pnl_pt:+.2f}pt | 기준:{self.futures_night_take_profit_pt}pt")
-                            return
-            return  # 포지션 보유 중이면 (체결 대기 상태 포함) 신규 진입 불가
+                        
+                        # 2. 익절 검사
+                        if is_kalman:
+                            tp_price = getattr(self, 'futures_night_tp_price_short', 0.0)
+                            if tp_price > 0 and current_price <= tp_price:
+                                print(f"[야간선물(칼만)] 🎯 SHORT 3-Sigma 익절 청산! 진입가:{entry:.2f} 현재가:{current_price:.2f} 목표가:{tp_price:.2f}pt")
+                                self.futures_night_consecutive_losses = 0
+                                self.save_futures_exit_state()
+                                self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
+                                self.futures_night_entry_price = 0.0
+                                if notifier:
+                                    notifier.send_message(f"🎯 <b>[야간선물(칼만) 3-Sigma 익절]</b> {pnl_pt:+.2f}pt | 진입가:{entry:.2f} ➡️ 현재가:{current_price:.2f} (목표가:{tp_price:.2f}pt)")
+                                return
+                            # 제안 B: 트레일링 스탑 적용
+                            elif max_pnl_pt >= 1.5 * c_std:
+                                ts_price = self.futures_night_peak + 0.5 * c_std
+                                if current_price >= ts_price:
+                                    realized_pnl = entry - current_price
+                                    peak_snapshot = self.futures_night_peak
+                                    print(f"[야간선물(칼만)] 💎 SHORT 트레일링 스탑 청산! 최고수익:{max_pnl_pt:.2f}pt (피크:{peak_snapshot:.2f}) ➡️ 현재가:{current_price:.2f} (이익보전:{realized_pnl:+.2f}pt)")
+                                    self.futures_night_consecutive_losses = 0
+                                    self.save_futures_exit_state()
+                                    self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
+                                    self.futures_night_entry_price = 0.0
+                                    if notifier:
+                                        notifier.send_message(f"💎 <b>[야간선물(칼만) 트레일링 익절]</b> {realized_pnl:+.2f}pt | 최저가:{peak_snapshot:.2f} ➡️ 현재가:{current_price:.2f} (TS 가동:1.5*std ➡️ 되돌림:0.5*std)")
+                                    return
+                        else:
+                            if pnl_pt >= self.futures_night_take_profit_pt:
+                                print(f"[야간선물] 🎯 SHORT 익절 청산! 진입가:{entry:.2f} 현재가:{current_price:.2f} 손익:{pnl_pt:+.2f}pt")
+                                self.futures_night_consecutive_losses = 0
+                                self.save_futures_exit_state()
+                                self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
+                                self.futures_night_entry_price = 0.0
+                                if notifier:
+                                    notifier.send_message(f"🎯 <b>[야간선물 익절]</b> {pnl_pt:+.2f}pt | 진입가:{entry:.2f} ➡️ 현재가:{current_price:.2f} (고정)")
+                                return
+            return  # 포지션 보유 중일 때는 신규 진입 차단
 
         # ── 신규 진입 조건 ──
         if not self.futures_night_order_locked and not self.system_halted:
+            if self.futures_night_trade_count >= self.futures_max_trades_night:
+                return
             # [AMATS 최적화] 초저변동성 구간 진입 차단 필터링 (ATR Cutoff)
             atr_val = getattr(self, 'futures_atr_14', 2.0)
             if atr_val < self.futures_atr_cutoff:
                 return
 
+            # 장기 칼만 필터 추세 필터링 (Proposal 3)
+            is_kalman = (getattr(self, "futures_strategy_type", "volatility_breakout") == "kalman")
+            trend = getattr(self, "futures_night_trend_direction", "NEUTRAL") if is_kalman else "NEUTRAL"
+
             if current_price >= self.futures_night_target_long:
+                # 장기 추세가 하락세(DOWN)일 때 LONG 진입 무시
+                if is_kalman and trend == "DOWN":
+                    return
                 if self._is_reentry_allowed("LONG", current_price, is_night=True):
                     self.futures_night_entry_price = current_price
+                    self.futures_night_peak = current_price # 진입 즉시 초기화
+                    self.futures_night_trade_count += 1
+                    self.save_futures_exit_state()
                     self._execute_futures_direct("LONG_ENTER", current_price, code, pos_key)
             elif current_price <= self.futures_night_target_short:
+                # 장기 추세가 상승세(UP)일 때 SHORT 진입 무시
+                if is_kalman and trend == "UP":
+                    return
                 if self._is_reentry_allowed("SHORT", current_price, is_night=True):
                     self.futures_night_entry_price = current_price
+                    self.futures_night_peak = current_price # 진입 즉시 초기화
+                    self.futures_night_trade_count += 1
+                    self.save_futures_exit_state()
                     self._execute_futures_direct("SHORT_ENTER", current_price, code, pos_key)
 
     def _execute_futures_direct(self, signal_type, current_price, order_code, pos_key):
@@ -3971,13 +4469,62 @@ class ERAOrderManager:
                 if not self._is_trading_day():
                     return
                 print("[ERA] ⚠️ 키움 연결 끊김 감지 (keepalive)")
+                
+                # 정기 점검 시간대에는 자동 재부팅을 유보 (점검 중에는 로그인 실패 루프 방지)
+                now = datetime.now()
+                hour_min = now.strftime("%H:%M")
+                is_maintenance = False
+                
+                # 1) 매일 새벽 점검 (03:00 ~ 05:00)
+                if "03:00" <= hour_min <= "05:00":
+                    is_maintenance = True
+                # 2) 평일 06:50 ~ 06:55 점검 (안전마진 포함 06:49 ~ 06:57)
+                elif now.weekday() < 5 and "06:49" <= hour_min <= "06:57":
+                    is_maintenance = True
+                # 3) 일요일 05:00 ~ 05:15 점검 (일요일에는 _is_trading_day가 False이지만 안전용)
+                elif now.weekday() == 6 and "04:59" <= hour_min <= "05:17":
+                    is_maintenance = True
+                
+                if is_maintenance:
+                    print(f"[ERA] 현재 키움 점검 시간대({hour_min})이므로 자동 재연결을 시도하지 않고 대기합니다.")
+                    if notifier:
+                        notifier.send_message(f"ℹ️ <b>[ERA]</b> 키움 점검 시간대({hour_min})로 감지되어 자동 재연결을 대기합니다.")
+                    return
+                
                 if notifier:
-                    notifier.send_message("⚠️ <b>[ERA]</b> 키움 서버 연결 끊김 감지됨")
+                    notifier.send_message("⚠️ <b>[ERA]</b> 키움 연결 끊김 감지됨 → 시스템 자동 재기동 스크립트를 실행합니다.")
+                
+                # reconnect_kiwoom.bat 실행 (비동기 백그라운드 호출)
+                reconnect_script = os.path.join(self.workspace_root, "reconnect_kiwoom.bat")
+                import subprocess
+                subprocess.Popen(f'cmd.exe /c "{reconnect_script}"', shell=True)
         except Exception as e:
             print(f"[ERA] keepalive 오류: {e}")
 
     def _check_kill_flag(self):
         """긴급정지 플래그 감시 — TCA가 생성한 emergency_kill.flag 감지 시 전량 청산 후 종료"""
+        # 키움 통신만 재연결 플래그 감시
+        reconnect_flag = os.path.join(self.workspace_root, "reconnect_kiwoom.flag")
+        if os.path.exists(reconnect_flag):
+            print("\n🔄 [ERA] 키움증권 통신 재연결 플래그 감지!")
+            try:
+                os.remove(reconnect_flag)
+            except:
+                pass
+            try:
+                state = self.kiwoom.dynamicCall("GetConnectState()")
+                if state == 0:
+                    if notifier:
+                        notifier.send_message("🔄 <b>[ERA]</b> 키움증권 통신 재연결(CommConnect)을 시도합니다. (엔진 재부팅 없음)")
+                    self.kiwoom.dynamicCall("CommConnect()")
+                else:
+                    if notifier:
+                        notifier.send_message("ℹ️ <b>[ERA]</b> 키움증권 서버에 이미 정상 연결되어 있습니다. (연결 상태: 연결됨)")
+            except Exception as e:
+                print(f"[ERA] 통신 재연결 시도 중 에러: {e}")
+                if notifier:
+                    notifier.send_message(f"❌ <b>[ERA]</b> 키움증권 통신 재연결 시도 실패: {e}")
+
         flag_path = os.path.join(self.workspace_root, "emergency_kill.flag")
         if os.path.exists(flag_path):
             print("\n🚨 [ERA] 긴급정지 플래그 감지! 전 포지션 청산 후 종료합니다.")

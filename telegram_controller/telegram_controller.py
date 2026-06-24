@@ -1,3 +1,13 @@
+import socket
+# Force IPv4 globally to prevent IPv6 DNS resolution hangs and connection timeouts on Windows
+orig_getaddrinfo = socket.getaddrinfo
+def patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    try:
+        return orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+    except Exception:
+        return orig_getaddrinfo(host, port, family, type, proto, flags)
+socket.getaddrinfo = patched_getaddrinfo
+
 import requests
 import time
 import subprocess
@@ -29,23 +39,24 @@ def send_message(text):
 
 def check_process_status():
     try:
-        # WMIC를 이용해 실행 중인 파이썬 프로세스 목록을 가져옴
-        output = subprocess.check_output('wmic process where "name=\'python.exe\'" get commandline', shell=True, text=True, errors='ignore')
+        # PowerShell을 활용해 python.exe 프로세스의 CommandLine을 안전하게 조회 (wmic 미지원 대응)
+        output = subprocess.check_output(
+            'powershell -Command "Get-CimInstance Win32_Process -Filter \\"name=\'python.exe\'\\" | Select-Object -ExpandProperty CommandLine"',
+            shell=True, text=True, errors='ignore'
+        )
         
-        unified_status = "🔴 <b>꺼짐</b>"
-        futures_status = "🔴 <b>꺼짐</b>"
+        era_status = "🔴 <b>꺼짐</b>"
+        controller_status = "🟢 <b>정상 가동 중</b>"
         
-        if "unified_order_manager.py" in output or "unified_auto_loop.py" in output:
-            unified_status = "🟢 <b>정상 가동 중</b>"
-            
-        if "futures_order_manager.py" in output or "futures_auto_loop.py" in output:
-            futures_status = "🟢 <b>정상 가동 중</b>"
+        if "era_order_manager.py" in output:
+            era_status = "🟢 <b>정상 가동 중</b>"
             
         msg = (
             "📊 <b>[현재 봇 가동 상태]</b>\n\n"
-            f"📈 주식 봇(통합): {unified_status}\n"
-            f"📉 선물 봇(주/야 통합): {futures_status}\n\n"
-            "<i>(명령어: !주식시작, !주식종료, !주식재연결)</i>"
+            f"⚙️ AMATS 통합 엔진(ERA): {era_status}\n"
+            f"📡 텔레그램 원격 제어: {controller_status}\n\n"
+            "<i>(주식 신정재/홍인기 + 선물 통합 관리)</i>\n\n"
+            "<i>(명령어: !재연동, !시스템재시작)</i>"
         )
         return msg
     except Exception as e:
@@ -53,7 +64,15 @@ def check_process_status():
 
 def get_unified_status():
     try:
-        with open(os.path.join(CONTROLLER_DIR, "unified_status.json"), "r", encoding="utf-8") as f:
+        # 통합 상태 정보(system_status.json) 읽기
+        status_path = os.path.join(BASE_DIR, "tca", "system_status.json")
+        if not os.path.exists(status_path):
+            status_path = os.path.join(BASE_DIR, "tca", "system_status_stock.json")
+            
+        if not os.path.exists(status_path):
+            return "🚨 주식 봇 상태 파일을 찾을 수 없습니다.\n(통합 엔진이 꺼져 있거나 아직 데이터를 내보내지 않았습니다.)"
+            
+        with open(status_path, "r", encoding="utf-8") as f:
             data = json.load(f)
             
         total_balance = data.get("total_balance", 0)
@@ -73,7 +92,18 @@ def get_unified_status():
             
             for code, pos in portfolio.items():
                 name = pos.get('name', code)
-                strat = "단타" if pos.get('strategy') == 'DAY' else "스윙"
+                strat_type = pos.get('strategy', 'DAY')
+                
+                # 전략명 맵핑 다듬기
+                if strat_type == 'DAY_CLOSE':
+                    strat = "종가베팅"
+                elif 'nulrim' in strat_type.lower():
+                    strat = "눌림목"
+                elif strat_type == 'DAY':
+                    strat = "단타"
+                else:
+                    strat = "스윙"
+                    
                 buy_price = pos.get('buy_price', 1)
                 current_price = pos.get('current_price', buy_price)
                 qty = pos.get('qty', 0)
@@ -101,15 +131,23 @@ def get_unified_status():
         msg += f"🕒 업데이트: {data.get('last_updated', '')}"
         return msg
     except Exception as e:
-        return f"🚨 주식 봇 상태 파일을 읽을 수 없습니다.\n(봇이 꺼져 있거나 아직 데이터를 저장하지 않았습니다.)"
+        return f"🚨 주식 봇 상태 분석 실패: {e}"
 
 def get_futures_status():
     try:
-        with open(os.path.join(CONTROLLER_DIR, "futures_status.json"), "r", encoding="utf-8") as f:
+        # 통합 상태 정보(system_status.json) 읽기
+        status_path = os.path.join(BASE_DIR, "tca", "system_status.json")
+        if not os.path.exists(status_path):
+            status_path = os.path.join(BASE_DIR, "tca", "system_status_futures.json")
+            
+        if not os.path.exists(status_path):
+            return "🚨 선물 봇 상태 파일을 찾을 수 없습니다.\n(통합 엔진이 꺼져 있거나 아직 데이터를 내보내지 않았습니다.)"
+            
+        with open(status_path, "r", encoding="utf-8") as f:
             data = json.load(f)
             
-        avail_balance = data.get("available_balance", 0)
-        positions = data.get("positions", {})
+        avail_balance = data.get("futures_balance", 0)
+        positions = data.get("futures_positions", {})
         
         msg = f"📉 <b>[선물 봇 실시간 현황]</b>\n"
         msg += f"💸 주문가능 현금: {avail_balance:,}원\n\n"
@@ -130,7 +168,7 @@ def get_futures_status():
         msg += f"\n🕒 업데이트: {data.get('last_updated', '')}"
         return msg
     except Exception as e:
-        return f"🚨 선물 봇 상태 파일을 읽을 수 없습니다.\n(봇이 꺼져 있거나 아직 데이터를 저장하지 않았습니다.)"
+        return f"🚨 선물 봇 상태 분석 실패: {e}"
 
 def execute_command(cmd_text, current_offset=None):
     if cmd_text == "!상태":
@@ -145,48 +183,12 @@ def execute_command(cmd_text, current_offset=None):
         msg = get_futures_status()
         send_message(msg)
         
-    elif cmd_text == "!주식시작":
-        send_message("⏳ 주식 봇 시작을 준비합니다... (기존 프로세스 정리 및 5초 대기)")
-        subprocess.run("kill_unified_bot.bat", shell=True, cwd=UNIFIED_DIR, capture_output=True)
-        time.sleep(5)
-        subprocess.Popen("start run_unified_bot.bat", shell=True, cwd=UNIFIED_DIR)
-        send_message("✅ 주식 봇 실행 명령이 전달되었습니다.")
+    elif cmd_text in ["!주식시작", "!주식종료", "!주식재연결"]:
+        send_message("⚠️ <b>알림</b>: 단타/스윙 봇은 중단되었습니다. 현재 주식 매매는 <b>AMATS 통합 엔진(ERA)</b>에서 신정재/홍인기 기법으로 통합 처리됩니다. 대신 <code>!재연동</code> 또는 <code>!시스템재시작</code> 명령어를 사용해 주세요.")
         
-    elif cmd_text == "!주식종료":
-        send_message("⏳ 주식 봇을 안전하게 종료합니다...")
-        subprocess.run("kill_unified_bot.bat", shell=True, cwd=UNIFIED_DIR, capture_output=True)
-        send_message("✅ 주식 봇이 종료되었습니다.")
+    elif cmd_text in ["!선물시작", "!선물종료", "!선물재연결"]:
+        send_message("⚠️ <b>알림</b>: 개별 선물 봇은 중단되었습니다. 현재 선물 매매는 <b>AMATS 통합 엔진(ERA)</b>에서 통합 처리됩니다. 대신 <code>!재연동</code> 또는 <code>!시스템재시작</code> 명령어를 사용해 주세요.")
         
-    elif cmd_text == "!선물시작":
-        send_message("⏳ 선물 봇 시작을 준비합니다... (기존 프로세스 정리 및 5초 대기)")
-        subprocess.run("kill_futures_bot.bat", shell=True, cwd=FUTURES_DIR, capture_output=True)
-        time.sleep(5)
-        subprocess.Popen("start run_futures_bot.bat", shell=True, cwd=FUTURES_DIR)
-        send_message("✅ 선물 봇 실행 명령이 전달되었습니다.")
-        
-    elif cmd_text == "!선물종료":
-        send_message("⏳ 선물 봇을 안전하게 종료합니다...")
-        subprocess.run("kill_futures_bot.bat", shell=True, cwd=FUTURES_DIR, capture_output=True)
-        send_message("✅ 선물 봇이 종료되었습니다.")
-        
-    elif cmd_text == "!주식재연결":
-        send_message("🔄 주식 봇 재연결을 시작합니다...\n1. 기존 봇 강제 종료 중...")
-        subprocess.run("kill_unified_bot.bat", shell=True, cwd=UNIFIED_DIR, capture_output=True)
-        send_message("⏳ 키움증권 서버에서 기존 접속이 완전히 끊길 때까지 60초 대기합니다...")
-        time.sleep(60) # 종료 대기 (키움증권 서버 세션 타임아웃 고려)
-        send_message("2. 주식 봇 재시작 중...")
-        subprocess.Popen("start run_unified_bot.bat", shell=True, cwd=UNIFIED_DIR)
-        send_message("✅ 주식 봇 재연결 명령이 전달되었습니다.")
-        
-    elif cmd_text == "!선물재연결":
-        send_message("🔄 선물 봇 재연결을 시작합니다...\n1. 기존 봇 강제 종료 중...")
-        subprocess.run("kill_futures_bot.bat", shell=True, cwd=FUTURES_DIR, capture_output=True)
-        send_message("⏳ 키움증권 서버에서 기존 접속이 완전히 끊길 때까지 60초 대기합니다...")
-        time.sleep(60) # 종료 대기 (키움증권 서버 세션 타임아웃 고려)
-        send_message("2. 선물 봇 재시작 중...")
-        subprocess.Popen("start run_futures_bot.bat", shell=True, cwd=FUTURES_DIR)
-        send_message("✅ 선물 봇 재연결 명령이 전달되었습니다.")
-
     elif cmd_text in ["!재연동", "!시스템재시작"]:
         send_message(
             "🔄 <b>시스템 재연동 시퀀스 가동!</b>\n\n"
@@ -196,7 +198,16 @@ def execute_command(cmd_text, current_offset=None):
         # auto_reconnect_era.bat가 60초 대기와 재기동을 처리하므로 비동기로 실행
         subprocess.Popen("start auto_reconnect_era.bat", shell=True, cwd=ERA_DIR)
         send_message("✅ <b>재연동 명령이 실행되었습니다.</b>\n60초 대기 후 ERA 엔진이 자동으로 재기동됩니다.")
-
+        
+    elif cmd_text in ["!재연결", "!통신재연결", "!키움재연결", "!키움만재연결"]:
+        flag_path = os.path.join(BASE_DIR, "reconnect_kiwoom.flag")
+        try:
+            with open(flag_path, "w") as f:
+                f.write("reconnect")
+            send_message("🔄 <b>통신 재연결 요청 송신!</b>\n\nERA 통합 엔진은 그대로 유지한 채 키움증권 OpenAPI 통신(CommConnect)만 재연결을 시도합니다.")
+        except Exception as e:
+            send_message(f"❌ <b>통신 재연결 요청 실패:</b> {e}")
+        
     elif cmd_text == "!텔레그램재연결":
         send_message("🔄 텔레그램 컨트롤러를 재시작합니다...\n잠시 후 다시 연결됩니다.")
         if current_offset is not None:
@@ -206,7 +217,7 @@ def execute_command(cmd_text, current_offset=None):
                 pass
         import sys
         sys.exit(0)
-
+        
     elif cmd_text in ["!선물매수", "!선물매도", "!선물청산"]:
         try:
             import sqlite3
@@ -248,12 +259,12 @@ def execute_command(cmd_text, current_offset=None):
                 send_message(f"✅ <b>[{session_label}선물]</b> 수동 매도(SHORT) 진입 명령이 전달되었습니다. (기준가: {current_price:.2f}pt)")
 
             elif cmd_text == "!선물청산":
-                status_path = os.path.join(CONTROLLER_DIR, "futures_status.json")
+                status_path = os.path.join(BASE_DIR, "tca", "system_status.json")
                 pos_found = False
                 if os.path.exists(status_path):
                     with open(status_path, "r", encoding="utf-8") as sf:
                         status_data = json.load(sf)
-                    positions = status_data.get("positions", {})
+                    positions = status_data.get("futures_positions", {})
                     for pos_key, pos_info in positions.items():
                         p_type = pos_info.get("type")
                         qty = pos_info.get("qty", 0)
@@ -279,7 +290,10 @@ def execute_command(cmd_text, current_offset=None):
             parts = cmd_text.split(" ", 1)
             if len(parts) > 1:
                 target_name = parts[1].strip()
-                with open(os.path.join(CONTROLLER_DIR, "unified_status.json"), "r", encoding="utf-8") as f:
+                status_path = os.path.join(BASE_DIR, "tca", "system_status.json")
+                if not os.path.exists(status_path):
+                    status_path = os.path.join(BASE_DIR, "tca", "system_status_stock.json")
+                with open(status_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 portfolio = data.get("portfolio", {})
                 target_code = None
@@ -305,7 +319,10 @@ def execute_command(cmd_text, current_offset=None):
 
     elif cmd_text == "!전량매도":
         try:
-            with open(os.path.join(CONTROLLER_DIR, "unified_status.json"), "r", encoding="utf-8") as f:
+            status_path = os.path.join(BASE_DIR, "tca", "system_status.json")
+            if not os.path.exists(status_path):
+                status_path = os.path.join(BASE_DIR, "tca", "system_status_stock.json")
+            with open(status_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             portfolio = data.get("portfolio", {})
             if portfolio:
@@ -330,7 +347,7 @@ def execute_command(cmd_text, current_offset=None):
         # 1. 주식 전량 매도 신호 삽입
         execute_command("!전량매도")
         
-        # 2. 선물 포지션 청산 신호 삽입 (추후 futures_data.db 스키마에 맞게 연동 필요)
+        # 2. 선물 포지션 청산 신호 삽입
         try:
             import sqlite3
             conn_f = sqlite3.connect(os.path.join(FUTURES_DIR, "futures_data.db"))
@@ -345,13 +362,21 @@ def execute_command(cmd_text, current_offset=None):
         send_message("⏳ 주문 체결을 위해 15초 대기합니다...")
         time.sleep(15)
         
-        send_message("2. 주식 및 선물 봇 프로세스 강제 종료 중...")
-        subprocess.run("kill_unified_bot.bat", shell=True, cwd=UNIFIED_DIR, capture_output=True)
-        subprocess.run("kill_futures_bot.bat", shell=True, cwd=FUTURES_DIR, capture_output=True)
+        send_message("2. 통합 매매 봇 프로세스 강제 종료 중...")
+        # 3. era_order_manager.py 강제 종료 (era.pid 파일 확인 후 kill 및 taskkill 폴백)
+        pid_path = os.path.join(ERA_DIR, "era.pid")
+        if os.path.exists(pid_path):
+            try:
+                with open(pid_path, "r") as pf:
+                    pid = pf.read().strip()
+                if pid:
+                    subprocess.run(f"taskkill /f /pid {pid}", shell=True, capture_output=True)
+            except:
+                pass
+        subprocess.run('powershell -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match \'era_order_manager.py\' -and $_.Name -match \'python\' } | Invoke-CimMethod -MethodName Terminate"', shell=True, capture_output=True)
         send_message("✅ <b>긴급 정지 완료:</b> 모든 매매 로직이 완전히 차단되었습니다.")
 
     elif cmd_text == "!백테스트시작":
-        # 추후 PC 2 (AI 랩)와 연동될 트리거 파일이나 네트워크 요청 삽입
         send_message("🧪 <b>[AI 랩]</b> 야간 파라미터 최적화(백테스트) 무한 루프 가동 명령을 하달했습니다.\n(Claude Code 에이전트가 작업을 시작합니다.)")
 
     elif cmd_text == "!최적화결과":
@@ -376,7 +401,6 @@ def execute_command(cmd_text, current_offset=None):
             send_message("📊 <b>[AI 랩 최적화 결과]</b>\n\n아직 진행된 백테스트 결과가 없습니다. (또는 파일을 읽을 수 없습니다.)")
 
     elif cmd_text == "!모의투자현황":
-        # 현재는 모의투자 계좌 연동이 안 되어 있으므로 향후 연동을 위한 안내 메시지
         send_message("📈 <b>[모의투자 샌드박스 현황]</b>\n\n현재 config.json 설정에 따라 모의투자(PC 2) 봇이 가동 중입니다.\n(추후 키움 모의 계좌 잔고 및 수익률과 연동됩니다.)")
 
     elif cmd_text == "!전략승인":
@@ -389,7 +413,6 @@ def execute_command(cmd_text, current_offset=None):
                 best_strat = top_strats[0]
                 new_k = best_strat.get('K')
                 
-                # 활성 전략 파일(active_strategy.json)에 기록하여 실전 봇이 다음 사이클부터 즉시 읽도록 함 (Hot-reload)
                 active_data = {
                     "K": new_k,
                     "approved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -406,24 +429,19 @@ def execute_command(cmd_text, current_offset=None):
 
     elif cmd_text == "/start" or cmd_text == "!도움말":
         help_msg = (
-            "🤖 <b>AI 원격 제어 봇 작동 시작</b>\n\n"
+            "🤖 <b>AMATS 통합 제어 봇 작동 중</b>\n\n"
             "<b>[사용 가능 명령어]</b>\n"
-            "• <code>!상태</code> : 현재 켜져 있는지 확인\n"
-            "• <code>!주식현황</code> / <code>!선물현황</code> : 실시간 수익률 및 잔고 브리핑\n"
-            "• <code>!매도 삼성전자</code> : 특정 종목 수동 익절/손절\n"
-            "• <code>!전량매도</code> : 전체 주식 종목 즉시 청산\n"
-            "• <code>!선물매수</code> / <code>!선물매도</code> / <code>!선물청산</code> : 선물 수동 진입/청산\n"
-            "• <code>!주식시작</code> / <code>!주식종료</code> / <code>!주식재연결</code>\n"
-            "• <code>!선물시작</code> / <code>!선물종료</code> / <code>!선물재연결</code>\n"
-            "• <code>!재연동</code> / <code>!시스템재시작</code> : 시스템 통합 프로세스 정리 후 안전 재기동 (추천)\n"
+            "• <code>!상태</code> : 전체 시스템 봇 가동 여부 확인\n"
+            "• <code>!주식현황</code> : 신정재/홍인기 주식 매매 잔고 및 보유 종목 현황\n"
+            "• <code>!선물현황</code> : KOSPI200 및 개별주식선물(ISF) 잔고 및 포지션 현황\n"
+            "• <code>!매도 종목명</code> : 특정 주식 종목 강제 시장가 청산\n"
+            "• <code>!전량매도</code> : 보유 중인 전체 주식 종목 즉시 일괄 청산\n"
+            "• <code>!선물청산</code> : 현재 보유 중인 선물 포지션 즉시 수동 청산\n"
+            "• <code>!재연결</code> / <code>!통신재연결</code> : 엔진 종료 없이 키움증권 통신만 재연결\n"
+            "• <code>!재연동</code> / <code>!시스템재시작</code> : 전체 통합 프로세스 정리 후 안전 재기동 (추천)\n"
             "• <code>!텔레그램재연결</code> : 메신저 봇 초기화\n\n"
             "<b>[🚨 긴급 제어]</b>\n"
-            "• <code>!긴급정지</code> : 모든 포지션 강제 청산 및 프로세스 킬\n\n"
-            "<b>[🧪 AI 최적화 및 모의투자 관제 (PC 2 연동)]</b>\n"
-            "• <code>!백테스트시작</code> : 야간 파라미터 최적화 강제 시작\n"
-            "• <code>!최적화결과</code> : 최적화 완료된 상위 파라미터 브리핑\n"
-            "• <code>!모의투자현황</code> : 현재 검증 중인 AI 전략 성과 확인\n"
-            "• <code>!전략승인</code> : 검증된 모의투자 전략을 실전(PC 1)에 핫-리로드\n\n"
+            "• <code>!긴급정지</code> : 모든 포지션 강제 청산 및 시스템 종료\n\n"
             "<i>보안: 다온님 외 타인의 접근은 완벽히 차단됩니다.</i>"
         )
         send_message(help_msg)

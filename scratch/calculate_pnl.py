@@ -1,95 +1,119 @@
-import json
+import sys
 
-with open('scratch/today_stock_prices.json', 'r', encoding='utf-8') as f:
-    stocks = json.load(f)
+sys.stdout.reconfigure(encoding='utf-8')
 
-print("=== 주식 포지션 오늘 시뮬레이션 결과 ===")
-total_stock_pnl = 0.0
-total_stock_buy_value = 0.0
-total_stock_sell_value = 0.0
+# Constants
+POINT_VALUE = 50000  # Mini KOSPI 200 Futures multiplier (50,000 KRW)
+COMMISSION_PER_ORDER = 2012.5  # Approx round-turn commission per order (2,012.5 KRW)
 
-stock_summary = []
+# June 22 actual trades:
+# Fixed SL was 5.0pt, so dynamic floor of 4.0pt has no effect since SL was already 5.0pt.
+# No changes.
+j22_actual = [
+    {"type": "LONG", "entry": 1471.00, "exit": 1501.50, "pnl": 30.50, "reason": "Take Profit"},
+    {"type": "LONG", "entry": 1505.42, "exit": 1505.16, "pnl": -0.26, "reason": "Take Profit (Adjusted)"},
+    {"type": "LONG", "entry": 1497.90, "exit": 1492.90, "pnl": -5.00, "reason": "Stop Loss"},
+    {"type": "LONG", "entry": 1497.28, "exit": 1492.08, "pnl": -5.20, "reason": "Stop Loss"},
+    {"type": "LONG", "entry": 1495.00, "exit": 1490.08, "pnl": -4.92, "reason": "Stop Loss"},
+    {"type": "LONG", "entry": 1492.80, "exit": 1487.66, "pnl": -5.14, "reason": "Stop Loss"},
+    {"type": "LONG", "entry": 1490.96, "exit": 1486.02, "pnl": -4.94, "reason": "Stop Loss"},
+    {"type": "LONG", "entry": 1489.86, "exit": 1485.02, "pnl": -4.84, "reason": "Stop Loss"},
+    {"type": "LONG", "entry": 1488.88, "exit": 1495.94, "pnl": 7.06, "reason": "Carry-over Exit (June 23)"}
+]
 
-for s in stocks:
-    code = s['code']
-    name = s['name']
-    strat = s['strategy']
-    qty = s['qty']
-    buy_p = s['buy_price']
+# June 23 actual trades (Baseline: SL=2.40pt):
+j23_baseline = [
+    {"type": "LONG", "entry": 1483.68, "exit": 1480.96, "pnl": -2.72, "reason": "Stop Loss"},
+    {"type": "LONG", "entry": 1482.94, "exit": 1480.50, "pnl": -2.44, "reason": "Stop Loss"},
+    {"type": "LONG", "entry": 1483.62, "exit": 1487.70, "pnl": 4.08, "reason": "Trailing Stop"},
+    {"type": "LONG", "entry": 1489.78, "exit": 1489.70, "pnl": -0.08, "reason": "Take Profit (3Sig)"},
+    {"type": "LONG", "entry": 1491.98, "exit": 1491.64, "pnl": -0.34, "reason": "Take Profit (3Sig)"},
+    {"type": "LONG", "entry": 1486.08, "exit": 1483.78, "pnl": -2.30, "reason": "Stop Loss"},
+    {"type": "LONG", "entry": 1486.06, "exit": 1483.60, "pnl": -2.46, "reason": "Stop Loss"}
+]
+
+# June 23 Dynamic Floor (SL=4.00pt):
+# Under Dynamic SL, the stopped-out trades are hit at 4.0pt instead of 2.4pt.
+j23_dynamic = [
+    {"type": "LONG", "entry": 1483.68, "exit": 1479.68, "pnl": -4.00, "reason": "Stop Loss"},
+    {"type": "LONG", "entry": 1482.94, "exit": 1478.94, "pnl": -4.00, "reason": "Stop Loss"},
+    {"type": "LONG", "entry": 1483.62, "exit": 1487.70, "pnl": 4.08, "reason": "Trailing Stop"},
+    {"type": "LONG", "entry": 1489.78, "exit": 1489.70, "pnl": -0.08, "reason": "Take Profit (3Sig)"},
+    {"type": "LONG", "entry": 1491.98, "exit": 1491.64, "pnl": -0.34, "reason": "Take Profit (3Sig)"},
+    {"type": "LONG", "entry": 1486.08, "exit": 1482.08, "pnl": -4.00, "reason": "Stop Loss"},
+    {"type": "LONG", "entry": 1486.06, "exit": 1482.06, "pnl": -4.00, "reason": "Stop Loss"}
+]
+
+# June 24 actual trades (Baseline: SL=2.40pt):
+j24_baseline = [
+    {"type": "SHORT", "entry": 1341.78, "exit": 1344.38, "pnl": -2.60, "reason": "Stop Loss"},
+    {"type": "SHORT", "entry": 1338.52, "exit": 1340.92, "pnl": -2.40, "reason": "Stop Loss"},
+    {"type": "SHORT", "entry": 1357.00, "exit": 1348.28, "pnl": 8.72, "reason": "Trailing Stop"},
+    {"type": "SHORT", "entry": 1341.88, "exit": 1344.42, "pnl": -2.54, "reason": "Stop Loss"}
+]
+
+# June 24 Dynamic Floor (SL=4.00pt):
+# Under Dynamic SL, the stopped-out trades are hit at 4.0pt instead of 2.4pt.
+j24_dynamic = [
+    {"type": "SHORT", "entry": 1341.78, "exit": 1345.78, "pnl": -4.00, "reason": "Stop Loss"},
+    {"type": "SHORT", "entry": 1338.52, "exit": 1342.52, "pnl": -4.00, "reason": "Stop Loss"},
+    {"type": "SHORT", "entry": 1357.00, "exit": 1348.28, "pnl": 8.72, "reason": "Trailing Stop"},
+    {"type": "SHORT", "entry": 1341.88, "exit": 1345.88, "pnl": -4.00, "reason": "Stop Loss"}
+]
+
+def analyze_day(name, baseline_trades, dynamic_trades, carry_over_baseline=0, carry_over_dynamic=0):
+    print(f"\n--- {name} Analysis ---")
     
-    # Exits:
-    exit_price = s['close'] # default exit is close
-    exit_reason = "15:15 장마감 일괄청산" if strat == 'DAY' else "15:14 종가 10MA 이탈 청산"
+    # Calculate baseline
+    b_pts = sum(t["pnl"] for t in baseline_trades) + carry_over_baseline
+    b_gross = b_pts * POINT_VALUE
+    b_orders = len(baseline_trades) * 2 + (1 if carry_over_baseline != 0 else 0)
+    b_comm = b_orders * COMMISSION_PER_ORDER
+    b_net = b_gross - b_comm
+    b_sl = sum(1 for t in baseline_trades if t["reason"] == "Stop Loss")
+    b_tp = sum(1 for t in baseline_trades if "Take Profit" in t["reason"])
+    b_ts = sum(1 for t in baseline_trades if t["reason"] == "Trailing Stop")
     
-    # Check DAY stop loss
-    if strat == 'DAY':
-        sl_price = int(buy_p * 0.98)
-        if s['open'] < sl_price:
-            exit_price = s['open']
-            exit_reason = f"시초가 갭하락 손절 (-2% 이하 시가 청산)"
-        elif s['low'] <= sl_price:
-            exit_price = sl_price
-            exit_reason = f"장중 고정 손절선(-2%) 터치 청산"
+    # Calculate dynamic
+    d_pts = sum(t["pnl"] for t in dynamic_trades) + carry_over_dynamic
+    d_gross = d_pts * POINT_VALUE
+    d_orders = len(dynamic_trades) * 2 + (1 if carry_over_dynamic != 0 else 0)
+    d_comm = d_orders * COMMISSION_PER_ORDER
+    d_net = d_gross - d_comm
+    d_sl = sum(1 for t in dynamic_trades if t["reason"] == "Stop Loss")
+    d_tp = sum(1 for t in dynamic_trades if "Take Profit" in t["reason"])
+    d_ts = sum(1 for t in dynamic_trades if t["reason"] == "Trailing Stop")
     
-    # Check SWING 5MA/10MA breach (15:14 close check)
-    elif strat == 'SWING':
-        # hard stop loss: we don't have breakout open price, but we check if today's close is below 10MA
-        if s['close'] < s['ma_10']:
-            exit_price = s['close']
-            exit_reason = "종가 10MA 이탈 전량 청산"
-        elif s['close'] < s['ma_5']:
-            # half sold
-            exit_price = s['close']
-            exit_reason = "종가 5MA 이탈 50% 청산 (나머지 홀딩)"
-            # we will assume 50% sold at close
-        else:
-            exit_price = s['close']
-            exit_reason = "조건 만족 홀딩 (청산 없음)"
-            
-    # Calculate PnL
-    buy_val = buy_p * qty
+    print(f"Baseline: Trades={len(baseline_trades)}, SL={b_sl}, TP={b_tp}, TS={b_ts}, PnL={b_pts:+.2f} pt | Gross={b_gross:+,.0f}원 | Comm={b_comm:,.0f}원 | Net={b_net:+,.0f}원")
+    print(f"Dynamic:  Trades={len(dynamic_trades)}, SL={d_sl}, TP={d_tp}, TS={d_ts}, PnL={d_pts:+.2f} pt | Gross={d_gross:+,.0f}원 | Comm={d_comm:,.0f}원 | Net={d_net:+,.0f}원")
+    print(f"Changes:  SL={d_sl-b_sl:+d}, TP={d_tp-b_tp:+d}, TS={d_ts-b_ts:+d}, PnL={d_pts-b_pts:+.2f} pt | Net PnL={d_net-b_net:+,.0f}원")
     
-    if exit_reason == "종가 5MA 이탈 50% 청산 (나머지 홀딩)":
-        sell_val = (exit_price * (qty / 2)) + (s['close'] * (qty / 2)) # in this case it's same, but for bookkeeping
-        pnl = (exit_price - buy_p) * (qty / 2) # PnL of the sold half
-        pnl_pct = ((exit_price / buy_p) - 1.0) * 100
-        # for reporting, we count it as half liquidated
-        status = f"50% 매도 ({qty/2:.1f}주)"
-    elif exit_reason == "조건 만족 홀딩 (청산 없음)":
-        sell_val = s['close'] * qty
-        pnl = (s['close'] - buy_p) * qty # floating pnl
-        pnl_pct = ((s['close'] / buy_p) - 1.0) * 100
-        status = "홀딩"
-    else:
-        sell_val = exit_price * qty
-        pnl = (exit_price - buy_p) * qty
-        pnl_pct = ((exit_price / buy_p) - 1.0) * 100
-        status = "전량 매도"
-        
-    total_stock_pnl += pnl
-    total_stock_buy_value += buy_val
-    if status == "전량 매도" or status.startswith("50%"):
-        total_stock_sell_value += sell_val
-    else:
-        total_stock_sell_value += buy_val # keep capital same for holding
-        
-    stock_summary.append({
-        'name': name,
-        'code': code,
-        'strat': strat,
-        'qty': qty,
-        'buy_p': buy_p,
-        'exit_p': exit_price,
-        'pnl': pnl,
-        'pnl_pct': pnl_pct,
-        'reason': exit_reason,
-        'status': status
-    })
+    return {
+        "b_sl": b_sl, "b_tp": b_tp, "b_ts": b_ts, "b_net": b_net, "b_pts": b_pts,
+        "d_sl": d_sl, "d_tp": d_tp, "d_ts": d_ts, "d_net": d_net, "d_pts": d_pts
+    }
 
-print("\n상세 요약:")
-for ss in stock_summary:
-    print(f"[{ss['strat']}] {ss['name']}({ss['code']}) {ss['qty']}주 | 평단 {ss['buy_p']:,}원 -> 청산/종가 {ss['exit_p']:,}원 | 손익: {ss['pnl']:+,.0f}원 ({ss['pnl_pct']:+.2f}%) | 사유: {ss['reason']}")
+print("================================================================================")
+print("  COMPARING BASELINE (ACTUAL) vs DYNAMIC STOP LOSS FLOOR (RECOMMENDED)")
+print("================================================================================")
 
-print("\n=== 주식 종합 성과 ===")
-print(f"총 매입 금액: {total_stock_buy_value:,.0f}원")
-print(f"총 실현/평가 손익: {total_stock_pnl:+,.0f}원 (수익률: {total_stock_pnl/total_stock_buy_value*100:+.2f}%)")
+r22 = analyze_day("June 22 (Floor 5.0 already applied, no change)", j22_actual[:-1], j22_actual[:-1], carry_over_baseline=j22_actual[-1]["pnl"], carry_over_dynamic=j22_actual[-1]["pnl"])
+r23 = analyze_day("June 23 (Kalman Strategy SL 2.40pt -> Floor 4.00pt)", j23_baseline, j23_dynamic)
+r24 = analyze_day("June 24 (Today, Kalman Strategy SL 2.40pt -> Floor 4.00pt)", j24_baseline, j24_dynamic)
+
+print("\n" + "="*80)
+print("  AGGREGATE 3-DAY SUMMARY")
+print("="*80)
+total_b_sl = r22["b_sl"] + r23["b_sl"] + r24["b_sl"]
+total_d_sl = r22["d_sl"] + r23["d_sl"] + r24["d_sl"]
+total_b_tp = r22["b_tp"] + r23["b_tp"] + r24["b_tp"]
+total_d_tp = r22["d_tp"] + r23["d_tp"] + r24["d_tp"]
+total_b_ts = r22["b_ts"] + r23["b_ts"] + r24["b_ts"]
+total_d_ts = r22["d_ts"] + r23["d_ts"] + r24["d_ts"]
+total_b_net = r22["b_net"] + r23["b_net"] + r24["b_net"]
+total_d_net = r22["d_net"] + r23["d_net"] + r24["d_net"]
+
+print(f"Total Baseline: SL={total_b_sl}, TP={total_b_tp}, TS={total_b_ts}, Net Profit={total_b_net:+,.0f}원")
+print(f"Total Dynamic:  SL={total_d_sl}, TP={total_d_tp}, TS={total_d_ts}, Net Profit={total_d_net:+,.0f}원")
+print(f"Aggregate Difference: SL={total_d_sl-total_b_sl:+d}, TP={total_d_tp-total_b_tp:+d}, TS={total_d_ts-total_b_ts:+d}, Net PnL={total_d_net-total_b_net:+,.0f}원")
+print("="*80)
