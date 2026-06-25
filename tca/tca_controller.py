@@ -853,6 +853,16 @@ class TCAController:
             import time
             time.sleep(2)
             os.system("shutdown /r /t 5 /f")
+        elif cmd_text == "!컴퓨터종료":
+            self.send_message("🔌 <b>[원격 일반 종료 명령 수신]</b>\n\n윈도우 시작 메뉴의 시스템 종료와 동일한 방식으로 컴퓨터를 안전하게 종료합니다. (저장되지 않은 파일이 있으면 대기하거나 취소될 수 있습니다.)")
+            import time
+            time.sleep(2)
+            os.system("shutdown /s /t 5")
+        elif cmd_text == "!컴퓨터강제종료":
+            self.send_message("🚨 <b>[원격 강제 종료 명령 수신]</b>\n\n열려 있는 모든 프로그램을 강제로 닫고 즉시 컴퓨터를 종료합니다.")
+            import time
+            time.sleep(2)
+            os.system("shutdown /s /t 5 /f")
             
         elif cmd_text.startswith("!매도"):
             try:
