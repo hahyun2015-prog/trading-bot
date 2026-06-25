@@ -548,6 +548,11 @@ class ERAOrderManager:
         self.sar_af_step = 0.02       # AF 증가폭
         self.sar_af_max = 0.20        # AF 최대값
 
+        # BB + PSAR 결합 필터 실시간 변수
+        self.current_bb_mid = 0.0
+        self.current_bb_bandwidth = 0.0
+        self.current_bb_squeeze_limit = 0.0
+
         # 볼린저 밴드 역추세 전략 상태변수
         self.bb_close_buf = []        # 실시간 5분봉 종가 롤링 버퍼
         self.bb_window    = 20        # 볼린저 밴드 창 크기 (config에서 덮어쓰기 가능)
@@ -678,6 +683,11 @@ class ERAOrderManager:
             self.futures_take_profit_pt = max(round(atr_val * 2.0, 2), 4.0)
             self.futures_atr_14 = float(atr_val)
             
+            # Parabolic SAR 전략인 경우 볼린저 밴드 필터 실시간 변수 초기화
+            if getattr(self, "futures_strategy_type", "") == "parabolic_sar":
+                target_code = getattr(self, "real_day_code", "10100000")
+                self.update_bb_psar_filters(target_code)
+            
             print(f"[AMATS 파생 최적화] 선물 동적 Kalman ATR 적용 완료: Kalman ATR={atr_val:.2f}pt ➡️ 손절={self.futures_stop_loss_pt}pt | 익절={self.futures_take_profit_pt}pt")
         except Exception as dynamic_err:
             print(f"[AMATS 파생 최적화] 동적 익손절 계산 에러 (기본 고정값 유지): {dynamic_err}")
@@ -702,6 +712,44 @@ class ERAOrderManager:
         except Exception as e:
             print(f"[주간선물] 금일 고/저가 DB 조회 실패: {e}")
         return 0.0, 0.0
+
+    def update_bb_psar_filters(self, code):
+        """실시간 선물 데이터에서 볼린저 밴드 중심선 및 Squeeze 필터 변수 업데이트"""
+        try:
+            import pandas as pd
+            import numpy as np
+            if not os.path.exists(self.futures_db_path):
+                return
+            conn = sqlite3.connect(self.futures_db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            # 볼린저 밴드 및 100봉 롤링 Squeeze 계산을 위해 충분한 5분봉 조회 (최근 250개)
+            df = pd.read_sql(
+                f"SELECT close FROM futures_ohlcv WHERE code='{code}' ORDER BY date DESC LIMIT 250", conn
+            )
+            conn.close()
+            
+            if df.empty or len(df) < 120:
+                return
+            
+            df = df.iloc[::-1].reset_index(drop=True) # 과거에서 최근 순으로 정렬
+            
+            # BB(20, 2)
+            df['sma20'] = df['close'].rolling(window=20).mean()
+            df['std20'] = df['close'].rolling(window=20).std()
+            df['bb_upper'] = df['sma20'] + 2 * df['std20']
+            df['bb_lower'] = df['sma20'] - 2 * df['std20']
+            df['bandwidth'] = (df['bb_upper'] - df['bb_lower']) / df['sma20']
+            # Squeeze Limit (최근 100봉의 25% 분위수)
+            df['squeeze_limit'] = df['bandwidth'].rolling(window=100).quantile(0.25)
+            
+            last_row = df.iloc[-1]
+            if not pd.isna(last_row['sma20']):
+                self.current_bb_mid = float(last_row['sma20'])
+                self.current_bb_bandwidth = float(last_row['bandwidth'])
+                self.current_bb_squeeze_limit = float(last_row['squeeze_limit'])
+                print(f"[ERA BB 필터] 갱신 완료 | 중심선={self.current_bb_mid:.2f} | 밴드폭={self.current_bb_bandwidth*100:.2f}% (임계={self.current_bb_squeeze_limit*100:.2f}%)")
+        except Exception as e:
+            print(f"[ERA BB 필터 오류] {e}")
 
     def update_kalman_targets(self, code):
         """로컬 DB의 최근 5분봉 데이터를 활용해 칼만 필터 예측값 및 오차 표준편차를 구하고 돌파 타점을 설정하며, 60분봉 장기 추세 필터를 계산합니다."""
@@ -2170,6 +2218,8 @@ class ERAOrderManager:
                 self._flush_ohlcv_buffer()
                 if getattr(self, "futures_strategy_type", "volatility_breakout") == "kalman":
                     self.update_kalman_targets(code)
+                elif getattr(self, "futures_strategy_type", "volatility_breakout") == "parabolic_sar":
+                    self.update_bb_psar_filters(code)
         else:
             c = buf[period_str]
             if price > c['h']:
@@ -3390,9 +3440,13 @@ class ERAOrderManager:
 
         # ── 신규 진입 조건 (09:00 장 초반 15분 노이즈 필터 연동) ──
         if not self.futures_order_locked and not self.system_halted:
-            # Parabolic SAR / Bollinger Band 전략은 거래 횟수 제한 제외
-            is_unlimited = getattr(self, "futures_strategy_type", "") in ["parabolic_sar", "bollinger_band"]
+            # Parabolic SAR / Bollinger Band / Kalman 전략은 거래 횟수 제한 제외 (무제한)
+            is_unlimited = getattr(self, "futures_strategy_type", "") in ["parabolic_sar", "bollinger_band", "kalman"]
             if not is_unlimited and self.futures_day_trade_count >= self.futures_max_trades_day:
+                return
+            # 칼만 필터는 무제한 거래 중에도 3회 연속 손실 시 즉시 당일 거래 정지
+            is_kalman = (getattr(self, "futures_strategy_type", "") == "kalman")
+            if is_kalman and getattr(self, "futures_day_consecutive_losses", 0) >= 3:
                 return
             is_after_9 = (now.hour == 9 and now.minute >= 0) or (now.hour > 9)
             if is_after_9:
@@ -3410,6 +3464,15 @@ class ERAOrderManager:
                     if is_kalman and trend == "DOWN":
                         return
                     if self._is_reentry_allowed("LONG", current_price, is_night=False):
+                            # 볼린저 밴드 결합 필터링
+                            if getattr(self, "futures_strategy_type", "") == "parabolic_sar" and self.current_bb_mid > 0:
+                                if self.current_bb_bandwidth < self.current_bb_squeeze_limit:
+                                    print(f"[주간선물(SAR)] 🚫 LONG 진입 차단 (Squeeze 수축 구간): 밴드폭={self.current_bb_bandwidth*100:.2f}% (임계={self.current_bb_squeeze_limit*100:.2f}%)")
+                                    return
+                                if current_price <= self.current_bb_mid:
+                                    print(f"[주간선물(SAR)] 🚫 LONG 진입 차단 (방향성 부적합): 현재가 {current_price:.2f} <= BB 중심선 {self.current_bb_mid:.2f}")
+                                    return
+                            
                             self.futures_day_entry_price = current_price
                             self.futures_day_peak = current_price # 진입 즉시 초기화
                             # Parabolic SAR 진입 초기화
@@ -3427,6 +3490,15 @@ class ERAOrderManager:
                     if is_kalman and trend == "UP":
                         return
                     if self._is_reentry_allowed("SHORT", current_price, is_night=False):
+                            # 볼린저 밴드 결합 필터링
+                            if getattr(self, "futures_strategy_type", "") == "parabolic_sar" and self.current_bb_mid > 0:
+                                if self.current_bb_bandwidth < self.current_bb_squeeze_limit:
+                                    print(f"[주간선물(SAR)] 🚫 SHORT 진입 차단 (Squeeze 수축 구간): 밴드폭={self.current_bb_bandwidth*100:.2f}% (임계={self.current_bb_squeeze_limit*100:.2f}%)")
+                                    return
+                                if current_price >= self.current_bb_mid:
+                                    print(f"[주간선물(SAR)] 🚫 SHORT 진입 차단 (방향성 부적합): 현재가 {current_price:.2f} >= BB 중심선 {self.current_bb_mid:.2f}")
+                                    return
+                            
                             self.futures_day_entry_price = current_price
                             self.futures_day_peak = current_price # 진입 즉시 초기화
                             # Parabolic SAR 진입 초기화
@@ -3634,9 +3706,13 @@ class ERAOrderManager:
 
         # ── 신규 진입 조건 ──
         if not self.futures_night_order_locked and not self.system_halted:
-            # Parabolic SAR / Bollinger Band 전략은 거래 횟수 제한 제외
-            is_unlimited = getattr(self, "futures_strategy_type", "") in ["parabolic_sar", "bollinger_band"]
+            # Parabolic SAR / Bollinger Band / Kalman 전략은 거래 횟수 제한 제외 (무제한)
+            is_unlimited = getattr(self, "futures_strategy_type", "") in ["parabolic_sar", "bollinger_band", "kalman"]
             if not is_unlimited and self.futures_night_trade_count >= self.futures_max_trades_night:
+                return
+            # 칼만 필터는 무제한 거래 중에도 3회 연속 손실 시 즉시 당일 거래 정지
+            is_kalman = (getattr(self, "futures_strategy_type", "") == "kalman")
+            if is_kalman and getattr(self, "futures_night_consecutive_losses", 0) >= 3:
                 return
             # [AMATS 최적화] 초저변동성 구간 진입 차단 필터링 (ATR Cutoff)
             atr_val = getattr(self, 'futures_atr_14', 2.0)

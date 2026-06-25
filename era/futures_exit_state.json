@@ -1,10 +1,10 @@
 {
     "last_long_exit_price": 0.0,
-    "last_short_exit_price": 1344.42,
+    "last_short_exit_price": 0.0,
     "night_last_long_exit_price": 0.0,
     "night_last_short_exit_price": 0.0,
-    "day_consecutive_losses": 1,
+    "day_consecutive_losses": 0,
     "night_consecutive_losses": 0,
-    "day_trade_count": 4,
+    "day_trade_count": 0,
     "night_trade_count": 0
 }
