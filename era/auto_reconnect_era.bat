@@ -3,6 +3,27 @@ rem chcp 65001 (Disabled to prevent CMD UTF-8 parser bug)
 title AMATS ERA Auto-Reconnect
 color 0C
 
+fltmc >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [*] 관리자 권한을 요청 중입니다... (UAC 승인 필요)
+    goto UACPrompt
+) else ( goto gotAdmin )
+
+:UACPrompt
+    if "%~1"=="--elevated" (
+        echo [ERROR] Failed to obtain Administrator privileges after elevation attempt.
+        echo Please run this script manually as Administrator.
+        pause
+        exit /B 1
+    )
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -ArgumentList '--elevated' -Verb RunAs"
+    exit /B
+
+:gotAdmin
+    if "%~1"=="--elevated" shift
+    pushd "%CD%"
+    CD /D "%~dp0"
+
 echo ===================================================
 echo     AMATS ERA Auto-Reconnecting System
 echo ===================================================

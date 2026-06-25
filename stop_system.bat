@@ -1,22 +1,29 @@
 @echo off
 cls
 
-:: 관리자 권한 자동 승격 (UAC) 확보
-net session >nul 2>&1
+fltmc >nul 2>&1
 if %errorlevel% neq 0 (
     echo [*] 관리자 권한을 요청 중입니다... (UAC 승인 필요)
     goto UACPrompt
 ) else ( goto gotAdmin )
 
+
 :UACPrompt
+    if "%~1"=="--elevated" (
+        echo [ERROR] Failed to obtain Administrator privileges after elevation attempt.
+        echo Please run this script manually as Administrator.
+        pause
+        exit /B 1
+    )
     if "%~1"=="" (
-        powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -ArgumentList '--elevated' -Verb RunAs"
     ) else (
-        powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -ArgumentList '%*' -Verb RunAs"
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -ArgumentList '--elevated %*' -Verb RunAs"
     )
     exit /B
 
 :gotAdmin
+    if "%~1"=="--elevated" shift
     pushd "%CD%"
     CD /D "%~dp0"
 
