@@ -384,7 +384,7 @@ class TCAController:
                 trend = strat_info.get("trend_direction", "NEUTRAL")
                 night_trend = strat_info.get("night_trend_direction", "NEUTRAL")
                 std_error = strat_info.get("std_error", 0.5)
-                kf_sl_mult = strat_info.get("kf_sl_mult", 3.4)
+                kf_sl_mult = strat_info.get("kf_sl_mult", 5.0)
                 msg += f"🧠 전략: <b>칼만 필터(Kalman)</b>\n"
                 msg += f"📐 주간 추세: <b>{trend}</b> | 야간 추세: <b>{night_trend}</b>\n"
                 msg += f"📊 잔차 표준편차: {std_error:.2f} | 손절 배수: {kf_sl_mult:.1f}배 (하이브리드 동적) | 익절: 동적 3-Sigma\n"

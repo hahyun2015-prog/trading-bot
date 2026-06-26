@@ -534,7 +534,7 @@ class ERAOrderManager:
         self.futures_last_long_exit_price = 0.0  # 재진입 방지용 최종 청산가
         self.futures_last_short_exit_price = 0.0
         self.futures_std_error = 0.5            # Kalman Filter 최근 주간 잔차 표준편차
-        self.futures_kf_sl_mult = 3.4           # Kalman Filter 하이브리드 손절 배수 (최적값 3.4)
+        self.futures_kf_sl_mult = 5.0           # Kalman Filter 하이브리드 손절 배수 (최적값 5.0)
         self.futures_trend_direction = "NEUTRAL" # 60분봉 장기 칼만 추세 필터
         self.futures_day_session_high = 0.0     # 금일 주간 세션 고가
         self.futures_day_session_low = 0.0      # 금일 주간 세션 저가
@@ -923,7 +923,7 @@ class ERAOrderManager:
             self.futures_kf_q = float(futures_settings.get("kf_q", 0.0001))
             self.futures_kf_r = float(futures_settings.get("kf_r", 0.5))
             self.futures_kf_mult = float(futures_settings.get("kf_mult", 1.0))
-            self.futures_kf_sl_mult = float(futures_settings.get("kf_sl_mult", 3.4))
+            self.futures_kf_sl_mult = float(futures_settings.get("kf_sl_mult", 5.0))
             self.sar_af_init = float(futures_settings.get("sar_af_init", 0.02))
             self.sar_af_step = float(futures_settings.get("sar_af_step", 0.02))
             self.sar_af_max  = float(futures_settings.get("sar_af_max", 0.20))
@@ -3151,8 +3151,10 @@ class ERAOrderManager:
 
                     if is_kalman:
                         c_std = getattr(self, "futures_std_error", 0.5)
-                        # 변동성 비례 동적 손절 상한선 (Dynamic Cap)
-                        sl_limit = max(min(self.futures_kf_sl_mult * c_std, 1.2 * getattr(self, "futures_atr_14", 5.0)), 2.0)
+                        # 변동성 비례 동적 손절 상한선 (Dynamic Cap) + ATR 연동형 동적 손절 하한선 (Floor)
+                        c_atr = getattr(self, "futures_atr_14", 5.0)
+                        sl_floor = max(0.5 * c_atr, 2.0)
+                        sl_limit = max(min(self.futures_kf_sl_mult * c_std, 1.2 * c_atr), sl_floor)
                     elif is_sar:
                         # Parabolic SAR: ATR 기반 초기 손절
                         sl_limit = max(getattr(self, "futures_atr_14", 5.0) * 1.0, 2.0)
@@ -3578,8 +3580,10 @@ class ERAOrderManager:
                     is_kalman = (getattr(self, "futures_strategy_type", "volatility_breakout") == "kalman")
                     if is_kalman:
                         c_std = getattr(self, "futures_night_std_error", 0.5)
-                        # 제안 A: 변동성 비례 동적 손절 상한선 (Dynamic Cap)
-                        sl_limit = max(min(self.futures_kf_sl_mult * c_std, 1.2 * getattr(self, "futures_atr_14", 5.0)), 2.0)
+                        # 변동성 비례 동적 손절 상한선 (Dynamic Cap) + ATR 연동형 동적 손절 하한선 (Floor)
+                        c_atr = getattr(self, "futures_atr_14", 5.0)
+                        sl_floor = max(0.5 * c_atr, 2.0)
+                        sl_limit = max(min(self.futures_kf_sl_mult * c_std, 1.2 * c_atr), sl_floor)
                     else:
                         sl_limit = self.futures_night_stop_loss_pt
                         
