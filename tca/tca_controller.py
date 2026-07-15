@@ -18,10 +18,27 @@ log_file = os.path.join(current_dir, "tca_controller.log")
 
 # 윈도우 CP949 콘솔 인코딩 에러(이모지 출력 크래시) 원천 방지 래퍼 클래스 + 파일 실시간 백업 로깅
 class SafeStreamWrapper:
+    MAX_LOG_BYTES = 20 * 1024 * 1024  # 로그 파일 1개당 20MB 제한 (무인 장기운영 시 디스크 무한증가 방지)
+    BACKUP_COUNT = 3                  # .1~.3까지 회전 보관, 그 이상은 삭제
+
     def __init__(self, original_stream, log_file_path=None):
         self.original_stream = original_stream
         self.log_file_path = log_file_path
-        
+
+    def _rotate_if_needed(self):
+        try:
+            if os.path.exists(self.log_file_path) and os.path.getsize(self.log_file_path) >= self.MAX_LOG_BYTES:
+                for i in range(self.BACKUP_COUNT - 1, 0, -1):
+                    src = f"{self.log_file_path}.{i}"
+                    dst = f"{self.log_file_path}.{i + 1}"
+                    if os.path.exists(src):
+                        if os.path.exists(dst):
+                            os.remove(dst)
+                        os.rename(src, dst)
+                os.rename(self.log_file_path, f"{self.log_file_path}.1")
+        except Exception:
+            pass  # 회전 실패해도 로깅 자체는 계속 진행되어야 함
+
     def write(self, data):
         if not data:
             return
@@ -42,15 +59,16 @@ class SafeStreamWrapper:
                 self.original_stream.write(cleaned_data)
         except Exception:
             pass  # 콘솔 핸들 유실(OSError 등) 전체 예외 원천 방어
-            
-        # 2. 파일 실시간 백업 로깅
+
+        # 2. 파일 실시간 백업 로깅 (크기 초과 시 회전)
         if self.log_file_path:
             try:
+                self._rotate_if_needed()
                 with open(self.log_file_path, "a", encoding="utf-8") as f:
                     f.write(data)
             except Exception:
                 pass
-            
+
     def flush(self):
         self.original_stream.flush()
 
@@ -75,24 +93,54 @@ class TCAController:
 
         self.load_config()
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
-        self._last_bqa_run_date = ""  # BQA 무인 스케줄러 중복 가동 방지
+        self.scheduler_state_path = os.path.join(workspace_root, "tca", "scheduler_state.json")
         self._bqa_check_timer = 0     # BQA 검사 주기 조절용
-        
-        # 금일 RSA 실행 여부 초기 감지
-        self._last_rsa_run_date = ""
+
+        # RSA/BQA 무인 스케줄러 중복 가동 방지용 마지막 실행일 — 메모리 변수만으로는 TCA가
+        # 재시작(크래시/업데이트 등)되면 초기화되어 같은 날 다시 트리거될 수 있어서, 디스크에
+        # 영속화된 상태 파일로 복원한다.
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        state = self._load_scheduler_state()
+        self._last_bqa_run_date = state.get("last_bqa_run_date", "")
+        self._last_rsa_run_date = state.get("last_rsa_run_date", "")
+        self._last_sta_run_date = state.get("last_sta_run_date", "")
+
+        # 금일 RSA 실행 여부 추가 감지 (상태 파일이 없거나 유실된 경우의 2차 방어 — DB 실적 기준)
+        if self._last_rsa_run_date != today_str:
+            try:
+                import sqlite3
+                conn = sqlite3.connect(self.db_path, timeout=30)
+                cursor = conn.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='research_reports'")
+                if cursor.fetchone():
+                    cursor.execute("SELECT COUNT(1) FROM research_reports WHERE date(timestamp) = ?", (today_str,))
+                    if cursor.fetchone()[0] > 0:
+                        self._last_rsa_run_date = today_str
+                conn.close()
+            except Exception as e:
+                print(f"[TCA] 금일 RSA 이력 확인 실패: {e}")
+
+    def _load_scheduler_state(self):
+        """RSA/BQA 마지막 실행일을 디스크에서 복원 (TCA 재시작 시 중복 트리거 방지)"""
         try:
-            import sqlite3
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            conn = sqlite3.connect(self.db_path, timeout=30)
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='research_reports'")
-            if cursor.fetchone():
-                cursor.execute("SELECT COUNT(1) FROM research_reports WHERE date(timestamp) = ?", (today_str,))
-                if cursor.fetchone()[0] > 0:
-                    self._last_rsa_run_date = today_str
-            conn.close()
+            if os.path.exists(self.scheduler_state_path):
+                with open(self.scheduler_state_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
         except Exception as e:
-            print(f"[TCA] 금일 RSA 이력 확인 실패: {e}")
+            print(f"[TCA] 스케줄러 상태 파일 로드 실패: {e}")
+        return {}
+
+    def _save_scheduler_state(self):
+        """RSA/BQA/STA 마지막 실행일을 디스크에 영속화"""
+        try:
+            with open(self.scheduler_state_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "last_rsa_run_date": self._last_rsa_run_date,
+                    "last_bqa_run_date": self._last_bqa_run_date,
+                    "last_sta_run_date": self._last_sta_run_date,
+                }, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[TCA] 스케줄러 상태 파일 저장 실패: {e}")
 
     def load_config(self):
         try:
@@ -209,6 +257,34 @@ class TCAController:
         
         return active_stock, active_futures, single_data
 
+    def _open_positions_warning(self):
+        """종료/재부팅류 명령 실행 전 보유 포지션 유무를 확인해 경고 문구를 만든다.
+        손절/트레일링/익절이 브로커 상주 스탑주문이 아니라 ERA 프로세스 내부 폴링으로만
+        동작하므로, ERA가 죽어있는 동안 보유 포지션은 완전히 무방비 상태가 된다."""
+        try:
+            stock_data, futures_data, single_data = self._load_all_status()
+            s_data = stock_data or single_data or {}
+            f_data = futures_data or single_data or {}
+            stock_cnt = len(s_data.get("portfolio", {}) or {})
+            futures_cnt = len(f_data.get("futures_positions", {}) or {})
+            if stock_cnt == 0 and futures_cnt == 0:
+                return ""
+            return (
+                f"\n\n⚠️ <b>[보유 포지션 주의]</b> 현재 주식 {stock_cnt}종목 / 선물 {futures_cnt}건 보유 중입니다.\n"
+                f"ERA가 꺼져 있는 동안에는 손절/익절/트레일링이 전혀 동작하지 않으니 유의하세요."
+            )
+        except Exception as e:
+            return f"\n\n⚠️ 보유 포지션 확인 실패({e}) — 확인 전 상태이니 주의하세요."
+
+    def _atomic_write_json(self, path, data):
+        """config_local.json을 임시파일에 쓴 뒤 os.replace로 원자적 치환한다.
+        era_order_manager.py의 apply_to_config()도 같은 파일을 주기적으로
+        read-modify-write하므로, 직접 write하면 두 프로세스가 겹치는 타이밍에
+        한쪽 변경사항이 조용히 유실될 수 있었다."""
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+        os.replace(tmp_path, path)
 
     def send_message(self, text):
         if notifier:
@@ -222,40 +298,59 @@ class TCAController:
                 print(f"[TCA Send Message Error] {e}")
 
     def _kill_era_process(self):
-        """PID 파일을 이용해 ERA 프로세스만 정확히 종료"""
+        """PID 파일을 이용해 ERA 프로세스를 종료하고, PID 파일이 유실/불일치해도
+        cmdline 광범위 스캔으로 잔존 프로세스를 잡아내는 폴백을 항상 병행한다."""
+        killed_any = False
         if os.path.exists(self.era_pid_file):
             try:
                 with open(self.era_pid_file, "r") as f:
                     pid = f.read().strip()
-                if not pid:
-                    return False
-                pid_int = int(pid)
-                
-                import psutil
-                try:
-                    if psutil.pid_exists(pid_int):
-                        proc = psutil.Process(pid_int)
-                        cmdline = proc.cmdline()
-                        is_era = any("era_order_manager" in arg for arg in cmdline)
-                        if is_era:
-                            proc.kill()
-                            proc.wait(timeout=3)
-                except (psutil.NoSuchProcess, psutil.AccessDenied) as pe:
-                    print(f"[TCA] Process kill exception: {pe}")
+                if pid:
+                    pid_int = int(pid)
 
-                # 프로세스가 실제로 종료되었는지 최종 검증
-                if psutil.pid_exists(pid_int):
-                    print(f"[TCA] ERA 프로세스(PID: {pid}) 종료 실패 (권한 부족 등)")
-                    return False
+                    import psutil
+                    try:
+                        if psutil.pid_exists(pid_int):
+                            proc = psutil.Process(pid_int)
+                            cmdline = proc.cmdline()
+                            is_era = any("era_order_manager" in arg for arg in cmdline)
+                            if is_era:
+                                proc.kill()
+                                proc.wait(timeout=3)
+                                killed_any = True
+                    except (psutil.NoSuchProcess, psutil.AccessDenied) as pe:
+                        print(f"[TCA] Process kill exception: {pe}")
+
+                    # 프로세스가 실제로 종료되었는지 검증
+                    if psutil.pid_exists(pid_int):
+                        print(f"[TCA] ERA 프로세스(PID: {pid}) 종료 실패 (권한 부족 등)")
 
                 try:
                     os.remove(self.era_pid_file)
                 except OSError:
                     pass
-                return True
             except Exception as e:
                 print(f"[TCA] PID 기반 종료 실패: {e}")
-        return False
+
+        # 2차 폴백: PID 파일이 없거나 이미 어긋난 상태에서도, cmdline에
+        # era_order_manager가 포함된 모든 프로세스를 광범위 검색해 종료한다.
+        # (check_process_status의 콘솔 타이틀 기반 2차 폴백과 견고성을 대칭화)
+        try:
+            import psutil
+            for proc in psutil.process_iter(['pid', 'cmdline']):
+                try:
+                    cmdline = proc.info.get('cmdline') or []
+                    if any("era_order_manager" in arg for arg in cmdline):
+                        proc.kill()
+                        proc.wait(timeout=3)
+                        killed_any = True
+                        print(f"[TCA] 광범위 스캔으로 잔존 ERA 프로세스(PID: {proc.pid}) 종료")
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+                    continue
+        except Exception as e:
+            print(f"[TCA] 광범위 ERA 프로세스 스캔 실패: {e}")
+
+        return killed_any
 
     def check_process_status(self):
         try:
@@ -277,14 +372,17 @@ class TCAController:
                 except Exception as e:
                     print(f"[TCA] PID 검증 오류: {e}")
                     
-            # 2. 2차 방어 폴백: PID 파일이 유실되었어도 백그라운드 tasklist로 전체 프로세스 2차 스캔
+            # 2. 2차 방어 폴백: PID 파일이 유실되었어도 콘솔 창 제목으로 ERA를 특정해서 스캔
+            # (startup.bat이 `start "AMATS | ERA" ...`로 띄우므로 그 콘솔 타이틀이 그대로 보존됨.
+            #  과거에는 단순히 python.exe 프로세스 수 >= 2로 판단해서, 이 점검 스크립트처럼 무관한
+            #  파이썬 프로세스가 떠 있기만 해도 ERA가 켜진 것으로 오탐했음)
             if era_status == "🔴 <b>꺼짐</b>":
                 try:
-                    proc_out = subprocess.check_output("tasklist /fi \"imagename eq python.exe\" /nh", shell=True, text=True, errors='ignore')
-                    python_count = len([line for line in proc_out.splitlines() if "python.exe" in line])
-                    # TCA 본인 프로세스 외에 다른 파이썬이 돌고 있다면 켜진 것으로 유연한 긍정 판단
-                    if python_count >= 2:
-                        era_status = "🟢 <b>정상 가동 중</b>"
+                    proc_out = subprocess.check_output(
+                        "tasklist /v /fi \"imagename eq python.exe\" /fo csv", shell=True, text=True, errors='ignore'
+                    )
+                    if "AMATS | ERA" in proc_out or "AMATS|ERA" in proc_out:
+                        era_status = "🟢 <b>정상 가동 중 (창 제목 기반 추정)</b>"
                 except Exception:
                     pass
                 
@@ -768,18 +866,25 @@ class TCAController:
                         local_config["futures_settings"]["fixed_qty"] = qty_num
                         msg = f"✅ <b>선물 계약수량이 고정 [{qty_num}계약]으로 설정되었습니다.</b>"
                     
-                    with open(local_config_path, "w", encoding="utf-8") as f:
-                        json.dump(local_config, f, ensure_ascii=False, indent=4)
-                    
-                    # 백업 폴더로 동기화 복사
-                    backup_config_path = os.path.abspath(os.path.join(self.workspace_root, "..", "AI_T_Agent", "config", "config_local.json"))
-                    if os.path.exists(os.path.dirname(backup_config_path)):
+                    self._atomic_write_json(local_config_path, local_config)
+
+                    # 하이브리드 동기화 경로(SMB/GDrive)로 백업 복사 — 예전 계산식은
+                    # workspace_root와 동일 경로로 정규화되어 매번 SameFileError로 조용히
+                    # 실패하는 죽은 코드였음. 실제 별도 경로(sync.smb_path/gdrive_path)가
+                    # 설정된 경우에만 복사한다.
+                    for remote_root in (self.smb_path, self.gdrive_path):
+                        if not remote_root:
+                            continue
                         try:
-                            import shutil
-                            shutil.copy2(local_config_path, backup_config_path)
-                            print(f"[TCA] config_local.json 백업 복사 완료: {backup_config_path}")
+                            remote_config_dir = os.path.join(remote_root, "config")
+                            if os.path.isdir(remote_config_dir):
+                                backup_config_path = os.path.join(remote_config_dir, "config_local.json")
+                                if os.path.abspath(backup_config_path) != os.path.abspath(local_config_path):
+                                    import shutil
+                                    shutil.copy2(local_config_path, backup_config_path)
+                                    print(f"[TCA] config_local.json 백업 복사 완료: {backup_config_path}")
                         except Exception as ex:
-                            print(f"[TCA] 백업 복사 실패: {ex}")
+                            print(f"[TCA] 백업 복사 실패({remote_root}): {ex}")
                     
                     self.load_config()
                     self.send_message(
@@ -806,60 +911,88 @@ class TCAController:
                 self.send_message(f"❌ 계약수량 설정 오류: {e}\n(예: `!계약수량 1` 또는 `!계약수량 자동`으로 입력해 주세요.)")
             
         elif cmd_text == "!주식시작" or cmd_text == "!선물시작" or cmd_text == "!시스템시작":
-            self.send_message("⏳ AMATS 통합 주문/리스크 엔진을 구동합니다...")
-            # Kiwoom 버전 업데이트(opstarter) 충돌 방지: KOA Studio 선제 종료
-            subprocess.run("taskkill /f /im KOA_STARTER.exe 2>nul", shell=True)
-            # 기존 ERA 프로세스가 좀비로 남아있을 경우 정리
-            self._kill_era_process()
-            # config.json의 venv32 경로에서 32비트 Python 실행
-            py32_path = os.path.join(self.venv32_path, "Scripts", "python.exe")
-            if not os.path.exists(py32_path):
-                self.send_message(
-                    f"⚠️ <b>[ERA 구동 실패]</b>\n32비트 Python을 찾을 수 없습니다.\n"
-                    f"경로: <code>{py32_path}</code>\n"
-                    f"<code>setup_env.bat</code>을 실행해 venv32를 먼저 생성하세요."
-                )
-                return
-            era_script = os.path.join(workspace_root, "era", "era_order_manager.py")
-            subprocess.Popen(f'start cmd /k "{py32_path} {era_script}"', shell=True)
-            self.send_message("✅ AMATS 통합 주문/리스크 엔진 가동 시작 명령이 전달되었습니다.")
-            
+            try:
+                self.send_message("⏳ AMATS 통합 주문/리스크 엔진을 구동합니다...")
+                # Kiwoom 버전 업데이트(opstarter) 충돌 방지: KOA Studio 선제 종료
+                subprocess.run("taskkill /f /im KOA_STARTER.exe 2>nul", shell=True)
+                # 기존 ERA 프로세스가 좀비로 남아있을 경우 정리
+                self._kill_era_process()
+                # config.json의 venv32 경로에서 32비트 Python 실행
+                py32_path = os.path.join(self.venv32_path, "Scripts", "python.exe")
+                if not os.path.exists(py32_path):
+                    self.send_message(
+                        f"⚠️ <b>[ERA 구동 실패]</b>\n32비트 Python을 찾을 수 없습니다.\n"
+                        f"경로: <code>{py32_path}</code>\n"
+                        f"<code>setup_env.bat</code>을 실행해 venv32를 먼저 생성하세요."
+                    )
+                    return
+                era_script = os.path.join(workspace_root, "era", "era_order_manager.py")
+                subprocess.Popen(f'start cmd /k "{py32_path} {era_script}"', shell=True)
+                self.send_message("✅ AMATS 통합 주문/리스크 엔진 가동 시작 명령이 전달되었습니다. (기동 확인까지 최대 20초 소요)")
+
+                # 신규 프로세스가 실제로 떠 있는지 지연 검증 — 포트 9991 싱글턴 락으로 신규
+                # 프로세스가 조용히 종료돼도 무조건 성공 메시지만 나가던 상태 불일치를 방지
+                import threading
+                def _verify_era_started():
+                    time.sleep(20)
+                    try:
+                        proc_out = subprocess.check_output(
+                            "tasklist /v /fi \"imagename eq python.exe\" /fo csv", shell=True, text=True, errors='ignore'
+                        )
+                        if "AMATS | ERA" in proc_out or "AMATS|ERA" in proc_out:
+                            self.send_message("✅ <b>ERA 기동 확인 완료</b> — 프로세스가 정상적으로 실행 중입니다.")
+                        else:
+                            self.send_message(
+                                "⚠️ <b>[ERA 기동 확인 실패]</b>\n20초 후에도 ERA 프로세스가 감지되지 않습니다.\n"
+                                "포트 9991 싱글턴 락(구 인스턴스 잔존) 또는 키움 로그인 실패 가능성이 있습니다. 콘솔 창을 직접 확인해주세요."
+                            )
+                    except Exception as e:
+                        print(f"[TCA] ERA 기동 검증 실패: {e}")
+                threading.Thread(target=_verify_era_started, daemon=True).start()
+            except Exception as e:
+                self.send_message(f"❌ ERA 구동 명령 처리 중 오류: {e}")
+
         elif cmd_text == "!주식종료" or cmd_text == "!선물종료" or cmd_text == "!시스템종료":
-            self.send_message("⏳ AMATS 통합 트레이딩 엔진 종료 중...")
+            self.send_message("⏳ AMATS 통합 트레이딩 엔진 종료 중..." + self._open_positions_warning())
             if self._kill_era_process():
                 self.send_message("✅ AMATS 통합 트레이딩 엔진이 정상 종료되었습니다.")
             else:
                 self.send_message("⚠️ ERA PID 파일을 찾을 수 없습니다. ERA가 실행 중이지 않거나 이미 종료되었습니다.")
 
         elif cmd_text in ["!재연동", "!시스템재시작"]:
-            self.send_message(
-                "🔄 <b>시스템 재연동 시퀀스 가동!</b>\n\n"
-                "1. 윈도우 작업 스케줄러 자동 감시를 일시정지합니다...\n"
-                "2. 기존 모든 ERA 및 키움증권 프로세스 강제 종료 중...\n"
-                "3. 키움증권 서버 세션 및 소켓 쿨타임(60초) 대기 후 안전하게 자동매매 창을 새로 엽니다."
-            )
-            # 윈도우 작업 스케줄러 임시 비활성화하여 쿨다운 기간 동안 가로채기 구동을 방지
             try:
-                subprocess.run('schtasks /change /tn "AMATS AutoStart" /disable', shell=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-                print("[TCA] AMATS AutoStart 스케줄러 임시 비활성화 완료.")
-            except Exception as e:
-                print(f"[TCA] 스케줄러 비활성화 실패: {e}")
+                self.send_message(
+                    "🔄 <b>시스템 재연동 시퀀스 가동!</b>\n\n"
+                    "1. 윈도우 작업 스케줄러 자동 감시를 일시정지합니다...\n"
+                    "2. 기존 모든 ERA 및 키움증권 프로세스 강제 종료 중...\n"
+                    "3. 키움증권 서버 세션 및 소켓 쿨타임(60초) 대기 후 안전하게 자동매매 창을 새로 엽니다."
+                    + self._open_positions_warning()
+                )
+                # 윈도우 작업 스케줄러 임시 비활성화하여 쿨다운 기간 동안 가로채기 구동을 방지
+                try:
+                    subprocess.run('schtasks /change /tn "AMATS AutoStart" /disable', shell=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                    print("[TCA] AMATS AutoStart 스케줄러 임시 비활성화 완료.")
+                except Exception as e:
+                    print(f"[TCA] 스케줄러 비활성화 실패: {e}")
 
-            # auto_reconnect_era.bat가 60초 대기와 재기동을 처리하므로 비동기로 실행
-            era_dir = os.path.join(self.workspace_root, "era")
-            subprocess.Popen("start auto_reconnect_era.bat", shell=True, cwd=era_dir)
+                # 작업 스케줄러(RunLevel=Highest)에 등록된 태스크를 트리거 — UAC 동의창 없이 조용히
+                # 승격되어 auto_reconnect_era.bat(60초 대기+재기동)을 실행함. 직접 .bat을 띄우면 그 안의
+                # UAC 자체승격이 인터랙티브 데스크톱 없이는 pause에서 영원히 멈추는 문제가 있었음.
+                subprocess.Popen('schtasks /run /tn "AMATS ERA Reconnect"', shell=True)
+            except Exception as e:
+                self.send_message(f"❌ 재연동 시퀀스 처리 중 오류: {e}")
         elif cmd_text == "!컴퓨터재부팅":
-            self.send_message("🚨 <b>[원격 재부팅 명령 수신]</b>\n\n5초 후 Windows 시스템을 강제로 재부팅합니다. 재부팅 완료 후 자동 로그인 설정을 통해 시스템이 순차적으로 자동 재기동됩니다.")
+            self.send_message("🚨 <b>[원격 재부팅 명령 수신]</b>\n\n5초 후 Windows 시스템을 강제로 재부팅합니다. 재부팅 완료 후 자동 로그인 설정을 통해 시스템이 순차적으로 자동 재기동됩니다." + self._open_positions_warning())
             import time
             time.sleep(2)
             os.system("shutdown /r /t 5 /f")
         elif cmd_text == "!컴퓨터종료":
-            self.send_message("🔌 <b>[원격 일반 종료 명령 수신]</b>\n\n윈도우 시작 메뉴의 시스템 종료와 동일한 방식으로 컴퓨터를 안전하게 종료합니다. (저장되지 않은 파일이 있으면 대기하거나 취소될 수 있습니다.)")
+            self.send_message("🔌 <b>[원격 일반 종료 명령 수신]</b>\n\n윈도우 시작 메뉴의 시스템 종료와 동일한 방식으로 컴퓨터를 안전하게 종료합니다. (저장되지 않은 파일이 있으면 대기하거나 취소될 수 있습니다.)" + self._open_positions_warning())
             import time
             time.sleep(2)
             os.system("shutdown /s /t 5")
         elif cmd_text == "!컴퓨터강제종료":
-            self.send_message("🚨 <b>[원격 강제 종료 명령 수신]</b>\n\n열려 있는 모든 프로그램을 강제로 닫고 즉시 컴퓨터를 종료합니다.")
+            self.send_message("🚨 <b>[원격 강제 종료 명령 수신]</b>\n\n열려 있는 모든 프로그램을 강제로 닫고 즉시 컴퓨터를 종료합니다." + self._open_positions_warning())
             import time
             time.sleep(2)
             os.system("shutdown /s /t 5 /f")
@@ -1077,6 +1210,11 @@ class TCAController:
 
         elif cmd_text == "!RSA분석":
             if self._run_rsa_analysis():
+                # 자동 스케줄러(08~15시, 금일 미실행 시 자동 트리거)와 동일하게 실행 이력을 갱신하지
+                # 않으면, 수동 실행 직후 다음 폴링 주기에서 스케줄러가 조건을 여전히 참으로 보고
+                # rsa_coordinator.py를 중복으로 재기동시켜 API 호출량이 두 배로 소모될 수 있었음.
+                self._last_rsa_run_date = datetime.now().strftime("%Y-%m-%d")
+                self._save_scheduler_state()
                 self.send_message(
                     "🔬 <b>[RSA 분석 기동]</b>\n"
                     "단타/스윙 후보 종목에 대한 FAA·IRA·NSAA 정밀 리서치를 시작합니다.\n"
@@ -1086,15 +1224,18 @@ class TCAController:
                 self.send_message("❌ RSA 분석 실행에 실패했습니다.")
 
         elif cmd_text == "!백테스트시작":
-            self.send_message("🧪 <b>[BQA]</b> 선물 최적화(K값 스위핑) 알고리즘을 즉시 강제 기동합니다...")
-            bqa_script = os.path.join(workspace_root, "bqa", "batch_optimizer.py")
-            log_dir = os.path.join(workspace_root, "bqa")
-            os.makedirs(log_dir, exist_ok=True)
-            log_path = os.path.join(log_dir, "bqa_optimizer.log")
-            log_f = open(log_path, "ab")
-            subprocess.Popen(f"python {bqa_script}", shell=True, stdout=log_f, stderr=log_f)
-            log_f.close()
-            self.send_message("✅ K값 최적화 엔진 기동 시작.")
+            try:
+                self.send_message("🧪 <b>[BQA]</b> 선물 최적화(K값 스위핑) 알고리즘을 즉시 강제 기동합니다...")
+                bqa_script = os.path.join(workspace_root, "bqa", "batch_optimizer.py")
+                log_dir = os.path.join(workspace_root, "bqa")
+                os.makedirs(log_dir, exist_ok=True)
+                log_path = os.path.join(log_dir, "bqa_optimizer.log")
+                log_f = open(log_path, "ab")
+                subprocess.Popen(f"python {bqa_script}", shell=True, stdout=log_f, stderr=log_f)
+                log_f.close()
+                self.send_message("✅ K값 최적화 엔진 기동 시작.")
+            except Exception as e:
+                self.send_message(f"❌ 백테스트 기동 실패: {e}")
 
         elif cmd_text == "!최적화결과":
             try:
@@ -1115,7 +1256,12 @@ class TCAController:
                         msg += f"  • 파라미터 (K값): {st.get('K')}\n"
                         msg += f"  • 연환산수익률(CAGR): {st.get('cagr')}%\n"
                         msg += f"  • 승률: {st.get('win_rate')}%\n\n"
-                    msg += "💡 위 전략 중 Top 1을 실전에 적용하려면 <code>!전략승인</code>을 입력하세요."
+                    msg += (
+                        "💡 Top 1(K="
+                        + str(top_strats[0].get('K', res_data.get('best_k', 0.5)))
+                        + ")은 기존 대비 개선된 경우 BQA가 이미 자동 적용했습니다(무인 운영 설계).\n"
+                        + "<code>!전략승인</code>은 현재 파일을 재승인 스탬프(재확인용)하는 명령입니다."
+                    )
                 self.send_message(msg)
             except Exception as e:
                 self.send_message(f"📊 최적화 결과 로드 실패: {e}")
@@ -1197,14 +1343,16 @@ class TCAController:
                 best_k = res_data.get('best_k', 0.5)
                 res_data['approved_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                with open(self.active_strategy_file, "w", encoding="utf-8") as f:
-                    json.dump(res_data, f, ensure_ascii=False, indent=4)
+                self._atomic_write_json(self.active_strategy_file, res_data)
 
+                # ERA의 load_config()/_load_futures_k()는 이제 approved_at이 없는
+                # active_strategy.json은 적용을 건너뛰므로, 이 명령은 (BQA 자동승인 여부와
+                # 무관하게) approved_at을 다시 찍어 현재 파일이 확실히 로드되도록 보증한다.
                 strat_type = res_data.get('futures_strategy_type', self.futures_settings.get('futures_strategy_type', 'volatility_breakout'))
                 if strat_type == "kalman":
-                    self.send_message(f"✅ <b>전략 핫-리로드 완료!</b>\n\n실전 선물 칼만 필터(Kalman) 전략 매개변수가 즉시 적용 승인되었습니다. ERA가 다음 사이클에 즉시 자동 로드합니다.")
+                    self.send_message(f"✅ <b>전략 승인 완료!</b>\n\n실전 선물 칼만 필터(Kalman) 전략 매개변수가 승인(approved_at 갱신)되었습니다. ERA가 다음 사이클에 로드합니다.\n(참고: 기존 대비 개선된 최적화 결과는 BQA가 매주 자동으로도 승인합니다 — 이 명령은 수동 재확인용입니다.)")
                 else:
-                    self.send_message(f"✅ <b>전략 핫-리로드 완료!</b>\n\n실전 선물 변동성 돌파 K값 매개변수(K={best_k})가 즉시 적용 승인되었습니다. ERA가 다음 사이클에 즉시 자동 로드합니다.")
+                    self.send_message(f"✅ <b>전략 승인 완료!</b>\n\n실전 선물 변동성 돌파 K값 매개변수(K={best_k})가 승인(approved_at 갱신)되었습니다. ERA가 다음 사이클에 로드합니다.\n(참고: 기존 대비 개선된 최적화 결과는 BQA가 매주 자동으로도 승인합니다 — 이 명령은 수동 재확인용입니다.)")
             except Exception as e:
                 self.send_message(f"❌ 전략 승인 중 오류 발생: {e}")
 
@@ -1280,8 +1428,7 @@ class TCAController:
                         })
                         lcfg["individual_stock_futures"] = isf_list
 
-                    with open(local_cfg_path, "w", encoding="utf-8") as f:
-                        json.dump(lcfg, f, ensure_ascii=False, indent=4)
+                    self._atomic_write_json(local_cfg_path, lcfg)
 
                     self.send_message(
                         f"✅ <b>[ISF 코드 업데이트 완료]</b>\n\n"
@@ -1382,6 +1529,7 @@ class TCAController:
                         name = item.get("name", sc)
                         long_min = item.get("nsaa_long_min", 72)
                         short_max = item.get("nsaa_short_max", 35)
+                        long_only = item.get("long_only", False)
                         cursor.execute(
                             "SELECT nsaa_score, score FROM research_reports WHERE code=? AND date(timestamp)=? ORDER BY id DESC LIMIT 1",
                             (sc, today)
@@ -1391,8 +1539,13 @@ class TCAController:
                             nsaa, total = row
                             if nsaa >= long_min:
                                 d, icon = "LONG", "📈"
-                            elif nsaa <= short_max:
+                            elif nsaa <= short_max and not long_only:
                                 d, icon = "SHORT", "📉"
+                            elif nsaa <= short_max and long_only:
+                                # era_order_manager.py의 실거래 판정(_check_isf_direction)과 동일하게
+                                # long_only 종목은 SHORT를 NEUTRAL로 강제 변환 — 조회 화면이 실거래
+                                # 동작과 어긋나던 문제 수정
+                                d, icon = "NEUTRAL (long_only)", "⏸️"
                             else:
                                 d, icon = "NEUTRAL", "⏸️"
                             msg += (
@@ -1450,33 +1603,15 @@ class TCAController:
                 "• <code>!긴급정지</code> : 모든 포지션 청산 후 봇 완전 킬"
             ]
             
-            # 4. ISF 개별주식선물 파트 (설정이 있을 때만 표시)
-            isf_active = show_futures and bool(self.isf_configs)
-            isf_text = ""
-            if isf_active:
-                isf_text = (
-                    "\n<b>[📊 ISF 개별주식선물]</b>\n"
-                    "• <code>!ISF상태</code> : 삼성전자/SK하이닉스 선물 설정·방향·포지션 확인\n"
-                    "• <code>!ISF방향</code> : 오늘 NSAA 점수 기반 Long/Short/Neutral 방향 조회\n"
-                    "• <code>!ISF코드 005930 선물코드</code> : 선물 코드 직접 입력\n"
-                )
-                
-            # 5. RSA AI 리서치
-            rsa_text = (
-                "\n<b>[🔬 RSA AI 리서치]</b>\n"
-                "• <code>!RSA분석</code> : 후보 종목 AI 정밀 분석 (FAA·IRA·NSAA)\n"
-                "• <code>!연구개시</code> : 30일 주기 AI 퀀트 연구원 리포트 즉시 분석 및 발송\n"
+            # 4. 🖥️ PC 원격 제어
+            pc_control_text = (
+                "\n<b>[🖥️ PC 원격 제어]</b>\n"
+                "• <code>!컴퓨터종료</code> : Windows 시스템 안전 종료\n"
+                "• <code>!컴퓨터강제종료</code> : 실행 중인 프로그램 강제 종료 후 시스템 즉시 종료\n"
+                "• <code>!컴퓨터재부팅</code> : Windows 시스템 강제 재부팅\n"
             )
             
-            # 6. BQA 퀀트 최적화
-            bqa_text = (
-                "\n<b>[🧪 BQA 퀀트 최적화]</b>\n"
-                "• <code>!백테스트시작</code> : K값 스위핑 백테스트 강제 구동\n"
-                "• <code>!최적화결과</code> : 최적화 완료된 상위 CAGR 매개변수 브리핑\n"
-                "• <code>!전략승인</code> : 최적 K값 파라미터 실전 즉시 적용 승인\n"
-            )
-            
-            # 7. 시스템 코드 업데이트 및 AI 자율 디버깅
+            # 5. 시스템 코드 업데이트 및 AI 자율 디버깅
             system_items = (
                 "\n<b>[🔁 시스템 코드 업데이트]</b>\n"
                 "• <code>!버전확인</code> : 현재 코드 버전 및 최근 커밋 확인\n"
@@ -1500,14 +1635,38 @@ class TCAController:
                 + "<b>[수동 제어]</b>\n"
                 + "\n".join(control_items) + "\n\n"
                 + "<b>[🚨 긴급 제어]</b>\n"
-                + "\n".join(emergency_items)
-                + isf_text
-                + rsa_text
-                + bqa_text
+                + "\n".join(emergency_items) + "\n"
+                + pc_control_text
                 + system_items
                 + rdp_warning
             )
             self.send_message(help_msg)
+
+    def _run_sta_screening(self):
+        """STA 테마/스마트머니 종목선정(theme_tracker.py)을 백그라운드로 기동
+        — 기존엔 run_sta.bat의 대화형 메뉴를 사람이 직접 실행해야만 동작해서, 안 돌리면
+        ERA가 조용히 더 단순한 폴백(테마크롤링만/거래금액순위)으로 넘어가는 문제가 있었음.
+        theme_tracker.py 자체는 입력 대기 없이 끝까지 자동 실행되므로 직접 기동 가능."""
+        sta_script = os.path.join(self.workspace_root, 'sta', 'theme_tracker.py')
+        py32_path = os.path.join(self.venv32_path, "Scripts", "python.exe")
+        python_cmd = py32_path if os.path.exists(py32_path) else "python"
+        log_dir = os.path.join(self.workspace_root, "sta")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "theme_tracker.log")
+        try:
+            log_f = open(log_path, "ab")
+            subprocess.Popen(
+                [python_cmd, sta_script],
+                shell=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                stdout=log_f,
+                stderr=log_f
+            )
+            log_f.close()
+            return True
+        except Exception as e:
+            print(f"[TCA] STA 종목선정 실행 실패: {e}")
+            return False
 
     def _run_rsa_analysis(self):
         """RSA 분석 (FAA·IRA·NSAA 정밀 리서치)을 백그라운드로 기동"""
@@ -1569,6 +1728,7 @@ class TCAController:
                 # 매 영업일(월~금요일) 오전 08:00 ~ 15:30 사이이고, 금일 실행 이력이 없을 때 자동 트리거
                 if now.weekday() < 5 and (8 <= now.hour <= 15) and self._last_rsa_run_date != today_str:
                     self._last_rsa_run_date = today_str
+                    self._save_scheduler_state()
                     self.send_message(
                         "🔬 <b>[Daily RSA 자동 분석 개시]</b>\n"
                         "금일 단타/스윙 후보 종목에 대한 FAA·IRA·NSAA 정밀 리서치를 자동으로 기동합니다."
@@ -1576,6 +1736,28 @@ class TCAController:
                     self._run_rsa_analysis()
             except Exception as e:
                 print(f"[TCA RSA Scheduler Error] {e}")
+
+            # ── STA 단타 종목선정(테마+스마트머니 수급필터) 자율 스케줄러 감시 ──
+            # 기존엔 run_sta.bat의 대화형 메뉴를 사람이 직접 실행해야만 동작했음 — 자동매매
+            # 파이프라인에 연동돼 있지 않아서, 실행을 빠뜨리면 ERA가 조용히 더 단순한 폴백
+            # (테마크롤링만/거래금액순위)으로 넘어가는 구조적 문제가 있었음.
+            # 09:01~09:10 사이로 잡은 이유: 너무 일찍(장 시작 전) 돌리면 외국인/기관 당일
+            # 순매수(opt10059)가 사실상 0이라 스마트머니 필터가 무의미해지고, 너무 늦으면
+            # ERA의 09:00~ 5분 주기 단타 스캔이 빈 후보로 먼저 돌게 됨.
+            try:
+                now = datetime.now()
+                today_str = now.strftime("%Y-%m-%d")
+                if (now.weekday() < 5 and now.hour == 9 and 1 <= now.minute <= 10
+                        and self._last_sta_run_date != today_str):
+                    self._last_sta_run_date = today_str
+                    self._save_scheduler_state()
+                    self.send_message(
+                        "🎯 <b>[STA 단타 종목선정 자동 개시]</b>\n"
+                        "테마 크롤링 + 외국인/기관 수급 필터를 자동으로 기동합니다."
+                    )
+                    self._run_sta_screening()
+            except Exception as e:
+                print(f"[TCA STA Scheduler Error] {e}")
 
             # ── BQA 주말 자율 최적화 스케줄러 감시 (매 getUpdates 주기마다 가볍게 시간 대조) ──
             try:
@@ -1585,6 +1767,7 @@ class TCAController:
                 # (토요일 05:00는 금요일 야간선물 세션이 04:45에 완벽히 마감 청산된 안전 직후 시점입니다!)
                 if now.weekday() == 5 and now.hour == 5 and self._last_bqa_run_date != today_str:
                     self._last_bqa_run_date = today_str
+                    self._save_scheduler_state()
                     self.send_message(
                         "🧪 <b>[BQA 주말 자율 최적화 개시]</b>\n"
                         "한 주간의 모든 거래가 마감되었습니다.\n"
@@ -1783,6 +1966,15 @@ if __name__ == "__main__":
         print(f"[TCA] PID {os.getpid()} 기록 완료 ({tca_pid_file})")
     except Exception as e:
         print(f"[TCA] PID 기록 실패: {e}")
+
+    # TCA가 떴다는 건 (startup.bat/수동실행/!시스템시작 등 경로 불문) 시스템을 다시 가동하겠다는
+    # 뜻이므로, AMATS Watchdog가 "의도적 종료 상태"로 오인해 감시를 계속 건너뛰지 않도록 해제
+    try:
+        _stopped_flag = os.path.join(workspace_root, "system_stopped.flag")
+        if os.path.exists(_stopped_flag):
+            os.remove(_stopped_flag)
+    except Exception:
+        pass
 
     try:
         import ctypes

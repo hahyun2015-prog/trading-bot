@@ -288,8 +288,10 @@ class RSACoordinator:
     def _write_isf_directions(self, day_results, swing_results):
         """
         개별주식선물(ISF) 감시 종목의 오늘 방향을 NSAA 점수 기반으로 결정하고
-        config/isf_direction.json 에 저장합니다.
-        ERA는 09:00에 이 파일을 읽어 ISF 진입 방향을 설정합니다.
+        config/isf_direction.json 에 저장합니다 (TCA의 !ISF상태 조회용 참고 자료).
+        실거래 진입 방향은 era_order_manager.py의 _check_isf_direction()이 이 파일과
+        무관하게 research_reports DB에서 직접 재계산하므로, 여기서는 long_only 등
+        실거래 로직과 동일한 규칙을 반영해 표시값과 실거래가 어긋나지 않도록 한다.
         """
         isf_direction_path = os.path.join(workspace_root, "config", "isf_direction.json")
         isf_config_path = os.path.join(workspace_root, "config", "config_local.json")
@@ -335,6 +337,7 @@ class RSACoordinator:
             nsaa = code_nsaa.get(sc)
             long_min = isf_cfg.get("nsaa_long_min", 72)
             short_max = isf_cfg.get("nsaa_short_max", 35)
+            long_only = isf_cfg.get("long_only", False)
 
             if nsaa is None:
                 direction = "NEUTRAL"
@@ -342,9 +345,15 @@ class RSACoordinator:
             elif nsaa >= long_min:
                 direction = "LONG"
                 reason = f"뉴스감성 {nsaa}점 ≥ {long_min}점 → LONG"
-            elif nsaa <= short_max:
+            elif nsaa <= short_max and not long_only:
                 direction = "SHORT"
                 reason = f"뉴스감성 {nsaa}점 ≤ {short_max}점 → SHORT"
+            elif nsaa <= short_max and long_only:
+                # era_order_manager.py의 _check_isf_direction과 동일하게, long_only 종목은
+                # SHORT 조건을 만족해도 실거래에서는 진입하지 않으므로 여기서도 NEUTRAL로 맞춘다
+                # (예전엔 이 함수만 long_only를 반영하지 않아 !ISF방향/!ISF상태 표시와 실거래가 어긋났음)
+                direction = "NEUTRAL"
+                reason = f"뉴스감성 {nsaa}점 ≤ {short_max}점이나 long_only 설정으로 SHORT 미진입 → NEUTRAL"
             else:
                 direction = "NEUTRAL"
                 reason = f"뉴스감성 {nsaa}점 중립 ({short_max}~{long_min}점 범위)"

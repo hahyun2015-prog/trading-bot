@@ -35,6 +35,11 @@ venv*/
 # 동기화 임시 파일
 sync_dump/
 
+# KIS(한국투자증권) 종목마스터 다운로드 산출물 (재생성 가능)
+kis/fo_idx_code_mts.mst
+kis/fo_idx_code_mts.mst.zip
+kis/*.xlsx
+
 # Google Drive / Drive Upload 임시 파일
 .tmp.driveupload/
 

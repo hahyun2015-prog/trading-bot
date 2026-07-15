@@ -1,6 +1,8 @@
 import os
 import sys
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import json
 from bs4 import BeautifulSoup
 
@@ -12,6 +14,13 @@ class NewsSentimentAnalystAgent:
     def __init__(self):
         self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         self.api_key = self._load_gemini_key()
+        # 네이버(뉴스 크롤링) 요청 시 일시적 타임아웃/5xx 오류를 가볍게 자동 재시도 (총 2회, 지수 백오프)
+        # — RSA 워커 기동 직후 타임아웃으로 뉴스 수집이 실패하던 문제 보완 (2026-07-01)
+        # Gemini 호출(quota 초과 등)은 재시도 대상이 아님 — 모델 폴백 체인이 이미 그 역할을 담당
+        self.session = requests.Session()
+        _retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+        self.session.mount("https://", HTTPAdapter(max_retries=_retry))
+        self.session.mount("http://", HTTPAdapter(max_retries=_retry))
 
         # 오류 추적 (rsa_coordinator가 분석 후 조회)
         self.errors = []   # [{"code", "name", "type", "detail"}]
@@ -55,7 +64,7 @@ class NewsSentimentAnalystAgent:
             'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15'
         }
         try:
-            res = requests.get(url, headers=mobile_headers, timeout=7)
+            res = self.session.get(url, headers=mobile_headers, timeout=7)
             if res.status_code == 200:
                 data = res.json()
                 # 응답 구조: [{"total":N,"items":[...]}] 또는 {"items":[...]} 모두 처리
@@ -80,7 +89,7 @@ class NewsSentimentAnalystAgent:
         # 폴백: 네이버 금융 메인 페이지에서 관련 뉴스 추출
         fallback_url = f"https://finance.naver.com/item/main.naver?code={code}"
         try:
-            res2 = requests.get(fallback_url, headers=self.headers, timeout=5)
+            res2 = self.session.get(fallback_url, headers=self.headers, timeout=5)
             soup = BeautifulSoup(res2.content, "html.parser")
             headlines = []
             seen = set()
@@ -123,11 +132,12 @@ class NewsSentimentAnalystAgent:
         return score, reason
 
     # 우선순위 모델 목록 — 앞에서부터 시도, 실패 시 다음으로 폴백
+    # gemini-1.5-flash는 목록에서 제거함 — 실제로는 HTTP 404(모델 미존재/폐기)만 반환해
+    # 폴백 슬롯만 낭비하고 있었음이 로그로 확인됨 (2026-07-01)
     _GEMINI_MODELS = [
         "gemini-2.5-flash",
         "gemini-2.0-flash",
         "gemini-2.0-flash-lite",
-        "gemini-1.5-flash",
     ]
 
     def analyze_sentiment(self, code, name=""):

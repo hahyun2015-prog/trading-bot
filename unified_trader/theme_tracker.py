@@ -90,23 +90,38 @@ class ThemeTracker:
                 for row in stock_rows:
                     if stock_count >= top_n_stocks:
                         break
-                        
-                    name_td = row.select("td.name a")
-                    if name_td:
-                        stock_name = name_td[0].text.strip()
-                        stock_code = name_td[0]["href"].split("code=")[1]
-                        
-                        # ETF, ETN, 스팩 등 파생/펀드 성격의 종목 제외
-                        exclude_keywords = ["KODEX", "TIGER", "KBSTAR", "KINDEX", "KOSEF", "HANARO", "ARIRANG", "인버스", "레버리지", "선물", "스팩", "ETN"]
-                        if any(kw in stock_name for kw in exclude_keywords):
-                            continue
-                        
-                        self.theme_leaders.append({
-                            "theme": theme['name'],
-                            "code": stock_code,
-                            "name": stock_name
-                        })
-                        stock_count += 1
+
+                    tds = row.select("td")
+                    if len(tds) >= 9:
+                        name_td = tds[0].select("a")
+                        if name_td:
+                            stock_name = name_td[0].text.strip()
+                            stock_code = name_td[0]["href"].split("code=")[1]
+                            
+                            # ETF, ETN, 스팩 등 파생/펀드 성격의 종목 제외
+                            exclude_keywords = ["KODEX", "TIGER", "KBSTAR", "KINDEX", "KOSEF", "HANARO", "ARIRANG", "인버스", "레버리지", "선물", "스팩", "ETN"]
+                            if any(kw in stock_name for kw in exclude_keywords):
+                                continue
+                            
+                            # 거래대금 필터 (100억 원 하한선)
+                            try:
+                                # tds[8]은 거래대금 (백만 원 단위)
+                                trade_value_text = tds[8].text.strip().replace(",", "")
+                                trade_value_million = int(trade_value_text) if trade_value_text else 0
+                            except Exception:
+                                trade_value_million = 0
+                                
+                            MIN_TRADE_VALUE_MILLION = 10000 # 100억 원
+                            if trade_value_million < MIN_TRADE_VALUE_MILLION:
+                                print(f" [DROP] {stock_name} -> 거래대금 부족 ({trade_value_million:,}백만 원 / 기준: {MIN_TRADE_VALUE_MILLION:,}백만 원)")
+                                continue
+
+                            self.theme_leaders.append({
+                                "theme": theme['name'],
+                                "code": stock_code,
+                                "name": stock_name
+                            })
+                            stock_count += 1
                         
             print(f" => 총 {len(self.theme_leaders)}개의 테마 대장주 후보 발굴 완료.\n")
             

@@ -2,6 +2,12 @@
 cls
 
 :: 관리자 권한 자동 승격 (UAC) 원천 확보 (net session을 이용한 안전하고 신뢰할 수 있는 방식)
+:: auto_reconnect_era.bat(RunLevel=Highest 스케줄 작업, 항상 이미 관리자 권한)이 "auto" 인자로
+:: 호출하는 경로는 UAC 재확인을 건너뛴다. start로 띄운 자식이 부모의 관리자 권한을 완전히
+:: 상속하지 못해 fltmc가 실패하고, 매번 UAC 재승격(-Verb RunAs)을 시도하다 무인 환경이라
+:: 동의를 받을 인터랙티브 데스크톱이 없어 조용히 실패하며 python이 아예 시작을 못하는
+:: 문제가 있었음 (2026-07-09 실측 확인).
+if "%~1"=="auto" goto gotAdmin
 fltmc >nul 2>&1
 if %errorlevel% neq 0 (
     echo [*] 관리자 권한을 요청 중입니다... (UAC 승인 필요)
@@ -71,7 +77,7 @@ echo      To terminate, press Ctrl+C or close this window.
 echo ----------------------------------------------------------
 echo.
 
-"venv32\Scripts\python.exe" "era\era_order_manager.py"
+"venv32\Scripts\python.exe" "era\leader_order_manager.py"
 
 echo.
 echo ----------------------------------------------------------

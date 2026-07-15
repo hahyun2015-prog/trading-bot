@@ -3,31 +3,23 @@ rem chcp 65001 (Disabled to prevent CMD UTF-8 parser bug)
 title AMATS ERA Auto-Reconnect
 color 0C
 
-fltmc >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [*] 관리자 권한을 요청 중입니다... (UAC 승인 필요)
-    goto UACPrompt
-) else ( goto gotAdmin )
-
-:UACPrompt
-    if "%~1"=="--elevated" (
-        echo [ERROR] Failed to obtain Administrator privileges after elevation attempt.
-        echo Please run this script manually as Administrator.
-        pause
-        exit /B 1
-    )
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -ArgumentList '--elevated' -Verb RunAs"
-    exit /B
-
-:gotAdmin
-    if "%~1"=="--elevated" shift
-    pushd "%CD%"
-    CD /D "%~dp0"
+rem 이 스크립트는 작업 스케줄러에 RunLevel=Highest로 등록된 "AMATS ERA Reconnect" 태스크를
+rem 통해서만 실행되도록 바뀌었음(era_order_manager.py/tca_controller.py/reconnect_kiwoom.bat
+rem 모두 schtasks /run으로 호출). 따라서 항상 이미 관리자 권한으로 실행되며, 과거의 UAC
+rem 자체승격(-Verb RunAs) 로직은 화면잠김/RDP끊김 등 무인 환경에서 동의를 받을 인터랙티브
+rem 데스크톱이 없어 pause에서 영원히 멈추는 문제가 있어 제거함.
+pushd "%CD%"
+CD /D "%~dp0"
 
 echo ===================================================
 echo     AMATS ERA Auto-Reconnecting System
 echo ===================================================
 echo.
+
+:: AMATS Watchdog(2분 주기 생존감시)가 아래 60초 대기 구간 중 ERA가 죽어있는 걸 보고
+:: 끼어들어 키움 세션이 안 비워진 채로 너무 일찍 재기동시키지 못하도록 일시 차단
+echo %date% %time% > "%~dp0..\system_stopped.flag"
+
 echo [1/3] Terminating existing ERA and Kiwoom processes...
 
 :: 1. Kill ERA process using era.pid if it exists
@@ -41,8 +33,8 @@ if exist "%~dp0era.pid" (
 )
 
 :: 2. Hard kill zombie ERA processes just in case
-echo Terminating any remaining era_order_manager.py processes...
-powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'era_order_manager.py' -and $_.Name -match 'python' } | Invoke-CimMethod -MethodName Terminate" >nul 2>&1
+echo Terminating ERA/TCA python processes...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process -Filter \"name='python.exe'\" | Where-Object { $_.CommandLine -like '*leader_order_manager.py*' -or $_.CommandLine -like '*tca_controller.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >nul 2>&1
 
 :: 3. Terminate Kiwoom OpenAPI processes to clear session
 echo Terminating Kiwoom OpenAPI helper processes...
@@ -57,7 +49,13 @@ ping 127.0.0.1 -n 61 >nul 2>&1
 
 echo.
 echo [3/3] Restarting ERA Trading Engine...
-start "" "%~dp0..\run_era.bat"
+rem "auto" 인자로 run_era.bat의 UAC 재확인을 건너뛴다 - 이 배치 자체가 이미 관리자 권한
+rem 스케줄 작업으로 실행 중인데, start로 띄운 자식이 그 권한을 상속 못 받아 매번 UAC
+rem 재승격을 시도하다 무인 환경이라 조용히 실패하는 문제가 있었음 (2026-07-09 실측 확인)
+start "" "%~dp0..\run_era.bat" auto
+
+:: 재기동을 시작했으니 워치독 차단 해제 (ERA 자체가 또는 다음 watchdog 주기가 정상 감시하게 함)
+if exist "%~dp0..\system_stopped.flag" del /f /q "%~dp0..\system_stopped.flag" >nul 2>&1
 
 :: Re-enable Windows Task Scheduler task to ensure auto-start on next boot
 echo Re-enabling Windows Task Scheduler AutoStart...

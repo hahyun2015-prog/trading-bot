@@ -51,6 +51,9 @@ echo  [1] 일반 종료 시퀀스를 구동합니다.
 echo ----------------------------------------------------------
 echo.
 
+:: 워치독이 프로세스 종료를 크래시로 오인해 끼어들지 않도록 종료 전 플래그를 먼저 만들어둠
+echo %date% %time% > "%~dp0system_stopped.flag"
+
 :: ERA 주문 엔진 종료
 if exist "era\era.pid" (
     for /f "usebackq" %%i in ("era\era.pid") do (
@@ -97,6 +100,9 @@ echo ----------------------------------------------------------
 echo.
 echo [!] 긴급정지 플래그 생성 중...
 echo %date% %time% > emergency_kill.flag
+
+:: 워치독이 이 종료 시퀀스 중간에 ERA/TCA를 재기동하지 않도록 플래그를 먼저 만들어둠
+echo %date% %time% > "%~dp0system_stopped.flag"
 
 echo.
 echo [*] ERA 엔진이 플래그를 감지하고 포지션을 청산하도록 대기 중입니다...

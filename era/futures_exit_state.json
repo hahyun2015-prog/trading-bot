@@ -1,10 +1,13 @@
 {
-    "last_long_exit_price": 0.0,
+    "last_long_exit_price": 1191.5549999999994,
     "last_short_exit_price": 0.0,
     "night_last_long_exit_price": 0.0,
     "night_last_short_exit_price": 0.0,
-    "day_consecutive_losses": 0,
+    "day_consecutive_losses": 1,
     "night_consecutive_losses": 0,
-    "day_trade_count": 0,
-    "night_trade_count": 0
+    "day_trade_count": 4,
+    "night_trade_count": 0,
+    "daily_reset_done_date": "2026-07-15",
+    "night_reset_done_date": "2026-07-15_0500",
+    "night_start_done_date": "2026-07-15_1800"
 }

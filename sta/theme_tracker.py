@@ -74,9 +74,18 @@ class ThemeTracker:
                     name = cols[0].text
                     link = "https://finance.naver.com" + cols[0]["href"]
                     change_tags = r.select("td.col_type2 span")
-                    change_rate = change_tags[0].text.strip() if change_tags else "0.00%"
-                    themes.append({"name": name, "url": link, "change": change_rate})
-                    
+                    change_text = change_tags[0].text.strip() if change_tags else "0.00%"
+                    try:
+                        change_val = float(change_text.replace("%", "").replace("+", "").strip())
+                        if "-" in change_text:
+                            change_val = -abs(change_val)
+                    except ValueError:
+                        change_val = 0.0
+                    themes.append({"name": name, "url": link, "change": change_text, "change_val": change_val})
+
+            # 네이버 페이지의 기본 노출 순서를 그대로 믿지 않고, 등락률 기준으로 명시적 재정렬
+            # — 페이지 기본 순서가 "오늘 가장 강한 테마"를 보장하지 않음
+            themes.sort(key=lambda t: t["change_val"], reverse=True)
             top_themes = themes[:top_n_themes]
             
             for theme in top_themes:
@@ -86,27 +95,55 @@ class ThemeTracker:
                 tsoup = BeautifulSoup(tres.content, "html.parser")
                 
                 stock_rows = tsoup.select("table.type_5 tbody tr")
-                stock_count = 0
-                for row in stock_rows:
-                    if stock_count >= top_n_stocks:
-                        break
+                exclude_keywords = ["KODEX", "TIGER", "KBSTAR", "KINDEX", "KOSEF", "HANARO", "ARIRANG", "인버스", "레버리지", "선물", "스팩", "ETN"]
+                MIN_TRADE_VALUE_MILLION = 10000  # 100억 원
 
-                    name_td = row.select("td.name a")
-                    if name_td:
+                # 먼저 테마 내 전 종목을 등락률 기준으로 정렬할 후보 목록으로 모은 뒤, 그중 상위
+                # top_n_stocks개만 채택 — 페이지 노출 순서가 "오늘 가장 강한 종목" 순서를 보장하지 않음
+                theme_candidates = []
+                for row in stock_rows:
+                    tds = row.select("td")
+                    if len(tds) >= 9:
+                        name_td = tds[0].select("a")
+                        if not name_td:
+                            continue
                         stock_name = name_td[0].text.strip()
                         stock_code = name_td[0]["href"].split("code=")[1]
-                        
-                        exclude_keywords = ["KODEX", "TIGER", "KBSTAR", "KINDEX", "KOSEF", "HANARO", "ARIRANG", "인버스", "레버리지", "선물", "스팩", "ETN"]
+
                         if any(kw in stock_name for kw in exclude_keywords):
                             continue
-                        
-                        self.theme_leaders.append({
-                            "theme": theme['name'],
-                            "code": stock_code,
-                            "name": stock_name
+
+                        try:
+                            change_text = tds[4].text.strip()
+                            change_val = float(change_text.replace("%", "").replace("+", "").strip())
+                            if "-" in change_text:
+                                change_val = -abs(change_val)
+                        except Exception:
+                            change_val = 0.0
+
+                        try:
+                            # tds[8]은 거래대금 (백만 원 단위)
+                            trade_value_text = tds[8].text.strip().replace(",", "")
+                            trade_value_million = int(trade_value_text) if trade_value_text else 0
+                        except Exception:
+                            trade_value_million = 0
+
+                        if trade_value_million < MIN_TRADE_VALUE_MILLION:
+                            print(f" [DROP] {stock_name} -> 거래대금 부족 ({trade_value_million:,}백만 원 / 기준: {MIN_TRADE_VALUE_MILLION:,}백만 원)")
+                            continue
+
+                        theme_candidates.append({
+                            "name": stock_name, "code": stock_code, "change_val": change_val
                         })
-                        stock_count += 1
-                        
+
+                theme_candidates.sort(key=lambda s: s["change_val"], reverse=True)
+                for cand in theme_candidates[:top_n_stocks]:
+                    self.theme_leaders.append({
+                        "theme": theme['name'],
+                        "code": cand["code"],
+                        "name": cand["name"]
+                    })
+
             print(f" => 총 {len(self.theme_leaders)}개의 테마 대장주 후보 발굴 완료.\n")
             
         except Exception as e:
@@ -139,7 +176,9 @@ class ThemeTracker:
             self.tr_loop = QEventLoop()
             self.tr_loop.exec_()
             
-            if self.current_foreign_net > 0 or self.current_inst_net > 0:
+            # "쌍끌이" 매수를 표방하므로 둘 다 순매수일 때만 통과 (기존엔 OR라서 한쪽이 대량
+            # 순매도해도 다른 쪽이 1주만 순매수하면 통과하는 모순이 있었음)
+            if self.current_foreign_net > 0 and self.current_inst_net > 0:
                 print(f" [PASS] {name} ({theme}) -> 외인: {self.current_foreign_net:,} / 기관: {self.current_inst_net:,}")
                 item['foreign_net'] = self.current_foreign_net
                 item['inst_net'] = self.current_inst_net
@@ -210,7 +249,8 @@ class ThemeTracker:
 
 if __name__ == "__main__":
     tracker = ThemeTracker()
-    tracker.crawl_naver_themes(top_n_themes=3, top_n_stocks=3)
+    # 기존 3x3(최대 9종목)은 AND로 강화된 수급필터를 통과하기엔 후보 풀이 너무 좁아서 5x5(최대 25종목)로 확대
+    tracker.crawl_naver_themes(top_n_themes=5, top_n_stocks=5)
     if tracker.theme_leaders:
         tracker.filter_smart_money()
     else:

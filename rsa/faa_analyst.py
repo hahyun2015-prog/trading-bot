@@ -2,6 +2,8 @@ import os
 import sys
 import sqlite3
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -11,6 +13,12 @@ sys.path.append(workspace_root)
 class FinancialAnalystAgent:
     def __init__(self):
         self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        # 네이버 금융 요청 시 일시적 타임아웃/5xx 오류를 가볍게 자동 재시도 (총 2회, 지수 백오프)
+        # — RSA 워커 기동 직후 타임아웃으로 재무 분석이 디폴트 점수로 우회되던 문제 보완 (2026-07-01)
+        self.session = requests.Session()
+        _retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+        self.session.mount("https://", HTTPAdapter(max_retries=_retry))
+        self.session.mount("http://", HTTPAdapter(max_retries=_retry))
 
     def analyze_finance(self, code):
         """
@@ -19,7 +27,7 @@ class FinancialAnalystAgent:
         """
         url = f"https://finance.naver.com/item/main.naver?code={code}"
         try:
-            res = requests.get(url, headers=self.headers, timeout=5)
+            res = self.session.get(url, headers=self.headers, timeout=5)
             soup = BeautifulSoup(res.content, "html.parser")
             
             # cop_analysis 영역 (기업분석) 찾기

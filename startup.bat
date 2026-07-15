@@ -9,8 +9,13 @@ echo.
 echo [*] Waiting for Network Connection Stability (25s)...
 ping 127.0.0.1 -n 26 > nul
 
-:: Auto git pull updates (실패해도 로컬 코드로 계속 진행, 10초 타임아웃)
 cd /d "%~dp0"
+
+:: 의도적 종료 플래그 제거 — 사람이 직접(또는 부팅) 시스템을 다시 켜는 것이므로
+:: AMATS Watchdog가 더 이상 "꺼진 상태 유지"로 보지 않고 정상적으로 감시를 재개하게 함
+if exist "system_stopped.flag" del "system_stopped.flag" >nul 2>&1
+
+:: Auto git pull updates (실패해도 로컬 코드로 계속 진행, 10초 타임아웃)
 where git >nul 2>&1
 if %errorlevel% equ 0 (
     echo [GIT] Checking latest GitHub repository updates...
@@ -38,7 +43,8 @@ start "AMATS | TCA" "%PY%" "%~dp0tca\tca_controller.py"
 ping 127.0.0.1 -n 6 > nul
 
 echo [2/2] Launching ERA Trading Engine...
-start "AMATS | ERA" "%PY%" "%~dp0era\era_order_manager.py"
+:: era_order_manager.py 직접 실행은 리더종목 필터를 우회하므로, 검증된 예약 작업을 트리거한다
+schtasks /run /tn "AMATS ERA Reconnect" >nul 2>&1
 
 echo.
 echo ====================================================
