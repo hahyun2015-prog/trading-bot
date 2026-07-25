@@ -892,7 +892,8 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                                  force_close_hour=8, force_close_minute=45, force_close_window_min=10,
                                  trim_std_outliers=0,
                                  entry_start_hour=9, entry_start_minute=0,
-                                 eod_close_unconditional=True, session_range_mult=1.0):
+                                 eod_close_unconditional=True, session_range_mult=1.0,
+                                 dynamic_sizing=False):
     """
     era_order_manager.py의 실전 주간선물 "샹들리에 청산"(2026-07-15 도입, futures_strategy_type=
     "chandelier")을 재현한 백테스트. run_kalman_live_replica와 진입측(칼만 타점/장기추세필터/
@@ -915,6 +916,15 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
         max(session_range_mult * ATR14, 15.0)를 넘을 때만 청산 (조건부, 구버전 재현용).
         오버나잇 갭 방지 개선을 껐을 때와 켰을 때를 같은 샹들리에 청산 엔진 위에서
         비교하기 위해 추가.
+
+    dynamic_sizing (2026-07-25 추가, 기본 False=기존 동작과 100% 동일):
+      - False(기본): era_order_manager.py:4677-4679의 실제 계약수 산정 공식과 달리,
+        계약수를 백테스트 시작 시점(첫 5분봉 가격) 기준으로 딱 한 번만 계산해서 끝까지
+        고정한다 — 계좌가 불어나도 계약수를 늘리지 않는 보수적 근사치.
+      - True: era_order_manager.py와 동일하게, 매 진입 시점마다 qty = clip(int(cap *
+        margin_cap / margin_per), 1, max_contracts)로 "그 시점의 누적 자본금" 기준
+        계약수를 재계산한다(margin_per = 진입가 * point_value * MARGIN_RATE). 즉 수익이
+        나서 계좌가 커지면 다음 진입부터 계약수도 늘어나는 실제 복리 효과를 반영한다.
     """
     n = len(df)
     if n < kf_window + 10:
@@ -965,12 +975,13 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
     SLIP_EXIT_FORCE = slip_exit_force_pt  if slip_exit_force_pt  is not None else (2.0 if _any_new_slip else slip_fee_pt)
 
     cap = float(INIT_CAPITAL)
-    equity, pnls, wins = [cap], [], 0
+    equity, equity_days, pnls, wins = [cap], [], [], 0
 
     first_price = closes[0]
     margin_per = first_price * point_value * MARGIN_RATE
     safe_budget = INIT_CAPITAL * margin_cap
     contracts = max(1, min(max_contracts, int(safe_budget // margin_per))) if margin_per > 0 else 1
+    pos_contracts = contracts  # dynamic_sizing=True면 매 진입마다 재계산, 아니면 위 고정값 그대로
 
     pos, entry_price, peak_price = 0, 0.0, 0.0
     day_high, day_low, cur_day = -np.inf, np.inf, None
@@ -979,6 +990,7 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
     target_long, target_short = np.inf, -np.inf
     std_error, trend, atr14, prev_range = 0.5, "NEUTRAL", 2.0, 0.0
     consec_losses = 0
+    contracts_log = []  # dynamic_sizing 진단용: 실제 체결된 계약수 이력
 
     def reentry_ok(direction, price):
         exit_price = last_long_exit if direction == 1 else last_short_exit
@@ -1093,10 +1105,11 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
             if exit_price is not None:
                 exit_slip = SLIP_EXIT_FORCE if is_force else SLIP_EXIT_NORMAL
                 raw_pnl = (exit_price - entry_price) if pos == 1 else (entry_price - exit_price)
-                commission_cost = entry_price * point_value * commission_rate * 2 * contracts
-                gain = (raw_pnl - exit_slip) * point_value * contracts - commission_cost
+                commission_cost = entry_price * point_value * commission_rate * 2 * pos_contracts
+                gain = (raw_pnl - exit_slip) * point_value * pos_contracts - commission_cost
                 cap += gain
                 equity.append(cap)
+                equity_days.append(day_key)
                 pnls.append(gain)
                 wins += int(gain > 0)
                 # 샹들리에는 별도 손절 플래그가 없으므로, era_order_manager.py와 동일하게
@@ -1127,12 +1140,24 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
             elif not enable_reentry_filter or reentry_ok(1, target_long):
                 fill = target_long + SLIP_ENTRY
                 pos, entry_price, peak_price = 1, fill, fill
+                if dynamic_sizing:
+                    m_per = fill * point_value * MARGIN_RATE
+                    pos_contracts = max(1, min(max_contracts, int((cap * margin_cap) / m_per))) if m_per > 0 else 1
+                else:
+                    pos_contracts = contracts
+                contracts_log.append(pos_contracts)
         elif c_low <= target_short:
             if not disable_trend_filter and trend == "UP":
                 continue
             elif not enable_reentry_filter or reentry_ok(-1, target_short):
                 fill = target_short - SLIP_ENTRY
                 pos, entry_price, peak_price = -1, fill, fill
+                if dynamic_sizing:
+                    m_per = fill * point_value * MARGIN_RATE
+                    pos_contracts = max(1, min(max_contracts, int((cap * margin_cap) / m_per))) if m_per > 0 else 1
+                else:
+                    pos_contracts = contracts
+                contracts_log.append(pos_contracts)
 
     total = len(pnls)
     if total == 0:
@@ -1147,18 +1172,24 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
     loss_sum = abs(sum(p for p in pnls if p < 0))
     pf = gain_sum / loss_sum if loss_sum > 0 else 999.0
 
-    wins_list = [p for p in pnls if p > 0]
-    losses_list = [p for p in pnls if p < 0]
-    denom = point_value * contracts
-    avg_win_pt = (sum(wins_list) / len(wins_list) / denom) if wins_list else 0.0
-    avg_loss_pt = (sum(losses_list) / len(losses_list) / denom) if losses_list else 0.0
+    # dynamic_sizing=True면 거래마다 계약수가 달라지므로, 각 거래를 그 거래 당시 계약수로
+    # 나눠 pt 환산해야 정확하다(고정 denom을 쓰면 뒤로 갈수록 계약수가 커져 왜곡됨)
+    pt_equiv = [p / (point_value * c) for p, c in zip(pnls, contracts_log)]
+    wins_pt = [v for v in pt_equiv if v > 0]
+    losses_pt = [v for v in pt_equiv if v < 0]
+    avg_win_pt = (sum(wins_pt) / len(wins_pt)) if wins_pt else 0.0
+    avg_loss_pt = (sum(losses_pt) / len(losses_pt)) if losses_pt else 0.0
     loss_win_ratio = (abs(avg_loss_pt) / avg_win_pt) if avg_win_pt > 0 else None
 
-    worst_loss_pt = (min(losses_list) / denom) if losses_list else 0.0
+    worst_loss_pt = min(losses_pt) if losses_pt else 0.0
+    final_contracts = contracts_log[-1] if contracts_log else contracts
+    avg_contracts = (sum(contracts_log) / len(contracts_log)) if contracts_log else contracts
 
     return {'trades': total, 'win_rate': win_rate, 'profit_pct': profit_pct, 'mdd': max_mdd, 'pf': pf,
             'contracts': contracts, 'avg_win_pt': avg_win_pt, 'avg_loss_pt': avg_loss_pt,
-            'loss_win_ratio': loss_win_ratio, 'worst_loss_pt': worst_loss_pt}
+            'loss_win_ratio': loss_win_ratio, 'worst_loss_pt': worst_loss_pt,
+            'final_capital': cap, 'final_contracts': final_contracts, 'avg_contracts': avg_contracts,
+            'equity': equity[1:], 'equity_days': equity_days}
 
 
 def run_kalman_night_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=5.0, atr_cutoff=0.5,
