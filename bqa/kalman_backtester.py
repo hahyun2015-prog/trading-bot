@@ -648,8 +648,11 @@ def run_kalman_live_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=2.0, atr_c
         hour, minute = ts.hour, ts.minute
         force_close = (hour == force_close_hour and
                         force_close_minute <= minute <= force_close_minute + force_close_window_min)
-        session_range_threshold = max(session_range_mult * atr14, 15.0)
-        vol_force_close = (hour == 15 and 35 <= minute <= 45) and (day_high - day_low > session_range_threshold)
+        # 장마감 전 무조건 강제청산 (era_order_manager.py와 동일화, 2026-07-24 — 기존엔 변동폭이
+        # session_range_threshold를 넘을 때만 청산했으나, 오버나잇 갭이 손절선을 그냥 건너뛰는
+        # 사례(2026-06-11→12, 의도한 캡 9.29pt인데 실현 -114.53pt) 실측 확인돼 조건 없이 항상
+        # 청산하도록 변경. 분기별 백테스트로 7개 구간 전부 baseline 대비 악화 없음을 검증함.
+        vol_force_close = (hour == 15 and 35 <= minute <= 45)
 
         # --- 칼만 타점/추세 재추정 (직전 i-1까지의 데이터로, 매 새 봉마다 갱신) ---
         # reset_kf_daily=True면 window_start가 전일로 못 넘어가도록 day_start_idx에서 clip되고,
@@ -756,8 +759,11 @@ def run_kalman_live_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=2.0, atr_c
                     # 계단식 Lock-In (2026-07-09: era_order_manager.py 실거래 트레일링 로직과 동일화 —
                     # 기존엔 단일단계 트레일링만 구현되어 있어 실거래 계단식 이익보전과 불일치했음)
                     max_pnl = peak_price - entry_price
-                    ts_tier2 = tier_mult2 * eff_trigger_mult * std_error
-                    ts_tier1 = tier_mult1 * eff_trigger_mult * std_error
+                    # (2026-07-15 수정) trigger_mult가 작으면 tier 발동폭이 tier_lock보다 작아져, 그 이익폭에
+                    # 아직 도달 못한 상태에서 ts_price가 entry+lock으로 뛰어올라 c_low와 자명하게 교차 ->
+                    # 실제로 가본 적 없는 가격에 즉시 청산되는 버그가 있었음(era_order_manager.py와 동일 수정).
+                    ts_tier2 = max(tier_mult2 * eff_trigger_mult * std_error, tier_lock2)
+                    ts_tier1 = max(tier_mult1 * eff_trigger_mult * std_error, tier_lock1)
                     active_cb_mult = eff_callback_mult
                     if max_pnl >= ts_tier2:
                         active_cb_mult = eff_callback_mult * tier_cb_frac2
@@ -781,8 +787,8 @@ def run_kalman_live_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=2.0, atr_c
                     exit_price = eff_tp_short
                 elif (entry_price - peak_price) >= eff_trigger_mult * std_error:
                     max_pnl = entry_price - peak_price
-                    ts_tier2 = tier_mult2 * eff_trigger_mult * std_error
-                    ts_tier1 = tier_mult1 * eff_trigger_mult * std_error
+                    ts_tier2 = max(tier_mult2 * eff_trigger_mult * std_error, tier_lock2)
+                    ts_tier1 = max(tier_mult1 * eff_trigger_mult * std_error, tier_lock1)
                     active_cb_mult = eff_callback_mult
                     if max_pnl >= ts_tier2:
                         active_cb_mult = eff_callback_mult * tier_cb_frac2
@@ -871,6 +877,276 @@ def run_kalman_live_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=2.0, atr_c
     return {'trades': total, 'win_rate': win_rate, 'profit_pct': profit_pct, 'mdd': max_mdd, 'pf': pf,
             'contracts': contracts, 'avg_win_pt': avg_win_pt, 'avg_loss_pt': avg_loss_pt,
             'loss_win_ratio': loss_win_ratio}
+
+
+def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
+                                 margin_cap=0.30, reentry_k=0.5, kf_window=40, std_window=20,
+                                 trend_q=0.001, trend_r=1.0, max_contracts=15, point_value=250_000,
+                                 enable_reentry_filter=True, slip_fee_pt=0.05, commission_rate=0.000065,
+                                 chandelier_mult=0.3, chandelier_hard_cap=60.0,
+                                 slip_entry_pt=None, slip_exit_sl_pt=None,
+                                 slip_exit_normal_pt=None, slip_exit_force_pt=None,
+                                 min_std_error_entry=0.0,
+                                 disable_trend_filter=False, trend_bar_minutes=15,
+                                 consecutive_loss_limit=5,
+                                 force_close_hour=8, force_close_minute=45, force_close_window_min=10,
+                                 trim_std_outliers=0,
+                                 entry_start_hour=9, entry_start_minute=0):
+    """
+    era_order_manager.py의 실전 주간선물 "샹들리에 청산"(2026-07-15 도입, futures_strategy_type=
+    "chandelier")을 재현한 백테스트. run_kalman_live_replica와 진입측(칼만 타점/장기추세필터/
+    ATR컷오프/재진입휩소방지)은 완전히 동일하고, 청산 로직만 다르다:
+
+      - 샹들리에 청산은 별도의 고정/동적 손절(sl_limit)과 3-Sigma 익절을 쓰지 않고, 진입 후
+        고점(LONG)/저점(SHORT) 대비 dist = min(chandelier_mult * ATR14, chandelier_hard_cap)만큼
+        되돌리면 단일 공식으로 청산한다 (era_order_manager.py의 sl_limit=inf 처리와 동일 원리,
+        즉 이 하나의 트레일링 스탑이 손절과 익절을 겸함).
+      - 장기 추세필터(역추세 진입 차단)는 chandelier에도 그대로 적용됨(era_order_manager.py의
+        use_trend_filter = is_kalman or is_chandelier).
+      - 연속손실 서킷브레이커 한도는 실전 config.json 기본값(consecutive_loss_limit=5)을 그대로
+        인자화함(run_kalman_live_replica는 이 값이 3으로 하드코딩돼 있어 현재 config와 어긋나
+        있었음 — 별도 함수라 여기선 정확히 맞춤).
+      - 장마감 전 무조건 강제청산(2026-07-24 반영)은 동일하게 적용.
+    """
+    n = len(df)
+    if n < kf_window + 10:
+        return None
+
+    opens = df['open'].values.astype(float)
+    highs = df['high'].values.astype(float)
+    lows = df['low'].values.astype(float)
+    closes = df['close'].values.astype(float)
+    day_keys = df['date_day'].values
+    dt_index = df.index
+
+    daily = df.groupby('date_day').agg(high=('high', 'max'), low=('low', 'min'), close=('close', 'last')).reset_index()
+    daily['prev_close'] = daily['close'].shift(1)
+    tr = np.maximum(daily['high'] - daily['low'],
+                     np.maximum((daily['high'] - daily['prev_close']).abs(),
+                                (daily['low'] - daily['prev_close']).abs())).fillna(daily['high'] - daily['low'])
+    kf_atr_path = np.empty(len(tr))
+    kf_atr, P_atr, Q_atr, R_atr = None, 1.0, 0.002, 0.2
+    for j, tr_val in enumerate(tr.values):
+        if kf_atr is None:
+            kf_atr = tr_val
+        else:
+            P_atr = P_atr + Q_atr
+            K_atr = P_atr / (P_atr + R_atr)
+            kf_atr = kf_atr + K_atr * (tr_val - kf_atr)
+            P_atr = (1 - K_atr) * P_atr
+        kf_atr_path[j] = kf_atr
+    daily['range'] = daily['high'] - daily['low']
+    atr_map, prev_range_map = {}, {}
+    day_list = daily['date_day'].tolist()
+    for i, dkey in enumerate(day_list):
+        if i == 0:
+            atr_map[dkey] = 2.0
+            prev_range_map[dkey] = 0.0
+        else:
+            v = kf_atr_path[i - 1]
+            atr_map[dkey] = float(v) if pd.notna(v) and v > 0 else 2.0
+            prev_range_map[dkey] = float(daily['range'].iloc[i - 1])
+
+    bucket60 = (df.index.astype('datetime64[ns]').astype(np.int64) // 10**9 // (trend_bar_minutes * 60))
+
+    MARGIN_RATE, INIT_CAPITAL = 0.10, 50_000_000
+    _any_new_slip = any(v is not None for v in (slip_entry_pt, slip_exit_sl_pt, slip_exit_normal_pt, slip_exit_force_pt))
+    SLIP_ENTRY      = slip_entry_pt       if slip_entry_pt       is not None else (1.5 if _any_new_slip else slip_fee_pt)
+    SLIP_EXIT_SL    = slip_exit_sl_pt     if slip_exit_sl_pt     is not None else (3.0 if _any_new_slip else slip_fee_pt)
+    SLIP_EXIT_NORMAL= slip_exit_normal_pt if slip_exit_normal_pt is not None else (0.5 if _any_new_slip else slip_fee_pt)
+    SLIP_EXIT_FORCE = slip_exit_force_pt  if slip_exit_force_pt  is not None else (2.0 if _any_new_slip else slip_fee_pt)
+
+    cap = float(INIT_CAPITAL)
+    equity, pnls, wins = [cap], [], 0
+
+    first_price = closes[0]
+    margin_per = first_price * point_value * MARGIN_RATE
+    safe_budget = INIT_CAPITAL * margin_cap
+    contracts = max(1, min(max_contracts, int(safe_budget // margin_per))) if margin_per > 0 else 1
+
+    pos, entry_price, peak_price = 0, 0.0, 0.0
+    day_high, day_low, cur_day = -np.inf, np.inf, None
+    day_start_idx = 0
+    last_long_exit, last_short_exit = 0.0, 0.0
+    target_long, target_short = np.inf, -np.inf
+    std_error, trend, atr14, prev_range = 0.5, "NEUTRAL", 2.0, 0.0
+    consec_losses = 0
+
+    def reentry_ok(direction, price):
+        exit_price = last_long_exit if direction == 1 else last_short_exit
+        if exit_price <= 0:
+            return True
+        unit = prev_range * reentry_k
+        if unit <= 0:
+            unit = 0.5
+        if direction == 1:
+            lo, hi = exit_price - unit * 0.5, exit_price + unit * 0.2
+        else:
+            lo, hi = exit_price - unit * 0.2, exit_price + unit * 0.5
+        return not (lo < price < hi)
+
+    for i in range(n):
+        day_key = day_keys[i]
+        ts = dt_index[i]
+
+        if day_key != cur_day:
+            cur_day = day_key
+            day_start_idx = i
+            day_high, day_low = highs[i], lows[i]
+            atr14 = atr_map.get(day_key, 2.0)
+            prev_range = prev_range_map.get(day_key, 0.0)
+            consec_losses = 0
+            last_long_exit, last_short_exit = 0.0, 0.0
+        else:
+            day_high = max(day_high, highs[i])
+            day_low = min(day_low, lows[i])
+
+        hour, minute = ts.hour, ts.minute
+        force_close = (hour == force_close_hour and
+                        force_close_minute <= minute <= force_close_minute + force_close_window_min)
+        vol_force_close = (hour == 15 and 35 <= minute <= 45)
+
+        window_start = i - kf_window
+        enough_data = i >= kf_window
+        if enough_data:
+            window_closes = closes[window_start:i]
+            x, P = None, 1.0
+            kf_path = np.empty(len(window_closes))
+            for j, z in enumerate(window_closes):
+                if x is None:
+                    x = z
+                else:
+                    P = P + Q
+                    K = P / (P + R)
+                    x = x + K * (z - x)
+                    P = (1 - K) * P
+                kf_path[j] = x
+            kf_price = kf_path[-1]
+            errs = window_closes - kf_path
+            std_slice = errs[-std_window:]
+            if trim_std_outliers > 0 and len(std_slice) > trim_std_outliers:
+                order = np.argsort(np.abs(std_slice))
+                std_slice = std_slice[order[:-trim_std_outliers]]
+            std_error = np.std(std_slice)
+            if not np.isfinite(std_error) or std_error <= 0:
+                std_error = 0.5
+            band = std_error * mult
+            target_long, target_short = kf_price + band, kf_price - band
+
+            lb_start = max(0, i - 300)
+            wb, wc = bucket60[lb_start:i], closes[lb_start:i]
+            trend = "NEUTRAL"
+            if len(wb) >= 5:
+                rev_b, rev_c = wb[::-1], wc[::-1]
+                _, first_idx = np.unique(rev_b, return_index=True)
+                long_closes = rev_c[first_idx]
+                if len(long_closes) >= 5:
+                    xl, Pl = None, 1.0
+                    kf_long_path = np.empty(len(long_closes))
+                    for j, zl in enumerate(long_closes):
+                        if xl is None:
+                            xl = zl
+                        else:
+                            Pl = Pl + trend_q
+                            Kl = Pl / (Pl + trend_r)
+                            xl = xl + Kl * (zl - xl)
+                            Pl = (1 - Kl) * Pl
+                        kf_long_path[j] = xl
+                    slope = kf_long_path[-1] - kf_long_path[-2]
+                    trend = "UP" if slope > 0.01 else ("DOWN" if slope < -0.01 else "NEUTRAL")
+
+        c_open, c_high, c_low, c_close = opens[i], highs[i], lows[i], closes[i]
+
+        if pos != 0:
+            exit_price, is_force = None, False
+            dist = min(chandelier_mult * atr14, chandelier_hard_cap)
+
+            if pos == 1:
+                peak_price = max(peak_price, c_high)
+                stop_price = peak_price - dist
+                if force_close or vol_force_close:
+                    exit_price = c_close
+                    is_force = True
+                elif c_low <= stop_price:
+                    exit_price = stop_price
+            else:
+                peak_price = min(peak_price, c_low)
+                stop_price = peak_price + dist
+                if force_close or vol_force_close:
+                    exit_price = c_close
+                    is_force = True
+                elif c_high >= stop_price:
+                    exit_price = stop_price
+
+            if exit_price is not None:
+                exit_slip = SLIP_EXIT_FORCE if is_force else SLIP_EXIT_NORMAL
+                raw_pnl = (exit_price - entry_price) if pos == 1 else (entry_price - exit_price)
+                commission_cost = entry_price * point_value * commission_rate * 2 * contracts
+                gain = (raw_pnl - exit_slip) * point_value * contracts - commission_cost
+                cap += gain
+                equity.append(cap)
+                pnls.append(gain)
+                wins += int(gain > 0)
+                # 샹들리에는 별도 손절 플래그가 없으므로, era_order_manager.py와 동일하게
+                # 실현손익 부호로 연속손실 카운터를 판단한다
+                if gain < 0:
+                    consec_losses += 1
+                else:
+                    consec_losses = 0
+                if pos == 1:
+                    last_long_exit = exit_price
+                else:
+                    last_short_exit = exit_price
+                pos, entry_price, peak_price = 0, 0.0, 0.0
+            continue
+
+        if force_close or vol_force_close or (hour, minute) < (entry_start_hour, entry_start_minute) or i < kf_window:
+            continue
+        if consec_losses >= consecutive_loss_limit:
+            continue
+        if atr14 < atr_cutoff:
+            continue
+        if std_error < min_std_error_entry:
+            continue
+
+        if c_high >= target_long:
+            if not disable_trend_filter and trend == "DOWN":
+                continue
+            elif not enable_reentry_filter or reentry_ok(1, target_long):
+                fill = target_long + SLIP_ENTRY
+                pos, entry_price, peak_price = 1, fill, fill
+        elif c_low <= target_short:
+            if not disable_trend_filter and trend == "UP":
+                continue
+            elif not enable_reentry_filter or reentry_ok(-1, target_short):
+                fill = target_short - SLIP_ENTRY
+                pos, entry_price, peak_price = -1, fill, fill
+
+    total = len(pnls)
+    if total == 0:
+        return None
+    equity_arr = np.array(equity)
+    peaks = np.maximum.accumulate(equity_arr)
+    drawdowns = (peaks - equity_arr) / peaks * 100
+    max_mdd = drawdowns.max()
+    win_rate = (wins / total) * 100
+    profit_pct = (cap - INIT_CAPITAL) / INIT_CAPITAL * 100
+    gain_sum = sum(p for p in pnls if p > 0)
+    loss_sum = abs(sum(p for p in pnls if p < 0))
+    pf = gain_sum / loss_sum if loss_sum > 0 else 999.0
+
+    wins_list = [p for p in pnls if p > 0]
+    losses_list = [p for p in pnls if p < 0]
+    denom = point_value * contracts
+    avg_win_pt = (sum(wins_list) / len(wins_list) / denom) if wins_list else 0.0
+    avg_loss_pt = (sum(losses_list) / len(losses_list) / denom) if losses_list else 0.0
+    loss_win_ratio = (abs(avg_loss_pt) / avg_win_pt) if avg_win_pt > 0 else None
+
+    worst_loss_pt = (min(losses_list) / denom) if losses_list else 0.0
+
+    return {'trades': total, 'win_rate': win_rate, 'profit_pct': profit_pct, 'mdd': max_mdd, 'pf': pf,
+            'contracts': contracts, 'avg_win_pt': avg_win_pt, 'avg_loss_pt': avg_loss_pt,
+            'loss_win_ratio': loss_win_ratio, 'worst_loss_pt': worst_loss_pt}
 
 
 def run_kalman_night_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=5.0, atr_cutoff=0.5,
@@ -1235,7 +1511,9 @@ def run_kalman_live_replica_oc(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=3.4, at
 
         hour, minute = ts.hour, ts.minute
         force_close = (hour == 8 and 45 <= minute <= 55)
-        vol_force_close = (hour == 15 and 35 <= minute <= 45) and (day_high - day_low > 15.0)
+        # 장마감 전 무조건 강제청산 (era_order_manager.py와 동일화, 2026-07-24 — 오버나잇 갭이
+        # 손절선을 그냥 건너뛰는 사례 실측 확인돼 조건(변동폭>15pt) 없이 항상 청산하도록 변경)
+        vol_force_close = (hour == 15 and 35 <= minute <= 45)
 
         if i >= kf_window:
             window_closes = closes[i - kf_window:i]
