@@ -891,7 +891,8 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                                  consecutive_loss_limit=5,
                                  force_close_hour=8, force_close_minute=45, force_close_window_min=10,
                                  trim_std_outliers=0,
-                                 entry_start_hour=9, entry_start_minute=0):
+                                 entry_start_hour=9, entry_start_minute=0,
+                                 eod_close_unconditional=True, session_range_mult=1.0):
     """
     era_order_manager.py의 실전 주간선물 "샹들리에 청산"(2026-07-15 도입, futures_strategy_type=
     "chandelier")을 재현한 백테스트. run_kalman_live_replica와 진입측(칼만 타점/장기추세필터/
@@ -907,6 +908,13 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
         인자화함(run_kalman_live_replica는 이 값이 3으로 하드코딩돼 있어 현재 config와 어긋나
         있었음 — 별도 함수라 여기선 정확히 맞춤).
       - 장마감 전 무조건 강제청산(2026-07-24 반영)은 동일하게 적용.
+
+    eod_close_unconditional (2026-07-25 추가, 기본 True=2026-07-24 반영분과 동일):
+      - True(기본): 15:35~15:45 사이엔 포지션이 있으면 조건 없이 무조건 청산 (현재 실전 상태).
+      - False: 2026-07-24 개선 이전의 원래 방식으로 되돌려서, 당일 변동폭이
+        max(session_range_mult * ATR14, 15.0)를 넘을 때만 청산 (조건부, 구버전 재현용).
+        오버나잇 갭 방지 개선을 껐을 때와 켰을 때를 같은 샹들리에 청산 엔진 위에서
+        비교하기 위해 추가.
     """
     n = len(df)
     if n < kf_window + 10:
@@ -1004,7 +1012,11 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
         hour, minute = ts.hour, ts.minute
         force_close = (hour == force_close_hour and
                         force_close_minute <= minute <= force_close_minute + force_close_window_min)
-        vol_force_close = (hour == 15 and 35 <= minute <= 45)
+        if eod_close_unconditional:
+            vol_force_close = (hour == 15 and 35 <= minute <= 45)
+        else:
+            session_range_threshold = max(session_range_mult * atr14, 15.0)
+            vol_force_close = (hour == 15 and 35 <= minute <= 45) and (day_high - day_low > session_range_threshold)
 
         window_start = i - kf_window
         enough_data = i >= kf_window
