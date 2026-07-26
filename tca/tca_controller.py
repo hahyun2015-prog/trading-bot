@@ -503,9 +503,13 @@ class TCAController:
                     buy_price = pos.get('price', 0)
                     qty = pos.get('qty', 0)
                     current_price = pos.get('current_price', buy_price)
-                    
+
                     # 국내선물 거래승수 (표준 250,000원, 미니 50,000원 판별)
-                    multiplier = 50000 if '105' in code else 250000
+                    # (2026-07-21 수정) code는 딕셔너리 키인 "KOSPI200"/"KOSPI200_NIGHT" 세션
+                    # 라벨이라 '105' 포함 여부로 판별이 항상 실패해(표준 승수로 고정) 미니선물
+                    # 실현손익이 5배로 부풀려 표시되던 버그. era가 export_status에 실어보내는
+                    # 전역 상품접두사(futures_prefix)로 판별한다.
+                    multiplier = 50000 if strat_info.get('prefix') == '105' else 250000
                     if p_type == 'LONG':
                         pnl = (current_price - buy_price) * qty * multiplier
                     else:
@@ -563,9 +567,13 @@ class TCAController:
                 buy_price = pos.get('price', 0)
                 qty = pos.get('qty', 0)
                 current_price = pos.get('current_price', buy_price)
-                
+
                 # 국내선물 거래승수 (표준 250,000원, 미니 50,000원 판별)
-                multiplier = 50000 if '105' in code else 250000
+                # (2026-07-21 수정) code는 "KOSPI200"/"KOSPI200_NIGHT" 세션 라벨이라 '105' 포함
+                # 여부 판별이 항상 실패하던 버그 — era가 export_status에 실어보내는 전역
+                # 상품접두사(futures_prefix)로 판별한다.
+                fut_prefix = f_data.get("futures_strategy", {}).get("prefix")
+                multiplier = 50000 if fut_prefix == '105' else 250000
                 if p_type == 'LONG':
                     pnl = (current_price - buy_price) * qty * multiplier
                 else:
