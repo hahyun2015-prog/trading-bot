@@ -11,7 +11,7 @@
     "night_consecutive_losses": 0,
     "day_trade_count": 3,
     "night_trade_count": 0,
-    "day_peak": 1073.46,
+    "day_peak": 0.0,
     "night_peak": 0.0,
     "day_entry_std_error": 5.18892894600071,
     "day_entry_atr": 84.67046061344959,
@@ -21,5 +21,5 @@
     "night_entry_tp_price": 0.0,
     "daily_reset_done_date": "2026-07-27",
     "night_reset_done_date": "2026-07-27_0500",
-    "night_start_done_date": "2026-07-26_1800"
+    "night_start_done_date": "2026-07-27_1800"
 }

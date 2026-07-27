@@ -895,6 +895,7 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                                  entry_end_hour=None, entry_end_minute=0,
                                  trend_completed_bars_only=False, trend_slope_threshold=0.01,
                                  return_trades=False,
+                                 session_range_cap_mult=None, session_range_cap_min_bars=6,
                                  eod_close_unconditional=True, session_range_mult=1.0,
                                  dynamic_sizing=False):
     """
@@ -923,6 +924,19 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
     return_trades (2026-07-27 추가, 기본 False=기존 동작과 100% 동일):
       - True면 반환 dict에 'trade_log' 키가 추가되어, 각 거래의 진입/청산 시각·가격·방향·손익(pt)을
         딕셔너리 리스트로 담는다. 짧은 구간(예: 최근 1주일)을 사람이 직접 대조 확인할 때 사용.
+
+    session_range_cap_mult (2026-07-27 추가, 기본 None=기존 동작과 100% 동일):
+      - dist 계산 시 사용하는 ATR14는 "전일까지의 일봉"으로 계산되는 지연 지표라서, 어제
+        이전에 변동성이 컸으면 오늘 실제 흐름과 무관하게 dist가 크게 유지된다(2026-07-27
+        선물매매_점검보고서 1.1절: 당일 레인지 40.64pt의 62%에 달하는 dist 때문에 +22.4pt
+        평가익을 전부 반납한 사례).
+      - None(기본): 추가 제한 없음 — dist = min(chandelier_mult*ATR14, chandelier_hard_cap) 그대로.
+      - 값 지정 시: 오늘 세션이 session_range_cap_min_bars(기본 6=30분)만큼 진행된 뒤부터,
+        dist를 session_range_cap_mult * (오늘 지금까지의 세션 레인지)로 추가 상한한다.
+        즉 dist = min(chandelier_mult*ATR14, chandelier_hard_cap, session_range_cap_mult*session_range_so_far).
+        어제 이전 변동성이 아무리 커도, 오늘 실제로 그만큼 움직이지 않았다면 트레일링 폭이
+        오늘 흐름을 벗어나 과도하게 넓어지지 않도록 하는 안전장치. 값을 낮출수록(예: 0.4)
+        더 타이트해진다.
 
     entry_end_hour / entry_end_minute (2026-07-27 추가, 기본 None=기존 동작과 100% 동일):
       - None(기본): 진입 종료시각 제한 없음 — era_order_manager.py의 현재 실전 동작과 동일하게
@@ -1109,6 +1123,10 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
         if pos != 0:
             exit_price, is_force = None, False
             dist = min(chandelier_mult * atr14, chandelier_hard_cap)
+            if session_range_cap_mult is not None and (i - day_start_idx) >= session_range_cap_min_bars:
+                session_range_so_far = day_high - day_low
+                if session_range_so_far > 0:
+                    dist = min(dist, session_range_cap_mult * session_range_so_far)
 
             if pos == 1:
                 peak_price = max(peak_price, c_high)

@@ -1169,6 +1169,9 @@ class ERAOrderManager:
             # 7~9절). 0.3 vs 0.5를 이 교정된 방법론으로 직접 맞대결시킨 적은 아직 없음(후속검증 후보).
             self.futures_chandelier_mult = float(futures_settings.get("chandelier_mult", 0.3))
             self.futures_chandelier_hard_cap = float(futures_settings.get("chandelier_hard_cap_pt", 60.0))
+            _srcm = futures_settings.get("session_range_cap_mult", None)
+            self.futures_session_range_cap_mult = float(_srcm) if _srcm is not None else None
+            self.futures_session_range_cap_min_bars = int(futures_settings.get("session_range_cap_min_bars", 6))
             # KIS(한국투자증권)로 별도 수집 중인 야간선물 코드 (kis/kis_night_futures_collector.py가
             # futures_ohlcv에 1분봉으로 적재). 주간 진입타점 계산 시 이 데이터를 병합해 간밤의
             # 가격 흐름을 반영한다 (2026-07-17 도입). 월물 만기가 바뀌면 이 값도 갱신 필요.
@@ -1501,6 +1504,31 @@ class ERAOrderManager:
                 cap = min(cap, self.futures_dynamic_cap_max)
             return cap
         return self.futures_sl_hard_cap_pt
+
+    def _apply_session_range_cap(self, dist):
+        """샹들리에 트레일링 폭(dist)에 '오늘 세션 레인지' 상한을 추가 적용 (2026-07-27 도입, 주간세션 전용).
+
+        dist=mult*ATR14는 ATR14가 전일까지의 일봉 기준이라 지연 지표다 — 어제 이전 변동성이
+        컸으면 오늘 실제 흐름과 무관하게 dist가 크게 유지된다(2026-07-27 실측: dist 25.40pt가
+        당일 레인지 40.64pt의 62%에 달해 +22.4pt 평가익을 전부 반납하고 -3.10pt로 청산된 사례,
+        선물매매_점검보고서_20260727.md 1.1절). 개장 후 session_range_cap_min_bars*5분이 지난
+        뒤부터, dist를 session_range_cap_mult * (오늘 지금까지의 세션 레인지)로 추가 상한한다 —
+        기존값보다 항상 같거나 좁아지기만 하므로 손절폭이 더 넓어지는 방향의 부작용은 없다.
+        bqa/kalman_backtester.py의 run_chandelier_live_replica(session_range_cap_mult)로 전체기간+
+        최근60/30일+7분기 교차검증 완료(10구간 중 9개 개선, 1개는 절대금액상 무시할 수준의 악화).
+        야간세션은 검증 범위 밖이라 이 함수를 적용하지 않는다(_process_night_tick 미호출).
+        """
+        cap_mult = getattr(self, "futures_session_range_cap_mult", None)
+        if cap_mult is None:
+            return dist
+        activated_at = getattr(self, "_day_strategy_activated_at", None)
+        min_bars = getattr(self, "futures_session_range_cap_min_bars", 6)
+        if activated_at is None or (datetime.now() - activated_at).total_seconds() < min_bars * 300:
+            return dist
+        session_range_so_far = self.futures_day_session_high - self.futures_day_session_low
+        if session_range_so_far > 0:
+            dist = min(dist, cap_mult * session_range_so_far)
+        return dist
 
     def _check_daily_reset(self):
         try:
@@ -3746,6 +3774,16 @@ class ERAOrderManager:
             if not self.futures_positions[pos_key].get('is_exiting', False):
                 pos = self.futures_positions[pos_key]
                 entry = self.futures_day_entry_price
+                if entry <= 0:
+                    # (2026-07-27 추가) 청산 주문이 체결 확인 전에 futures_day_entry_price를
+                    # 낙관적으로 0으로 초기화하는 20여 곳의 기존 호출부(장마감 강제청산 포함) 때문에,
+                    # 주문이 15초 내 미체결로 끝나면 포지션은 self.futures_positions에 그대로
+                    # 남아있는데 이 아래 감시 블록 전체가 통째로 꺼져버리는 문제가 실측 확인됨
+                    # (2026-07-27 15:44 장마감청산 미체결 → entry=0 → 샹들리에 트레일링 감시가
+                    # 08:45 다음날 재시작 전까지 완전히 죽어있었음). pos['price']는 이 초기화의
+                    # 영향을 받지 않고 원래 체결가를 그대로 들고 있으므로, 여기서 이걸로 복구해
+                    # 미체결 재시도 구간에도 감시 공백이 생기지 않게 한다.
+                    entry = pos.get('price', 0.0)
                 if entry > 0:
                     strategy_type = getattr(self, "futures_strategy_type", "volatility_breakout")
                     is_kalman = (strategy_type == "kalman")
@@ -3870,6 +3908,7 @@ class ERAOrderManager:
                         # ── 샹들리에 청산 전략 (2026-07-15 도입) ──
                         elif is_chandelier:
                             dist = min(self.futures_chandelier_mult * getattr(self, "futures_atr_14", 5.0), self.futures_chandelier_hard_cap)
+                            dist = self._apply_session_range_cap(dist)
                             stop_price = self.futures_day_peak - dist
                             if current_price <= stop_price:
                                 realized_pnl = current_price - entry
@@ -4055,6 +4094,7 @@ class ERAOrderManager:
                         # ── 샹들리에 청산 전략 (2026-07-15 도입) ──
                         elif is_chandelier:
                             dist = min(self.futures_chandelier_mult * getattr(self, "futures_atr_14", 5.0), self.futures_chandelier_hard_cap)
+                            dist = self._apply_session_range_cap(dist)
                             stop_price = self.futures_day_peak + dist
                             if current_price >= stop_price:
                                 realized_pnl = entry - current_price
