@@ -894,6 +894,7 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                                  entry_start_hour=9, entry_start_minute=0,
                                  entry_end_hour=None, entry_end_minute=0,
                                  trend_completed_bars_only=False, trend_slope_threshold=0.01,
+                                 return_trades=False,
                                  eod_close_unconditional=True, session_range_mult=1.0,
                                  dynamic_sizing=False):
     """
@@ -918,6 +919,10 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
         max(session_range_mult * ATR14, 15.0)를 넘을 때만 청산 (조건부, 구버전 재현용).
         오버나잇 갭 방지 개선을 껐을 때와 켰을 때를 같은 샹들리에 청산 엔진 위에서
         비교하기 위해 추가.
+
+    return_trades (2026-07-27 추가, 기본 False=기존 동작과 100% 동일):
+      - True면 반환 dict에 'trade_log' 키가 추가되어, 각 거래의 진입/청산 시각·가격·방향·손익(pt)을
+        딕셔너리 리스트로 담는다. 짧은 구간(예: 최근 1주일)을 사람이 직접 대조 확인할 때 사용.
 
     entry_end_hour / entry_end_minute (2026-07-27 추가, 기본 None=기존 동작과 100% 동일):
       - None(기본): 진입 종료시각 제한 없음 — era_order_manager.py의 현재 실전 동작과 동일하게
@@ -994,6 +999,8 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
     pos_contracts = contracts  # dynamic_sizing=True면 매 진입마다 재계산, 아니면 위 고정값 그대로
 
     pos, entry_price, peak_price = 0, 0.0, 0.0
+    entry_time = None
+    trade_log = []
     day_high, day_low, cur_day = -np.inf, np.inf, None
     day_start_idx = 0
     last_long_exit, last_short_exit = 0.0, 0.0
@@ -1140,6 +1147,14 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                     last_long_exit = exit_price
                 else:
                     last_short_exit = exit_price
+                if return_trades:
+                    trade_log.append({
+                        'entry_time': entry_time, 'exit_time': dt_index[i],
+                        'direction': 'LONG' if pos == 1 else 'SHORT',
+                        'entry_price': entry_price, 'exit_price': exit_price,
+                        'pnl_pt': raw_pnl - exit_slip, 'is_force': is_force,
+                        'contracts': pos_contracts, 'gain_krw': gain,
+                    })
                 pos, entry_price, peak_price = 0, 0.0, 0.0
             continue
 
@@ -1160,6 +1175,7 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
             elif not enable_reentry_filter or reentry_ok(1, target_long):
                 fill = target_long + SLIP_ENTRY
                 pos, entry_price, peak_price = 1, fill, fill
+                entry_time = dt_index[i]
                 if dynamic_sizing:
                     m_per = fill * point_value * MARGIN_RATE
                     pos_contracts = max(1, min(max_contracts, int((cap * margin_cap) / m_per))) if m_per > 0 else 1
@@ -1172,6 +1188,7 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
             elif not enable_reentry_filter or reentry_ok(-1, target_short):
                 fill = target_short - SLIP_ENTRY
                 pos, entry_price, peak_price = -1, fill, fill
+                entry_time = dt_index[i]
                 if dynamic_sizing:
                     m_per = fill * point_value * MARGIN_RATE
                     pos_contracts = max(1, min(max_contracts, int((cap * margin_cap) / m_per))) if m_per > 0 else 1
@@ -1205,11 +1222,14 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
     final_contracts = contracts_log[-1] if contracts_log else contracts
     avg_contracts = (sum(contracts_log) / len(contracts_log)) if contracts_log else contracts
 
-    return {'trades': total, 'win_rate': win_rate, 'profit_pct': profit_pct, 'mdd': max_mdd, 'pf': pf,
-            'contracts': contracts, 'avg_win_pt': avg_win_pt, 'avg_loss_pt': avg_loss_pt,
-            'loss_win_ratio': loss_win_ratio, 'worst_loss_pt': worst_loss_pt,
-            'final_capital': cap, 'final_contracts': final_contracts, 'avg_contracts': avg_contracts,
-            'equity': equity[1:], 'equity_days': equity_days}
+    result = {'trades': total, 'win_rate': win_rate, 'profit_pct': profit_pct, 'mdd': max_mdd, 'pf': pf,
+              'contracts': contracts, 'avg_win_pt': avg_win_pt, 'avg_loss_pt': avg_loss_pt,
+              'loss_win_ratio': loss_win_ratio, 'worst_loss_pt': worst_loss_pt,
+              'final_capital': cap, 'final_contracts': final_contracts, 'avg_contracts': avg_contracts,
+              'equity': equity[1:], 'equity_days': equity_days}
+    if return_trades:
+        result['trade_log'] = trade_log
+    return result
 
 
 def run_kalman_night_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=5.0, atr_cutoff=0.5,
