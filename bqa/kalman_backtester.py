@@ -892,6 +892,8 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                                  force_close_hour=8, force_close_minute=45, force_close_window_min=10,
                                  trim_std_outliers=0,
                                  entry_start_hour=9, entry_start_minute=0,
+                                 entry_end_hour=None, entry_end_minute=0,
+                                 trend_completed_bars_only=False, trend_slope_threshold=0.01,
                                  eod_close_unconditional=True, session_range_mult=1.0,
                                  dynamic_sizing=False):
     """
@@ -916,6 +918,14 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
         max(session_range_mult * ATR14, 15.0)를 넘을 때만 청산 (조건부, 구버전 재현용).
         오버나잇 갭 방지 개선을 껐을 때와 켰을 때를 같은 샹들리에 청산 엔진 위에서
         비교하기 위해 추가.
+
+    entry_end_hour / entry_end_minute (2026-07-27 추가, 기본 None=기존 동작과 100% 동일):
+      - None(기본): 진입 종료시각 제한 없음 — era_order_manager.py의 현재 실전 동작과 동일하게
+        09:10 이후라면 장마감 직전이라도 신규 진입이 허용된다.
+      - 값 지정 시: (hour, minute) >= (entry_end_hour, entry_end_minute)이면 신규 진입 차단.
+        기존 포지션의 청산/트레일링은 이 게이트와 무관하게 계속 동작한다. "장마감 무조건청산"
+        (15:35~15:45)이 도입된 뒤로는 늦은 진입일수록 트레일링이 작동할 시간 자체가 없어
+        강제청산으로 끝날 확률이 높아지는데, 그 구간을 잘라내는 효과를 검증하기 위해 추가.
 
     dynamic_sizing (2026-07-25 추가, 기본 False=기존 동작과 100% 동일):
       - False(기본): era_order_manager.py:4677-4679의 실제 계약수 산정 공식과 달리,
@@ -1062,8 +1072,15 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
             trend = "NEUTRAL"
             if len(wb) >= 5:
                 rev_b, rev_c = wb[::-1], wc[::-1]
-                _, first_idx = np.unique(rev_b, return_index=True)
+                uniq_b, first_idx = np.unique(rev_b, return_index=True)
                 long_closes = rev_c[first_idx]
+                # (2026-07-27 추가) trend_completed_bars_only=True면 아직 다 차지 않은 최신
+                # 15분 버킷을 추세판정에서 제외한다. 기본 False는 실전/기존과 100% 동일한 동작
+                # (미완성 버킷을 그대로 써서, 5분마다 비교 대상 마지막 값이 바뀌는 리페인팅 발생).
+                if trend_completed_bars_only and len(uniq_b) >= 2:
+                    bars_per_bucket = max(1, trend_bar_minutes // 5)
+                    if np.count_nonzero(wb == uniq_b[-1]) < bars_per_bucket:
+                        long_closes = long_closes[:-1]
                 if len(long_closes) >= 5:
                     xl, Pl = None, 1.0
                     kf_long_path = np.empty(len(long_closes))
@@ -1077,7 +1094,8 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                             Pl = (1 - Kl) * Pl
                         kf_long_path[j] = xl
                     slope = kf_long_path[-1] - kf_long_path[-2]
-                    trend = "UP" if slope > 0.01 else ("DOWN" if slope < -0.01 else "NEUTRAL")
+                    _thr = trend_slope_threshold
+                    trend = "UP" if slope > _thr else ("DOWN" if slope < -_thr else "NEUTRAL")
 
         c_open, c_high, c_low, c_close = opens[i], highs[i], lows[i], closes[i]
 
@@ -1126,6 +1144,8 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
             continue
 
         if force_close or vol_force_close or (hour, minute) < (entry_start_hour, entry_start_minute) or i < kf_window:
+            continue
+        if entry_end_hour is not None and (hour, minute) >= (entry_end_hour, entry_end_minute):
             continue
         if consec_losses >= consecutive_loss_limit:
             continue
