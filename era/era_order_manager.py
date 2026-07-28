@@ -4972,7 +4972,7 @@ class ERAOrderManager:
         try:
             from datetime import datetime as dt
             today_str = dt.now().strftime("%Y-%m-%d")
-            
+
             if not hasattr(self, '_last_logged_balance_date') or self._last_logged_balance_date != today_str:
                 stock_invested = 0
                 for code, pos in self.portfolio.items():
@@ -4980,9 +4980,9 @@ class ERAOrderManager:
                     qty = pos.get('qty', 0)
                     current_price = pos.get('current_price', buy_price)
                     stock_invested += current_price * qty
-                
+
                 stock_total = self.stock_total_balance + stock_invested
-                
+
                 futures_pnl = 0
                 for code, pos in self.futures_positions.items():
                     p_type = pos.get('type', 'LONG')
@@ -4995,10 +4995,10 @@ class ERAOrderManager:
                     else:
                         pnl = (buy_price - current_price) * qty * multiplier
                     futures_pnl += pnl
-                    
+
                 futures_total = self.futures_available_balance + futures_pnl
                 combined_total = stock_total + futures_total
-                
+
                 if combined_total > 0:
                     import sqlite3
                     db_conn = sqlite3.connect(self.unified_db_path, timeout=30)
