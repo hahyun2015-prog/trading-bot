@@ -4750,34 +4750,68 @@ class ERAOrderManager:
 
                     # 청산 주문 후 15초 내 체결 미확인 시 재시도 (최대 3회 초과 시 로컬 포지션 강제 초기화)
                     # 모의투자 환경에서 체결 콜백이 오지 않아 is_exiting이 영구 해제 → 재주문 → 루프가 발생하는 것을 방지
+                    #
+                    # (2026-07-28 강화) 취소 요청을 보내도 브로커에 실제 반영되기까지는 시간이
+                    # 걸릴 수 있다. 취소 요청 직후 바로 재주문/강제초기화를 진행하면, 취소가 아직
+                    # 처리되기 전에 원주문이 뒤늦게 체결되면서 재주문과 이중 체결될 위험이 남는다.
+                    # 그래서 취소 요청과 재시도 판단 사이에 CANCEL_GRACE_MS 유예를 두고, 유예가
+                    # 끝난 시점에 포지션이 이미 사라졌으면(=원주문이 그 사이 실제로 체결되어
+                    # 정상 정리됨) 재시도/강제초기화 자체를 하지 않는다.
+                    CANCEL_GRACE_MS = 20000
+
+                    def _finalize_exit_after_cancel_grace(retry_count):
+                        pos = self.futures_positions.get(pos_key)
+                        if pos is None:
+                            print(f"[{session_label}선물] ✅ 취소 유예 중 원주문 체결로 포지션 정리 확인됨 → 재시도 불필요")
+                            return
+                        if not pos.get('is_exiting'):
+                            return  # 유예 도중 다른 경로(정상 체결 처리 등)로 이미 처리됨
+
+                        if retry_count >= 3:
+                            print(f"[{session_label}선물] 🚨 청산 주문 {retry_count}회 체결 미확인 (취소 유예 종료) → 로컬 포지션 강제 초기화 (과매매 방지)")
+                            del self.futures_positions[pos_key]
+                            setattr(self, lock_attr, False)
+                            if is_night:
+                                self.futures_night_entry_price = 0.0
+                            else:
+                                self.futures_day_entry_price = 0.0
+                                self.futures_day_peak = 0.0
+                            if notifier:
+                                notifier.send_message(
+                                    f"🚨 <b>[{session_label}선물 강제 로컬 청산]</b>\n"
+                                    f"청산 주문 {retry_count}회 체결 미확인 → 로컬 포지션 초기화\n"
+                                    f"⚠️ 실제 브로커 포지션과 불일치 가능 — 수동 확인 필요"
+                                )
+                        else:
+                            print(f"[{session_label}선물] ⚠️ 청산 주문 {retry_count}회 체결 미확인 (취소 유예 종료) → is_exiting 해제 (재시도)")
+                            pos['is_exiting'] = False
+                            if notifier:
+                                notifier.send_message(
+                                    f"⚠️ <b>[{session_label}선물 청산 체결 미확인 {retry_count}/3]</b>\n"
+                                    f"원주문 취소 요청 후 감시를 재가동합니다."
+                                )
+
                     def _clear_exiting_if_no_fill():
                         pos = self.futures_positions.get(pos_key)
                         if pos is not None and pos.get('is_exiting'):
                             retry_count = pos.get('exit_retry_count', 0) + 1
                             pos['exit_retry_count'] = retry_count
-                            if retry_count >= 3:
-                                print(f"[{session_label}선물] 🚨 청산 주문 {retry_count}회 체결 미확인 → 로컬 포지션 강제 초기화 (과매매 방지)")
-                                del self.futures_positions[pos_key]
-                                setattr(self, lock_attr, False)
-                                if is_night:
-                                    self.futures_night_entry_price = 0.0
-                                else:
-                                    self.futures_day_entry_price = 0.0
-                                    self.futures_day_peak = 0.0
-                                if notifier:
-                                    notifier.send_message(
-                                        f"🚨 <b>[{session_label}선물 강제 로컬 청산]</b>\n"
-                                        f"청산 주문 {retry_count}회 체결 미확인 → 로컬 포지션 초기화\n"
-                                        f"⚠️ 실제 브로커 포지션과 불일치 가능 — 수동 확인 필요"
+
+                            # 재시도로 새 주문을 내기 전에, 앞서 낸 원주문이 아직 브로커에 살아
+                            # 있을 수 있으므로 먼저 취소를 시도한다 (원주문번호 미확보 시 조용히
+                            # 건너뛰고 기존 동작 그대로 진행 — 취소 실패가 재시도 자체를 막지 않음).
+                            _org_order_no = getattr(self, "_futures_last_order_no", {}).get(order_code)
+                            if _org_order_no:
+                                try:
+                                    self.kiwoom.dynamicCall(
+                                        "SendOrderFO(QString, QString, QString, QString, int, QString, QString, int, QString, QString)",
+                                        ["FuturesLive", "0200", self.futures_account, order_code, 3, slby_tp, "3", qty, "0", _org_order_no]
                                     )
-                            else:
-                                print(f"[{session_label}선물] ⚠️ 청산 주문 15초 체결 미확인 ({retry_count}/3) → is_exiting 해제 (재시도)")
-                                pos['is_exiting'] = False
-                                if notifier:
-                                    notifier.send_message(
-                                        f"⚠️ <b>[{session_label}선물 청산 체결 미확인 {retry_count}/3]</b>\n"
-                                        f"15초 내 체결이 확인되지 않아 감시를 재가동합니다."
-                                    )
+                                    print(f"[{session_label}선물] 🚫 미체결 원주문({_org_order_no}) 취소 요청 전송 → {CANCEL_GRACE_MS // 1000}초 유예 후 재시도 판단")
+                                except Exception as _cancel_err:
+                                    print(f"[{session_label}선물] 원주문 취소 요청 실패: {_cancel_err}")
+
+                            QTimer.singleShot(CANCEL_GRACE_MS, lambda rc=retry_count: _finalize_exit_after_cancel_grace(rc))
                     QTimer.singleShot(15000, _clear_exiting_if_no_fill)
             else:
                 # ENTER 주문 전송 후 15초 내 체결 미확인 시 잠금 자동 해제
@@ -5583,6 +5617,19 @@ class ERAOrderManager:
             name = self.kiwoom.dynamicCall("GetChejanData(int)", 302).strip()
             code = self.kiwoom.dynamicCall("GetChejanData(int)", 9001).strip().replace("A", "")
             
+            # (2026-07-28 추가) 청산 주문이 15초 내 미체결로 재시도될 때 원주문을 취소하지 않고
+            # 새 주문을 또 내보내던 문제가 실측 확인됨 (원주문이 실제로는 살아있다가 재시도 주문과
+            # 함께 뒤늦게 둘 다 체결되어, SHORT 청산이 반대 방향 신규 LONG으로 뒤집힘). 취소 시
+            # 원주문번호(OrgOrdNo)가 필요한데 기존엔 "체결" 상태에서만 주문번호를 읽었으므로,
+            # 접수 단계에서도 코드별 최신 주문번호를 잡아둬서 재시도 시 취소에 사용한다.
+            if status != "체결":
+                _acc_order_no = self.kiwoom.dynamicCall("GetChejanData(int)", 9203).strip()
+                _acc_code = self.kiwoom.dynamicCall("GetChejanData(int)", 9001).strip().replace("A", "")
+                if _acc_order_no:
+                    if not hasattr(self, "_futures_last_order_no"):
+                        self._futures_last_order_no = {}
+                    self._futures_last_order_no[_acc_code] = _acc_order_no
+
             if status == "체결":
                 order_no = self.kiwoom.dynamicCall("GetChejanData(int)", 9203).strip()
                 raw_price = float(self.kiwoom.dynamicCall("GetChejanData(int)", 910).strip())
