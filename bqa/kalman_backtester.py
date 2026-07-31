@@ -897,7 +897,11 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                                  return_trades=False,
                                  session_range_cap_mult=None, session_range_cap_min_bars=6,
                                  eod_close_unconditional=True, session_range_mult=1.0,
-                                 dynamic_sizing=False):
+                                 dynamic_sizing=False,
+                                 regime_filter_enabled=False,
+                                 profit_lock_enabled=False, profit_lock_trigger_pt=8.0,
+                                 profit_lock_mult=0.10, profit_lock_be_buffer_pt=1.0,
+                                 profit_lock_be_move_trigger_pt=None, profit_lock_be_stage_buffer_pt=0.0):
     """
     era_order_manager.py의 실전 주간선물 "샹들리에 청산"(2026-07-15 도입, futures_strategy_type=
     "chandelier")을 재현한 백테스트. run_kalman_live_replica와 진입측(칼만 타점/장기추세필터/
@@ -954,6 +958,14 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
         margin_cap / margin_per), 1, max_contracts)로 "그 시점의 누적 자본금" 기준
         계약수를 재계산한다(margin_per = 진입가 * point_value * MARGIN_RATE). 즉 수익이
         나서 계좌가 커지면 다음 진입부터 계약수도 늘어나는 실제 복리 효과를 반영한다.
+
+    regime_filter_enabled / profit_lock_* (2026-07-30 도입, 기본 False=기존 동작과 100% 동일):
+      - regime_filter_enabled=True면 장기추세가 확실히 UP일 때만 LONG, DOWN일 때만 SHORT
+        진입을 허용한다(기존 역추세 차단은 반대방향만 막았으나, 이건 NEUTRAL/횡보 진입까지 차단).
+      - profit_lock_enabled=True면 era_order_manager.py의 _apply_profit_lock을 재현한다.
+        1단계(선택, be_move_trigger_pt): 미실현 최대이익(MFE)이 이 값 도달 시 손절선을
+        본전±be_stage_buffer_pt로 끌어올린다. 2단계(trigger_pt): MFE가 trigger_pt(기본 8)
+        도달 시 트레일링 폭을 profit_lock_mult*ATR14로 좁히고 손절선을 본전±be_buffer_pt로 잠근다.
     """
     n = len(df)
     if n < kf_window + 10:
@@ -1130,7 +1142,17 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
 
             if pos == 1:
                 peak_price = max(peak_price, c_high)
-                stop_price = peak_price - dist
+                eff_dist, pl_floor = dist, None
+                if profit_lock_enabled:
+                    mfe = peak_price - entry_price
+                    if profit_lock_be_move_trigger_pt is not None and mfe >= profit_lock_be_move_trigger_pt:
+                        pl_floor = entry_price + profit_lock_be_stage_buffer_pt
+                    if mfe >= profit_lock_trigger_pt:
+                        eff_dist = min(eff_dist, profit_lock_mult * atr14)
+                        pl_floor = entry_price + profit_lock_be_buffer_pt
+                stop_price = peak_price - eff_dist
+                if pl_floor is not None:
+                    stop_price = max(stop_price, pl_floor)
                 if force_close or vol_force_close:
                     exit_price = c_close
                     is_force = True
@@ -1138,7 +1160,17 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                     exit_price = stop_price
             else:
                 peak_price = min(peak_price, c_low)
-                stop_price = peak_price + dist
+                eff_dist, pl_floor = dist, None
+                if profit_lock_enabled:
+                    mfe = entry_price - peak_price
+                    if profit_lock_be_move_trigger_pt is not None and mfe >= profit_lock_be_move_trigger_pt:
+                        pl_floor = entry_price - profit_lock_be_stage_buffer_pt
+                    if mfe >= profit_lock_trigger_pt:
+                        eff_dist = min(eff_dist, profit_lock_mult * atr14)
+                        pl_floor = entry_price - profit_lock_be_buffer_pt
+                stop_price = peak_price + eff_dist
+                if pl_floor is not None:
+                    stop_price = min(stop_price, pl_floor)
                 if force_close or vol_force_close:
                     exit_price = c_close
                     is_force = True
@@ -1190,6 +1222,8 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
         if c_high >= target_long:
             if not disable_trend_filter and trend == "DOWN":
                 continue
+            elif regime_filter_enabled and trend != "UP":
+                continue
             elif not enable_reentry_filter or reentry_ok(1, target_long):
                 fill = target_long + SLIP_ENTRY
                 pos, entry_price, peak_price = 1, fill, fill
@@ -1202,6 +1236,8 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                 contracts_log.append(pos_contracts)
         elif c_low <= target_short:
             if not disable_trend_filter and trend == "UP":
+                continue
+            elif regime_filter_enabled and trend != "DOWN":
                 continue
             elif not enable_reentry_filter or reentry_ok(-1, target_short):
                 fill = target_short - SLIP_ENTRY
