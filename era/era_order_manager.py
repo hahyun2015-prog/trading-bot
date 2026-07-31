@@ -672,6 +672,8 @@ class ERAOrderManager:
         # ── STA 통합: 테마 크롤링 + 실시간 OHLCV ─────────────────────────
         self.theme_stocks = {}        # {code: name} 오늘 실시간 구독 종목
         self.ohlcv_buffer = {}        # {code: {period_str: {o,h,l,c,v}}}
+        self._tick_reject = {}        # {code: [최근 연속 거부된 틱 가격]} — 지속이동 락아웃 복구용(2026-07-31)
+        self._tick_feed_alerted = {}  # {code: bool} 피드 동결 텔레그램 경고 중복 방지
         self.theme_crawl_date = ""    # 크롤링 완료 날짜 (YYYY-MM-DD), 날짜 바뀌면 재실행
 
         # 7. 장전 테마 크롤링 체크 (1분 주기, 08:50) — stock/both만
@@ -1185,6 +1187,30 @@ class ERAOrderManager:
             self.futures_reentry_cooldown_sec = float(futures_settings.get("reentry_cooldown_sec", 0.0))  # 청산 후 같은 방향 재진입 최소 대기시간(초, 0=비활성)
             self.futures_consecutive_loss_limit = int(futures_settings.get("consecutive_loss_limit", 5))
             self.futures_min_std_error_entry = float(futures_settings.get("min_std_error_entry", 0.0))
+            # ── (2026-07-30 도입) 레짐필터 + 이익보전 (샹들리에 전용) ──────────────────────
+            # 백테스트(bqa 30,950봉, 레짐+이익보전+진입임계1.5): 승률 56%→82%, PF 4.2→13.6,
+            # MDD 27.7%→8.6%, 최악단일손실 -77.7pt→-28.6pt. 표준코스피200·최근장에서도 동일 방향 개선.
+            # 셋 다 config 플래그로 on/off 가능하며, 끄면 기존 라이브 동작과 100% 동일.
+            # (1) 레짐필터: 장기 칼만 추세가 확실히 방향성을 가질 때만(UP=롱, DOWN=숏) 신규진입 허용.
+            #     기존은 역추세(DOWN롱/UP숏)만 차단했으나, 켜면 NEUTRAL(횡보) 진입까지 차단해 박스권 오진입 제거.
+            self.futures_regime_filter_enabled = bool(futures_settings.get("regime_filter_enabled", False))
+            # (2) 이익보전: 미실현 최대이익(MFE)이 trigger_pt 도달 시 트레일링 폭을 profit_lock_mult*ATR로
+            #     좁히고, 손절선을 본전±be_buffer_pt로 끌어올려 벌어둔 이익을 되뱉지 않도록 잠근다.
+            self.futures_profit_lock_enabled = bool(futures_settings.get("profit_lock_enabled", False))
+            self.futures_profit_lock_trigger_pt = float(futures_settings.get("profit_lock_trigger_pt", 8.0))
+            self.futures_profit_lock_mult = float(futures_settings.get("profit_lock_mult", 0.10))
+            self.futures_profit_lock_be_buffer_pt = float(futures_settings.get("profit_lock_be_buffer_pt", 1.0))
+            # (2026-07-30) 2단계 이익보전 — 본전이동 단계. None이면 1단계만(기존 동작).
+            _pl_be_mt = futures_settings.get("profit_lock_be_move_trigger_pt", None)
+            self.futures_profit_lock_be_move_trigger_pt = float(_pl_be_mt) if _pl_be_mt is not None else None
+            self.futures_profit_lock_be_stage_buffer_pt = float(futures_settings.get("profit_lock_be_stage_buffer_pt", 0.0))
+            # (2026-07-31) 틱 이상치 필터 '지속이동 복구' — 3% 초과 틱이 좁은 범위에 뭉쳐 N개
+            # 연속 거부되면 실제 이동으로 보고 내부가격을 새 레벨로 재기준(락아웃 해제). 단발
+            # 스파이크는 계속 거부. tick_recovery_enabled=False면 기존 동작(무한 거부)과 동일.
+            self.futures_tick_recovery_enabled = bool(futures_settings.get("tick_recovery_enabled", True))
+            self.futures_tick_recovery_streak = int(futures_settings.get("tick_recovery_streak", 20))
+            self.futures_tick_recovery_band_pct = float(futures_settings.get("tick_recovery_band_pct", 0.01))
+            self.futures_tick_health_alert = bool(futures_settings.get("tick_health_alert", True))
             self.futures_std_trim_outliers = int(futures_settings.get("std_trim_outliers", 0))
             _dcm = futures_settings.get("dynamic_cap_mult", None)
             self.futures_dynamic_cap_mult = float(_dcm) if _dcm is not None else None
@@ -1529,6 +1555,32 @@ class ERAOrderManager:
         if session_range_so_far > 0:
             dist = min(dist, cap_mult * session_range_so_far)
         return dist
+
+    def _apply_profit_lock(self, dist, entry, peak, is_long):
+        """이익보전(2026-07-30 도입, 샹들리에 전용). 2단계 구조:
+        - 1단계(본전이동, be_move_trigger_pt): 미실현 최대이익(MFE)이 be_move_trigger_pt에 도달하면
+          손절선을 본전±be_stage_buffer_pt로 끌어올린다(트레일링 폭은 아직 그대로). MFE 3~8pt
+          '사각지대'에서 소액 평가익이 큰 손실로 뒤집히던 케이스를 본전 근처에서 끊기 위함.
+        - 2단계(타이트 트레일, trigger_pt): MFE가 trigger_pt(기본 8)에 도달하면 트레일링 폭을
+          profit_lock_mult*ATR14로 좁히고 손절선을 본전±be_buffer_pt로 잠근다.
+        반환값 (조정된 dist, 손절선 하한/상한 floor). profit_lock_enabled=False면 (dist, None)로
+        기존 동작과 100% 동일. be_move_trigger_pt=None(미설정)이면 1단계 없이 기존 1단계식으로 동작.
+        bqa 백테스트 검증: 2단계(BE@4) 적용 시 평균손실 −6.7→−4.2pt, PF 23.7→28.1로 개선."""
+        if not getattr(self, "futures_profit_lock_enabled", False):
+            return dist, None
+        mfe = (peak - entry) if is_long else (entry - peak)
+        floor = None
+        be_trig = getattr(self, "futures_profit_lock_be_move_trigger_pt", None)
+        if be_trig is not None and mfe >= be_trig:
+            be_buf = getattr(self, "futures_profit_lock_be_stage_buffer_pt", 0.0)
+            floor = (entry + be_buf) if is_long else (entry - be_buf)
+        trig = getattr(self, "futures_profit_lock_trigger_pt", 8.0)
+        if mfe >= trig:
+            atr = getattr(self, "futures_atr_14", 5.0)
+            dist = min(dist, getattr(self, "futures_profit_lock_mult", 0.10) * atr)
+            buf = getattr(self, "futures_profit_lock_be_buffer_pt", 1.0)
+            floor = (entry + buf) if is_long else (entry - buf)
+        return dist, floor
 
     def _check_daily_reset(self):
         try:
@@ -2787,8 +2839,37 @@ class ERAOrderManager:
             # 봉 시가 대비 급격히 괴리된 틱(순간 오류/글리치)은 high/low/종가 반영에서 제외하여
             # ATR·손절폭 계산이 단발성 이상 틱 하나로 몇 주씩 왜곡되는 사고를 방지 (2026-06-23 사례)
             if c['o'] > 0 and abs(price - c['o']) / c['o'] > max_jump:
-                print(f"[ERA 이상치 필터] {code} 틱 {price:.2f}pt가 봉 시가 {c['o']:.2f}pt 대비 {abs(price-c['o'])/c['o']*100:.1f}% 괴리 — 이상치로 판단해 무시")
-                return
+                # (2026-07-31) 지속이동 복구: 3% 초과 틱이 좁은 범위에 N개 연속 뭉쳐 거부되면
+                # 단발 글리치가 아니라 실제 이동으로 보고 내부가격을 새 레벨로 재기준(락아웃 해제).
+                _msg = f"[ERA 이상치 필터] {code} 틱 {price:.2f}pt가 봉 시가 {c['o']:.2f}pt 대비 {abs(price-c['o'])/c['o']*100:.1f}% 괴리 — 이상치로 판단해 무시"
+                if getattr(self, "futures_tick_recovery_enabled", True):
+                    st = self._tick_reject.setdefault(code, [])
+                    st.append(price)
+                    need = getattr(self, "futures_tick_recovery_streak", 20)
+                    if len(st) < need:
+                        print(_msg); return
+                    recent = st[-need:]
+                    med = sorted(recent)[len(recent) // 2]
+                    band = getattr(self, "futures_tick_recovery_band_pct", 0.01)
+                    if not (med > 0 and (max(recent) - min(recent)) / med <= band):
+                        st[:] = recent  # 스트릭 길이 제한
+                        print(_msg); return
+                    old_o = c['o']
+                    c['o'] = c['h'] = c['l'] = c['c'] = med
+                    st.clear()
+                    print(f"[ERA 이상치 복구] {code} {need}틱 연속 {med:.2f}pt 군집 — 지속 이동 판단, 내부가격 {old_o:.2f}→{med:.2f}pt 재기준(락아웃 해제)")
+                    if getattr(self, "futures_tick_health_alert", True) and notifier and not self._tick_feed_alerted.get(code):
+                        self._tick_feed_alerted[code] = True
+                        notifier.send_message(f"⚠️ <b>[선물 피드 복구]</b> {code} 내부가격 {old_o:.2f}→{med:.2f}pt 재기준 (지속 이동 감지, 이상치 락아웃 해제)")
+                    # 재기준 후 이번 틱은 아래 정상 반영 경로로 진행
+                else:
+                    print(_msg); return
+            else:
+                # 정상 채택 틱 — 거부 스트릭·경고 상태 리셋
+                if self._tick_reject.get(code):
+                    self._tick_reject[code] = []
+                if self._tick_feed_alerted.get(code):
+                    self._tick_feed_alerted[code] = False
             if price > c['h']:
                 c['h'] = price
             if price < c['l']:
@@ -3909,7 +3990,10 @@ class ERAOrderManager:
                         elif is_chandelier:
                             dist = min(self.futures_chandelier_mult * getattr(self, "futures_atr_14", 5.0), self.futures_chandelier_hard_cap)
                             dist = self._apply_session_range_cap(dist)
+                            dist, _pl_floor = self._apply_profit_lock(dist, entry, self.futures_day_peak, True)
                             stop_price = self.futures_day_peak - dist
+                            if _pl_floor is not None:
+                                stop_price = max(stop_price, _pl_floor)
                             if current_price <= stop_price:
                                 realized_pnl = current_price - entry
                                 peak_snapshot = self.futures_day_peak
@@ -4095,7 +4179,10 @@ class ERAOrderManager:
                         elif is_chandelier:
                             dist = min(self.futures_chandelier_mult * getattr(self, "futures_atr_14", 5.0), self.futures_chandelier_hard_cap)
                             dist = self._apply_session_range_cap(dist)
+                            dist, _pl_floor = self._apply_profit_lock(dist, entry, self.futures_day_peak, False)
                             stop_price = self.futures_day_peak + dist
+                            if _pl_floor is not None:
+                                stop_price = min(stop_price, _pl_floor)
                             if current_price >= stop_price:
                                 realized_pnl = entry - current_price
                                 peak_snapshot = self.futures_day_peak
@@ -4241,6 +4328,9 @@ class ERAOrderManager:
                     # 장기 추세가 하락세(DOWN)일 때 LONG 진입 무시
                     if use_trend_filter and trend == "DOWN":
                         return
+                    # (2026-07-30) 레짐필터: 켜져 있으면 추세가 확실히 상승(UP)일 때만 LONG 허용(NEUTRAL 차단)
+                    if is_chandelier and getattr(self, "futures_regime_filter_enabled", False) and trend != "UP":
+                        return
                     # 칼만 필터인 경우 이미 익절 타겟을 초과했으면 진입 금지 (무한 루프 방지)
                     if is_kalman and self.futures_tp_price_long > 0 and current_price >= self.futures_tp_price_long:
                         return
@@ -4285,6 +4375,9 @@ class ERAOrderManager:
                 elif current_price <= self.futures_target_short:
                     # 장기 추세가 상승세(UP)일 때 SHORT 진입 무시
                     if use_trend_filter and trend == "UP":
+                        return
+                    # (2026-07-30) 레짐필터: 켜져 있으면 추세가 확실히 하락(DOWN)일 때만 SHORT 허용(NEUTRAL 차단)
+                    if is_chandelier and getattr(self, "futures_regime_filter_enabled", False) and trend != "DOWN":
                         return
                     # 칼만 필터인 경우 이미 익절 타겟을 초과했으면 진입 금지 (무한 루프 방지)
                     if is_kalman and self.futures_tp_price_short > 0 and current_price <= self.futures_tp_price_short:
