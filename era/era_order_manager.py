@@ -1651,8 +1651,72 @@ class ERAOrderManager:
             self.futures_day_consecutive_losses = 0
             self.futures_day_trade_count = 0
             self.ohlcv_buffer.clear()
+            # (2026-08-04) 틱 이상치 거부 스트릭도 함께 초기화한다. ohlcv_buffer만 비우면
+            # 어제 쌓인 거부 이력이 남아, 오늘 첫 거부부터 어제·오늘 가격이 섞인 채로 군집
+            # 판정이 이뤄질 수 있다(_is_sustained_tick_move는 최근 N건만 보므로 경계가 흐려짐).
+            self._tick_reject.clear()
+            self._tick_feed_alerted.clear()
             self.save_futures_exit_state()
             self._load_prev_range()
+
+            # (2026-08-04) 08:45 안전청산 실패 감시 — 15:46 마감청산 감시와 짝을 이룬다.
+            # 08:45~08:55는 장전 단일가 구간이라 틱이 희소해, 최악의 경우 첫 청산 주문조차
+            # 나가지 못한 채 조용히 넘어갈 수 있다(재시도는 타이머가 돌지만, 그건 첫 주문이
+            # 나간 뒤의 이야기다). 이 예약은 틱과 무관한 일일 리셋 타이머에서 걸어두므로
+            # 그날 틱이 한 건도 없어도 반드시 실행된다.
+            # 늦게 기동해 이미 08:57을 지난 경우엔 예약하지 않는다 — 장중 정상 보유 포지션을
+            # 청산 실패로 오인해 거짓 경보를 울리는 것을 막기 위함.
+            _morning_check_at = now.replace(hour=8, minute=57, second=0, microsecond=0)
+            if datetime.now() < _morning_check_at:
+                def _warn_if_morning_close_failed():
+                    _stuck = [(k, v) for k, v in self.futures_positions.items()
+                              if k in ("KOSPI200", "KOSPI200_NIGHT")]
+                    if not _stuck:
+                        return
+                    _lines = "\n".join(
+                        f"• {k}: {v.get('type')} {v.get('qty')}계약 @ {v.get('price', 0):.2f}pt"
+                        for k, v in _stuck
+                    )
+                    # 밤새 벌어진 갭과 그로 인한 평가손익을 함께 싣는다 — 오버나잇으로
+                    # 넘어간 포지션에서 정작 궁금한 건 "얼마나 물렸나"이기 때문.
+                    _gap = getattr(self, "_last_overnight_gap", None)
+                    _gap_txt = ""
+                    if _gap:
+                        _gap_txt = (f"\n• 야간 갭: {_gap['gap_pt']:+.2f}pt ({_gap['gap_pct']:+.2f}%), "
+                                    f"야간 최종가 {_gap['night_close']:.2f}pt")
+                        # 승수(미니 50,000 / 표준 250,000)를 확실히 아는 경우에만 금액을 싣는다.
+                        # 종목코드 문자열로 '105'를 찾는 방식은 못 쓴다 — 실전 코드는 'A0568000'
+                        # 형태라 '105'가 들어있지 않아 표준선물로 오판되고 금액이 5배로 부풀려진다
+                        # (2026-08-04 테스트로 발견). 긴급 알림에서 5배 틀린 손익은
+                        # 없느니만 못하므로, 모르면 pt 단위 괴리만 알리고 금액은 생략한다.
+                        _prefix = getattr(self, 'futures_prefix', None)
+                        _pv = {'105': 50000, '101': 250000}.get(_prefix)
+                        _pnl = 0.0
+                        _ok = _pv is not None
+                        for _k, _v in _stuck:
+                            _e = _v.get('price', 0) or 0
+                            _q = _v.get('qty', 0) or 0
+                            if _e <= 0:
+                                _ok = False
+                                break
+                            _d = (_gap['night_close'] - _e) if _v.get('type') == 'LONG' else (_e - _gap['night_close'])
+                            if _ok:
+                                _pnl += _d * _q * _pv
+                        if _ok:
+                            _gap_txt += f"\n• 추정 평가손익: <b>{_pnl:+,.0f}원</b>"
+                        else:
+                            _gap_txt += "\n• (승수 미확인 — 금액 환산 생략)"
+                    print(f"[선물 안전청산] 🚨 08:45 청산 창을 넘겼는데 포지션 잔존 — {len(_stuck)}건")
+                    if notifier:
+                        notifier.send_message(
+                            f"🚨 <b>[선물 08:45 안전청산 실패]</b>\n"
+                            f"장전 청산 창(08:45~08:55)을 넘겼는데 포지션이 남아 있습니다.\n{_lines}{_gap_txt}\n"
+                            f"⚠️ 정규장 개장 전 수동 확인 필요"
+                        )
+                QTimer.singleShot(
+                    int((_morning_check_at - datetime.now()).total_seconds() * 1000),
+                    _warn_if_morning_close_failed
+                )
             if self.trading_mode in ('futures', 'both'):
                 self.update_futures_dynamic_sl_tp()
             print(f"[ERA 주간선물] {now.strftime('%H:%M')} 세션 준비 — 전일 Range 갱신 및 카운터 초기화")
@@ -1682,6 +1746,15 @@ class ERAOrderManager:
                         print(f"[ERA 야간갭] 어제 주간종가({day_date}, {day_close:.2f}pt) → "
                               f"야간 마지막가({night_code}, {night_date}, {night_close:.2f}pt) | "
                               f"갭 {gap_pt:+.2f}pt ({gap_pct:+.2f}%)")
+                        # (2026-08-04) 08:45 안전청산 실패 알림에서 쓰기 위해 보관한다.
+                        # 매매 판단에는 여전히 쓰지 않는다(위 주석의 원칙 유지) — 포지션이
+                        # 밤을 넘겨버린 비정상 상황에서 "얼마나 물렸는지"를 알리기 위한 참고값이다.
+                        # 2026-08-03 사고 때 -33.94pt(-3.43%) 갭이 실제로 발생했고, 그 규모를
+                        # 아침에 즉시 알 수 있었다면 대응 판단이 빨랐다.
+                        self._last_overnight_gap = {
+                            'gap_pt': gap_pt, 'gap_pct': gap_pct,
+                            'night_close': night_close, 'night_code': night_code,
+                        }
                     else:
                         print(f"[ERA 야간갭] 야간 데이터가 어제 종가보다 오래됨({night_date} <= {day_date}) — 수집 공백 의심, 스킵")
             except Exception as e:
@@ -4957,7 +5030,13 @@ class ERAOrderManager:
                             # (2026-08-03) 틱을 기다리지 않고 여기서 직접 재주문한다.
                             # exit_retry_count는 pos에 남아 있으므로 3회 한도는 그대로 유지되고,
                             # 위에서 is_exiting을 풀었으므로 중복 주문 가드에도 걸리지 않는다.
-                            self._execute_futures_direct(signal_type, current_price, order_code, pos_key)
+                            #
+                            # (2026-08-04) 가격은 클로저에 잡힌 값이 아니라 그 시점의 최신가를 쓴다.
+                            # 시장가 주문("3"/가격 0)이라 체결 자체엔 영향이 없지만, 로그와 텔레그램에
+                            # 수십 초 전 가격이 찍히면 사후 분석 때 오해를 부른다. pos['current_price']는
+                            # 틱과 계좌 동기화 양쪽에서 갱신된다.
+                            _retry_price = pos.get('current_price') or current_price
+                            self._execute_futures_direct(signal_type, _retry_price, order_code, pos_key)
 
                     def _clear_exiting_if_no_fill():
                         pos = self.futures_positions.get(pos_key)
@@ -5222,12 +5301,20 @@ class ERAOrderManager:
                 stock_total = self.stock_total_balance + stock_invested
 
                 futures_pnl = 0
+                # (2026-08-04 수정) 승수를 futures_prefix로 판정한다.
+                # 기존 코드는 `'105' in code`였는데, 이 루프의 code는 종목코드가 아니라
+                # futures_positions의 키("KOSPI200" / "KOSPI200_NIGHT")다. 따라서 조건이
+                # 항상 False가 되어 미니선물(50,000)도 표준선물(250,000)로 계산됐고,
+                # daily_balance_history의 선물 평가손익이 5배로 기록돼 왔다.
+                # (매매 로직과는 무관한 통계 테이블이라 체결에는 영향이 없었으나,
+                #  수익률 추적이 왜곡됨. 같은 파일 4950/5832행은 이미 이 방식을 쓴다.)
+                _multiplier = 50000 if getattr(self, 'futures_prefix', '101') == '105' else 250000
                 for code, pos in self.futures_positions.items():
                     p_type = pos.get('type', 'LONG')
                     buy_price = pos.get('price', 0)
                     qty = pos.get('qty', 0)
                     current_price = pos.get('current_price', buy_price)
-                    multiplier = 50000 if '105' in code else 250000
+                    multiplier = _multiplier
                     if p_type == 'LONG':
                         pnl = (current_price - buy_price) * qty * multiplier
                     else:

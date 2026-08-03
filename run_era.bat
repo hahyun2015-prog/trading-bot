@@ -72,6 +72,27 @@ if %errorlevel% equ 0 (
 )
 echo.
 
+:: 기동 전 구문 자가검사 — 디스크 손상/편집 사고로 파일이 깨진 채 기동하면
+:: 스케줄 작업 경로에서는 콘솔이 숨겨져 IndentationError가 눈에 띄지 않고, 시스템이
+:: 조용히 죽은 상태로 장을 통째로 날린다 (2026-07-31 실측: 클라우드 동기화가
+:: era_order_manager.py를 덮어써 기동 실패, 원인 파악까지 장중 수 시간 소요).
+echo [CHECK] Verifying Python syntax before launch...
+"venv32\Scripts\python.exe" -m py_compile "era\era_order_manager.py" "era\leader_order_manager.py"
+if %errorlevel% neq 0 (
+    echo.
+    echo ==========================================================
+    echo  [FATAL] Python syntax check FAILED - aborting startup.
+    echo  era\era_order_manager.py or leader_order_manager.py is broken.
+    echo  Restore from git:  git checkout -- era\era_order_manager.py
+    echo ==========================================================
+    echo.
+    if "%1"=="auto" exit /b 1
+    pause
+    exit /b 1
+)
+echo [OK] Syntax check passed.
+echo.
+
 echo [OK] Starting ERA Order Manager...
 echo      To terminate, press Ctrl+C or close this window.
 echo ----------------------------------------------------------
