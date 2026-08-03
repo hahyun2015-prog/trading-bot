@@ -1174,6 +1174,12 @@ class ERAOrderManager:
             _srcm = futures_settings.get("session_range_cap_mult", None)
             self.futures_session_range_cap_mult = float(_srcm) if _srcm is not None else None
             self.futures_session_range_cap_min_bars = int(futures_settings.get("session_range_cap_min_bars", 6))
+            # (2026-08-03) 진입 종료 시각 — None이면 비활성(기존 동작). 주간세션 전용.
+            # 늦은 진입이 EOD 강제청산에 의존하는 구조와 2026-06-11 갭 꼬리위험을 회피한다.
+            # 검증: 선물_15시진입차단_백테스트_20260803.md
+            _eeh = futures_settings.get("entry_end_hour", None)
+            self.futures_entry_end_hour = int(_eeh) if _eeh is not None else None
+            self.futures_entry_end_minute = int(futures_settings.get("entry_end_minute", 0))
             # KIS(한국투자증권)로 별도 수집 중인 야간선물 코드 (kis/kis_night_futures_collector.py가
             # futures_ohlcv에 1분봉으로 적재). 주간 진입타점 계산 시 이 데이터를 병합해 간밤의
             # 가격 흐름을 반영한다 (2026-07-17 도입). 월물 만기가 바뀌면 이 값도 갱신 필요.
@@ -4340,6 +4346,25 @@ class ERAOrderManager:
             # (2026-07-20 39pt 오차 사례). 09:10부터 신규 진입을 허용해 그 노이즈 구간을 피한다 —
             # 기존 포지션의 청산/트레일링 로직(위쪽)은 이 게이트와 무관하게 계속 정상 동작함.
             is_after_910 = (now.hour == 9 and now.minute >= 10) or (now.hour > 9)
+
+            # (2026-08-03) 진입 종료 게이트 — 위 09:10 시작 게이트의 반대편 짝.
+            # 15:35~15:45 장마감 무조건청산이 도입된 뒤로 늦은 진입은 트레일링이 작동할
+            # 시간 자체가 없어 강제청산으로 끝나는 비율이 압도적으로 높다(15시 이후 진입의
+            # 57.8%가 강제청산, 전체 평균은 5.8%). 더 결정적으로, 이 시스템 최대 꼬리위험인
+            # 2026-06-11 거래정지 갭 사고(-117.98pt, 익일 08:45까지 방치)가 15:05 진입
+            # 건이었다 — session_range_cap도 EOD 무조건청산도 막지 못하는 구간이라
+            # 진입 자체를 막는 것이 유일한 방어다. 게다가 2026-08-03에 그 EOD 강제청산이
+            # 실제로 실패해(15:42 청산 미확인 → 오버나잇 방치) 의존도를 줄일 이유가 하나 더 늘었다.
+            # 백테스트(31,277봉, 현실 비용): 최악손실 -118.14 → -26.32pt, 최근60일 MDD
+            # 12.79% → 0.89%, PF 21.59 → 25.88. 대가는 전체 최종자본 -2.7%(-3.6억).
+            # 상세: 선물_15시진입차단_백테스트_20260803.md
+            # 기존 포지션의 청산/트레일링은 위쪽에서 이미 처리되므로 이 게이트와 무관하게 계속 동작한다.
+            _entry_end_h = getattr(self, "futures_entry_end_hour", None)
+            if _entry_end_h is not None:
+                _entry_end_m = getattr(self, "futures_entry_end_minute", 0)
+                if (now.hour, now.minute) >= (_entry_end_h, _entry_end_m):
+                    return
+
             if is_after_910:
                 # [AMATS 최적화] 초저변동성 구간 진입 차단 필터링 (ATR Cutoff)
                 atr_val = getattr(self, 'futures_atr_14', 2.0)
