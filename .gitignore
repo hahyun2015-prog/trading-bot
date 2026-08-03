@@ -43,3 +43,18 @@ kis/*.xlsx
 # Google Drive / Drive Upload 임시 파일
 .tmp.driveupload/
 
+# 클라우드 동기화가 남기는 충돌 사본·잔재 (2026-08-04 정리)
+# Drive/OneDrive가 같은 파일을 양쪽에서 건드리면 "파일 (1).py" 같은 사본을 만든다.
+# 2026-07-31에는 동기화가 era_order_manager.py를 덮어써 기동 실패까지 갔다.
+# 동기화 자체는 껐지만, 잔재가 git status를 오염시켜 진짜 변경을 놓치기 쉬우므로 제외한다.
+* (1).*
+* (2).*
+* (1)
+* (2)
+.fuse_hidden*
+
+# 코드 백업본 (수동/스크립트 생성)
+*.bak
+*.bak_*
+*.py.bak*
+
