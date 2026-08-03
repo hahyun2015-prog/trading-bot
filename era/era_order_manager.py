@@ -4873,7 +4873,7 @@ class ERAOrderManager:
                 if pos_key in self.futures_positions:
                     self.futures_positions[pos_key]['is_exiting'] = True
 
-                    # 청산 주문 후 15초 내 체결 미확인 시 재시도 (최대 3회 초과 시 로컬 포지션 강제 초기화)
+                    # 청산 주문 후 일정 시간 내 체결 미확인 시 재시도 (최대 3회 초과 시 로컬 포지션 강제 초기화)
                     # 모의투자 환경에서 체결 콜백이 오지 않아 is_exiting이 영구 해제 → 재주문 → 루프가 발생하는 것을 방지
                     #
                     # (2026-07-28 강화) 취소 요청을 보내도 브로커에 실제 반영되기까지는 시간이
@@ -4882,7 +4882,21 @@ class ERAOrderManager:
                     # 그래서 취소 요청과 재시도 판단 사이에 CANCEL_GRACE_MS 유예를 두고, 유예가
                     # 끝난 시점에 포지션이 이미 사라졌으면(=원주문이 그 사이 실제로 체결되어
                     # 정상 정리됨) 재시도/강제초기화 자체를 하지 않는다.
-                    CANCEL_GRACE_MS = 20000
+                    #
+                    # (2026-08-03 재설계) 위 구조에 두 가지 결함이 실측으로 드러나 함께 고친다.
+                    #  (1) 재시도가 틱에 의존했다. 유예가 끝나면 is_exiting만 풀고, 실제 재주문은
+                    #      _process_day_tick이 다시 호출되기를 기다렸다. 그런데 장마감 청산이
+                    #      필요한 15:35~15:45는 종가 단일가 구간이라 틱이 거의 들어오지 않는다.
+                    #      2026-08-03 15:42 LONG 15계약 청산 주문이 미확인으로 끝난 뒤 재시도가
+                    #      단 한 번도 발동하지 못했고, 창(15:45)을 넘겨 포지션이 그대로 오버나잇으로
+                    #      넘어갔다. → 이제 타이머가 _execute_futures_direct를 직접 재호출한다.
+                    #  (2) 기본 사이클(15초 미확인 + 20초 유예 = 35초)이 마감 창 끝자락에서는
+                    #      재시도 기회를 창 밖으로 밀어낸다. → 마감 창 안에서는 두 값을 줄여
+                    #      최소 한 번의 재시도가 창 안에 들어오게 한다.
+                    _now_exec = datetime.now()
+                    _in_eod_window = (not is_night) and _now_exec.hour == 15 and 35 <= _now_exec.minute <= 45
+                    UNCONFIRMED_MS = 6000 if _in_eod_window else 15000
+                    CANCEL_GRACE_MS = 6000 if _in_eod_window else 20000
 
                     def _finalize_exit_after_cancel_grace(retry_count):
                         pos = self.futures_positions.get(pos_key)
@@ -4908,13 +4922,17 @@ class ERAOrderManager:
                                     f"⚠️ 실제 브로커 포지션과 불일치 가능 — 수동 확인 필요"
                                 )
                         else:
-                            print(f"[{session_label}선물] ⚠️ 청산 주문 {retry_count}회 체결 미확인 (취소 유예 종료) → is_exiting 해제 (재시도)")
+                            print(f"[{session_label}선물] ⚠️ 청산 주문 {retry_count}회 체결 미확인 (취소 유예 종료) → 즉시 재주문")
                             pos['is_exiting'] = False
                             if notifier:
                                 notifier.send_message(
                                     f"⚠️ <b>[{session_label}선물 청산 체결 미확인 {retry_count}/3]</b>\n"
-                                    f"원주문 취소 요청 후 감시를 재가동합니다."
+                                    f"원주문 취소 후 청산을 재주문합니다."
                                 )
+                            # (2026-08-03) 틱을 기다리지 않고 여기서 직접 재주문한다.
+                            # exit_retry_count는 pos에 남아 있으므로 3회 한도는 그대로 유지되고,
+                            # 위에서 is_exiting을 풀었으므로 중복 주문 가드에도 걸리지 않는다.
+                            self._execute_futures_direct(signal_type, current_price, order_code, pos_key)
 
                     def _clear_exiting_if_no_fill():
                         pos = self.futures_positions.get(pos_key)
@@ -4935,9 +4953,45 @@ class ERAOrderManager:
                                     print(f"[{session_label}선물] 🚫 미체결 원주문({_org_order_no}) 취소 요청 전송 → {CANCEL_GRACE_MS // 1000}초 유예 후 재시도 판단")
                                 except Exception as _cancel_err:
                                     print(f"[{session_label}선물] 원주문 취소 요청 실패: {_cancel_err}")
+                            else:
+                                # 원주문번호를 못 잡은 경우(키움이 접수 체잔을 안 보내준 경우).
+                                # 2026-08-03 실측: 이 경로로 빠져 취소가 한 번도 전송되지 않았다.
+                                # 유예 자체는 그대로 둔다 — 취소를 못 보냈다는 건 원주문이 아직
+                                # 살아있을 가능성이 오히려 크다는 뜻이라, 뒤늦은 체결이 도착할
+                                # 시간을 주는 편이 이중체결 방지에 유리하다(유예 종료 시점의
+                                # 포지션 존재 확인이 그 판정을 한다).
+                                print(f"[{session_label}선물] ⚠️ 원주문번호 미확보 — 취소 전송 불가, {CANCEL_GRACE_MS // 1000}초 유예 후 재시도 판단")
 
                             QTimer.singleShot(CANCEL_GRACE_MS, lambda rc=retry_count: _finalize_exit_after_cancel_grace(rc))
-                    QTimer.singleShot(15000, _clear_exiting_if_no_fill)
+                    QTimer.singleShot(UNCONFIRMED_MS, _clear_exiting_if_no_fill)
+
+                    # (2026-08-03) 마감 창 초과 감시 — 창(15:45)이 지나도 주간 포지션이 남아
+                    # 있으면 조용히 오버나잇으로 넘기지 않고 반드시 알린다. 2026-08-03에는
+                    # 아무 경고 없이 포지션이 다음날까지 방치됐고, 사용자가 밤에 직접 발견했다.
+                    # 재시도마다 중복 예약되면 알림이 여러 번 울리므로 당일 1회만 예약한다.
+                    _eod_check_key = _now_exec.strftime("%Y%m%d")
+                    if _in_eod_window and getattr(self, "_eod_overrun_check_date", None) != _eod_check_key:
+                        self._eod_overrun_check_date = _eod_check_key
+
+                        def _warn_if_still_open_after_eod():
+                            _p = self.futures_positions.get(pos_key)
+                            if not _p:
+                                return
+                            _msg = (f"🚨 <b>[주간선물 장마감 청산 실패]</b>\n"
+                                    f"15:45 마감 창을 넘겼는데 포지션이 남아 있습니다.\n"
+                                    f"• {_p.get('type')} {_p.get('qty')}계약 @ {_p.get('price', 0):.2f}pt\n"
+                                    f"⚠️ 오버나잇 노출 상태 — 수동 청산 필요\n"
+                                    f"(익일 08:45 안전청산이 있으나 그때까지 갭 위험에 노출됩니다)")
+                            print(f"[주간선물] 🚨 마감 창 초과 — 포지션 잔존: {_p.get('type')} {_p.get('qty')}계약")
+                            if notifier:
+                                notifier.send_message(_msg)
+                        # 15:46:30 시점에 확인 (창 종료 + 90초 여유)
+                        _ms_until_check = max(
+                            5000,
+                            int((datetime.now().replace(hour=15, minute=46, second=30, microsecond=0)
+                                 - datetime.now()).total_seconds() * 1000)
+                        )
+                        QTimer.singleShot(_ms_until_check, _warn_if_still_open_after_eod)
             else:
                 # ENTER 주문 전송 후 15초 내 체결 미확인 시 잠금 자동 해제
                 # (Mock 서버 무응답 또는 주문 거절 후 res=0 반환하는 경우 대비)
