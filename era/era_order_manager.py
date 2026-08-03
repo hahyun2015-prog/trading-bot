@@ -2803,6 +2803,42 @@ class ERAOrderManager:
             c['c'] = price
             c['v'] += tick_vol
 
+    def _is_sustained_tick_move(self, code, price):
+        """이상치로 거부된 틱을 누적해, 좁은 범위에 N개 연속 뭉치면 단발 글리치가 아니라
+        실제 가격 이동으로 판정한다. (True, 재기준가) 또는 (False, 0.0)을 반환. (2026-07-31)
+
+        정규장 개장(09:00) 갭처럼 봉 경계에서 3%를 넘는 '정당한' 이동이 들어오면, 기존
+        로직은 신규봉 시가를 직전 종가로 대체 → 이후 모든 틱이 그 스테일 기준 대비 3% 밖이라
+        전부 거부 → 봉이 바뀌어도 대체가 반복되어 하루 종일 락아웃되는 문제가 실측 확인됨
+        (2026-07-31: 09:05 +6.31% 갭 직후부터 93,894틱 거부, 당일 체결 0건, DB에 평탄봉 82개
+        기록. 매매시스템_점검보고서_20260731.md 참조). 신규봉/기존봉 양쪽 경로가 이 함수로
+        거부 스트릭을 공유해서, 봉 경계를 넘어가도 지속 이동이면 곧바로 새 레벨을 채택한다."""
+        if not getattr(self, "futures_tick_recovery_enabled", True):
+            return False, 0.0
+        st = self._tick_reject.setdefault(code, [])
+        st.append(price)
+        need = getattr(self, "futures_tick_recovery_streak", 20)
+        if len(st) < need:
+            return False, 0.0
+        recent = st[-need:]
+        st[:] = recent  # 스트릭 길이 제한
+        med = sorted(recent)[len(recent) // 2]
+        band = getattr(self, "futures_tick_recovery_band_pct", 0.01)
+        if med > 0 and (max(recent) - min(recent)) / med <= band:
+            return True, med
+        return False, 0.0
+
+    def _notify_tick_recovery(self, code, old_price, new_price, where):
+        """이상치 락아웃 해제 알림 (코드별 1회만 — 복구가 반복돼도 도배하지 않음)"""
+        if not getattr(self, "futures_tick_health_alert", True):
+            return
+        if notifier and not self._tick_feed_alerted.get(code):
+            self._tick_feed_alerted[code] = True
+            notifier.send_message(
+                f"⚠️ <b>[선물 피드 복구]</b> {code} 내부가격 {old_price:.2f}→{new_price:.2f}pt "
+                f"재기준 ({where}, 지속 이동 감지로 이상치 락아웃 해제)"
+            )
+
     def _update_futures_ohlcv(self, code, price):
         """선물 실시간 틱 → 5분봉 OHLCV 인메모리 버퍼 갱신 (30초마다 DB 동기화)
         야간 세션 데이터를 futures_ohlcv 테이블에 축적해서 향후 야간 백테스트 가능하게 함"""
@@ -2821,8 +2857,17 @@ class ERAOrderManager:
             if is_new_candle:
                 prev_close = buf[max(buf.keys())]['c']
                 if prev_close > 0 and abs(price - prev_close) / prev_close > max_jump:
-                    print(f"[ERA 이상치 필터] {code} 신규봉 시가 {price:.2f}pt가 직전 종가 {prev_close:.2f}pt 대비 {abs(price-prev_close)/prev_close*100:.1f}% 괴리 — 직전 종가로 대체")
-                    price = prev_close
+                    # (2026-07-31) 지속 이동이면 대체하지 않고 새 레벨을 그대로 채택한다.
+                    # 대체를 반복하면 스테일 가격이 봉을 넘어 계속 승계되어 락아웃이 하루 종일
+                    # 풀리지 않는다(2026-07-31 09:05 개장갭 사고의 직접 원인).
+                    _ok, _med = self._is_sustained_tick_move(code, price)
+                    if _ok:
+                        print(f"[ERA 이상치 복구] {code} 신규봉 시가 {price:.2f}pt 채택 — 지속 이동 판단(직전 종가 {prev_close:.2f}pt로 대체하지 않음)")
+                        self._tick_reject[code] = []
+                        self._notify_tick_recovery(code, prev_close, price, "신규봉")
+                    else:
+                        print(f"[ERA 이상치 필터] {code} 신규봉 시가 {price:.2f}pt가 직전 종가 {prev_close:.2f}pt 대비 {abs(price-prev_close)/prev_close*100:.1f}% 괴리 — 직전 종가로 대체")
+                        price = prev_close
             buf[period_str] = {'o': price, 'h': price, 'l': price, 'c': price, 'v': 1}
             if is_new_candle:
                 # (2026-07-20 추가) DB 조회+KIS 야간데이터 병합+칼만 재계산을 포함하는 무거운 작업을
@@ -2842,28 +2887,15 @@ class ERAOrderManager:
                 # (2026-07-31) 지속이동 복구: 3% 초과 틱이 좁은 범위에 N개 연속 뭉쳐 거부되면
                 # 단발 글리치가 아니라 실제 이동으로 보고 내부가격을 새 레벨로 재기준(락아웃 해제).
                 _msg = f"[ERA 이상치 필터] {code} 틱 {price:.2f}pt가 봉 시가 {c['o']:.2f}pt 대비 {abs(price-c['o'])/c['o']*100:.1f}% 괴리 — 이상치로 판단해 무시"
-                if getattr(self, "futures_tick_recovery_enabled", True):
-                    st = self._tick_reject.setdefault(code, [])
-                    st.append(price)
-                    need = getattr(self, "futures_tick_recovery_streak", 20)
-                    if len(st) < need:
-                        print(_msg); return
-                    recent = st[-need:]
-                    med = sorted(recent)[len(recent) // 2]
-                    band = getattr(self, "futures_tick_recovery_band_pct", 0.01)
-                    if not (med > 0 and (max(recent) - min(recent)) / med <= band):
-                        st[:] = recent  # 스트릭 길이 제한
-                        print(_msg); return
-                    old_o = c['o']
-                    c['o'] = c['h'] = c['l'] = c['c'] = med
-                    st.clear()
-                    print(f"[ERA 이상치 복구] {code} {need}틱 연속 {med:.2f}pt 군집 — 지속 이동 판단, 내부가격 {old_o:.2f}→{med:.2f}pt 재기준(락아웃 해제)")
-                    if getattr(self, "futures_tick_health_alert", True) and notifier and not self._tick_feed_alerted.get(code):
-                        self._tick_feed_alerted[code] = True
-                        notifier.send_message(f"⚠️ <b>[선물 피드 복구]</b> {code} 내부가격 {old_o:.2f}→{med:.2f}pt 재기준 (지속 이동 감지, 이상치 락아웃 해제)")
-                    # 재기준 후 이번 틱은 아래 정상 반영 경로로 진행
-                else:
+                _ok, _med = self._is_sustained_tick_move(code, price)
+                if not _ok:
                     print(_msg); return
+                old_o = c['o']
+                c['o'] = c['h'] = c['l'] = c['c'] = _med
+                self._tick_reject[code] = []
+                print(f"[ERA 이상치 복구] {code} 연속 거부틱이 {_med:.2f}pt에 군집 — 지속 이동 판단, 내부가격 {old_o:.2f}→{_med:.2f}pt 재기준(락아웃 해제)")
+                self._notify_tick_recovery(code, old_o, _med, "봉 내부")
+                # 재기준 후 이번 틱은 아래 정상 반영 경로로 진행
             else:
                 # 정상 채택 틱 — 거부 스트릭·경고 상태 리셋
                 if self._tick_reject.get(code):
