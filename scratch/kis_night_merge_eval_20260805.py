@@ -99,13 +99,18 @@ def kalman_targets(df):
     return kf_price, std_error, std_error * MULT, trend
 
 
-def build(conn, cutoff, merge):
-    """기준시각 cutoff에서 ERA가 보유했을 입력 프레임. merge=True면 KIS 야간 병합."""
+def build(conn, cutoff, merge, hours=36):
+    """기준시각 cutoff에서 ERA가 보유했을 입력 프레임. merge=True면 KIS 야간 병합.
+
+    hours는 라이브의 야간 조회 범위(era_order_manager.py:983의 36시간). 월요일은
+    직전 야간 세션(금 18:00~토 05:00)이 36시간 밖이라 병합이 통째로 비므로,
+    이 값을 넓혔을 때의 효과를 재려고 파라미터로 뺐다.
+    """
     df = pd.read_sql(
         "SELECT date, close FROM futures_ohlcv WHERE code = ? AND date <= ? ORDER BY date DESC LIMIT 300",
         conn, params=(DAY_CODE, cutoff))
     if merge:
-        lo = (datetime.strptime(cutoff, FMT) - timedelta(hours=36)).strftime(FMT)
+        lo = (datetime.strptime(cutoff, FMT) - timedelta(hours=hours)).strftime(FMT)
         night = pd.read_sql(
             "SELECT date, close FROM futures_ohlcv WHERE code = ? AND date > ? AND date <= ? ORDER BY date ASC",
             conn, params=(NIGHT_CODE, lo, cutoff))
@@ -127,7 +132,7 @@ CHECKPOINTS = [("084500", "08:45 개장"), ("091000", "09:10 진입개시"),
                ("093000", "09:30"), ("100000", "10:00")]
 
 
-def evaluate(conn, days, hhmmss):
+def evaluate(conn, days, hhmmss, hours=36):
     """지정 시각에서 두 변형을 재현. 기준값은 그 시각 봉의 시가."""
     rows = []
     for d in days:
@@ -140,7 +145,7 @@ def evaluate(conn, days, hhmmss):
         cutoff = (datetime.strptime(bar[0], FMT) - timedelta(seconds=1)).strftime(FMT)
 
         a = kalman_targets(build(conn, cutoff, merge=False))
-        b = kalman_targets(build(conn, cutoff, merge=True))
+        b = kalman_targets(build(conn, cutoff, merge=True, hours=hours))
         if not a or not b:
             continue
 
