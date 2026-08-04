@@ -1196,6 +1196,11 @@ class ERAOrderManager:
             # (2026-08-04) 계약당 고정 증거금. None이면 기존 정률(가격x승수x10%) 방식 유지.
             # 실측(모의계좌, 미니 코스피200): 10,360,560원/계약 — 명목가치와 무관하게 일정.
             # 실계좌·종목·시기에 따라 거래소가 조정하므로 하드코딩하지 않고 설정값으로 둔다.
+            # (2026-08-04) 증거금 요율. 미설정 시 0.10이 적용돼 기존 동작을 유지한다.
+            # 실측·공식 요율은 약 0.20(위탁증거금률 19.8%)이며, 기존 0.10은 실제의 절반이라
+            # 계약수를 2.11배 과대 산정한다. margin_per_contract는 고정값 오버라이드로,
+            # 기준가격이 갱신되면 어긋나므로 요율 방식을 권장한다.
+            self.futures_margin_rate = float(futures_settings.get("margin_rate", 0.10))
             _mpc = futures_settings.get("margin_per_contract", None)
             self.futures_margin_per_contract = float(_mpc) if _mpc is not None else None
             # (2026-08-04) 최대 계약수 상한. 기존 하드코딩 15를 설정으로 옮긴 것으로,
@@ -5056,18 +5061,27 @@ class ERAOrderManager:
                 qty = self.futures_fixed_qty
             else:
                 multiplier = 50000 if getattr(self, 'futures_prefix', '101') == '105' else 250000
-                # (2026-08-04) 증거금은 명목가치의 정률이 아니라 '계약당 고정액'이다.
-                # 2026-08-04 실측: 진입가가 962~1003pt로 변하는 동안에도 청산 시 반환된
-                # 증거금이 계약당 10,360,560원으로 일정했다(6건 편차 0.0042%). 기존
-                # 정률 10% 가정(≈4,950,300원)은 실제의 절반이라 계약수를 2.11배 과대
-                # 산정했다 — 지금은 max_contracts=15 상한에 가려 드러나지 않지만,
-                # 상한을 올리거나 계좌가 줄면 증거금 부족으로 주문이 거부된다.
-                # margin_per_contract 미설정 시에는 기존 정률 방식을 그대로 쓴다.
+                # 증거금 = 기준가격 × 승수 × 요율.
+                #
+                # (2026-08-04 1차) 하루치 실측만 보고 "계약당 고정액(10,360,560원)"으로
+                # 판단해 고정값을 넣었으나 오판이었다. 여러 날을 보면 계약당 반환액이
+                # 758만~1,214만원으로 움직인다. 하루 안에서 일정했던 건 기준가격이 그날
+                # 안 바뀌었기 때문이고, 실제로는 20% × 기준가격 × 승수다
+                # (검증: 20% × 1036.28pt × 50,000 = 10,362,800원 vs 실측 10,360,560원, 오차 0.02%).
+                # 공식 위탁증거금률은 19.8%(유지 13.2%, 2026-07-06 기준).
+                #
+                # 기존 코드의 0.10은 실제(약 0.20)의 절반이라 계약수를 2.11배 과대 산정했다.
+                # 지금은 max_contracts 상한에 가려 있지만, 상한을 올리거나 지수가 오르면
+                # 증거금 부족으로 주문이 거부된다.
+                #
+                # margin_rate 미설정 시 0.10이 적용돼 기존 동작이 유지된다.
+                # margin_per_contract를 지정하면 그 고정값이 요율보다 우선한다(정확한 값을
+                # 아는 경우에만 사용 — 기준가격이 갱신되면 어긋나므로 권장하지 않는다).
                 _mpc = getattr(self, 'futures_margin_per_contract', None)
                 if _mpc is not None and _mpc > 0:
                     margin_per = _mpc
                 else:
-                    margin_per = current_price * multiplier * 0.10
+                    margin_per = current_price * multiplier * getattr(self, 'futures_margin_rate', 0.10)
 
                 # [AMATS 최적화] active_strategy.json의 마진캡(최적화 적용값 50%)을 반영한 자본 대비 계약 수 계산
                 margin_cap = getattr(self, 'futures_margin_cap_ratio', 0.30)

@@ -904,7 +904,7 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                                  profit_lock_be_move_trigger_pt=None, profit_lock_be_stage_buffer_pt=0.0,
                                  reentry_pullback_mult=0.5, reentry_breakout_mult=0.2,
                                  hard_stop_enabled=False, hard_stop_se_mult=1.5, hard_stop_pt=None,
-                                 margin_per_contract=None):
+                                 margin_per_contract=None, margin_rate=None):
     """
     era_order_manager.py의 실전 주간선물 "샹들리에 청산"(2026-07-15 도입, futures_strategy_type=
     "chandelier")을 재현한 백테스트. run_kalman_live_replica와 진입측(칼만 타점/장기추세필터/
@@ -1014,14 +1014,17 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
     MARGIN_RATE, INIT_CAPITAL = 0.10, 50_000_000
 
     def _margin_per(price):
-        # (2026-08-04) 증거금은 명목가치의 정률이 아니라 계약당 고정액이다. 2026-08-04 실측:
-        # 진입가 962~1003pt 구간에서 청산 시 반환 증거금이 계약당 10,360,560원으로 일정했다
-        # (6건 편차 0.0042%). 정률 10% 가정은 실제의 절반이라 dynamic_sizing에서 계약수가
-        # 실제보다 2.11배 빠르게 늘어 복리 결과가 낙관 편향된다.
-        # margin_per_contract 미지정 시 기존 정률을 그대로 쓰므로 기본 동작은 바뀌지 않는다.
+        # 증거금 = 기준가격 x 승수 x 요율.
+        # (2026-08-04 1차) 하루치 실측만 보고 '계약당 고정액'으로 오판했으나, 여러 날을
+        # 보면 계약당 반환액이 758만~1,214만원으로 움직인다. 하루 안에서 일정했던 건
+        # 기준가격이 그날 안 바뀌었기 때문이고, 실제로는 20% x 기준가격 x 승수다
+        # (20% x 1036.28pt x 50,000 = 10,362,800 vs 실측 10,360,560, 오차 0.02%).
+        # 공식 위탁증거금률 19.8%. 기존 0.10은 실제의 절반이라 dynamic_sizing에서
+        # 계약수가 2.11배 빠르게 늘어 복리 결과가 낙관 편향된다.
+        # margin_rate 미지정 시 MARGIN_RATE(0.10)로 기존 동작을 유지한다.
         if margin_per_contract is not None and margin_per_contract > 0:
             return margin_per_contract
-        return price * point_value * MARGIN_RATE
+        return price * point_value * (margin_rate if margin_rate is not None else MARGIN_RATE)
     _any_new_slip = any(v is not None for v in (slip_entry_pt, slip_exit_sl_pt, slip_exit_normal_pt, slip_exit_force_pt))
     SLIP_ENTRY      = slip_entry_pt       if slip_entry_pt       is not None else (1.5 if _any_new_slip else slip_fee_pt)
     SLIP_EXIT_SL    = slip_exit_sl_pt     if slip_exit_sl_pt     is not None else (3.0 if _any_new_slip else slip_fee_pt)
