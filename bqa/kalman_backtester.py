@@ -78,13 +78,19 @@ def clean_ohlcv_outliers(df):
     return df
 
 
-def load_futures_data(code='10100000'):
+def load_futures_data(code='10100000', table='futures_ohlcv'):
+    """선물 OHLCV 로드. table='futures_ohlcv_1m'으로 1분봉을 쓸 수 있다 (2026-08-04 추가).
+
+    ※ 1분봉으로 바꿀 때는 봉 개수 기반 파라미터를 시간 기준으로 5배 환산해야 한다
+      (kf_window 40→200, std_window 20→100, session_range_cap_min_bars 6→30).
+      환산 없이 돌리면 칼만 필터가 보는 구간이 200분에서 40분으로 줄어 완전히 다른 전략이 된다.
+    """
     db_path = "c:\\Antigravity\\AI_T_Agent\\futures_data.db"
     if not os.path.exists(db_path):
         print(f"[-] Database not found at: {db_path}")
         return pd.DataFrame()
     conn = sqlite3.connect(db_path)
-    query = f"SELECT date, open, high, low, close, volume FROM futures_ohlcv WHERE code = '{code}' ORDER BY date ASC"
+    query = f"SELECT date, open, high, low, close, volume FROM {table} WHERE code = '{code}' ORDER BY date ASC"
     df = pd.read_sql_query(query, conn)
     conn.close()
 
@@ -904,7 +910,8 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                                  profit_lock_be_move_trigger_pt=None, profit_lock_be_stage_buffer_pt=0.0,
                                  reentry_pullback_mult=0.5, reentry_breakout_mult=0.2,
                                  hard_stop_enabled=False, hard_stop_se_mult=1.5, hard_stop_pt=None,
-                                 margin_per_contract=None, margin_rate=None):
+                                 margin_per_contract=None, margin_rate=None,
+                                 signal_only_on_5min=False):
     """
     era_order_manager.py의 실전 주간선물 "샹들리에 청산"(2026-07-15 도입, futures_strategy_type=
     "chandelier")을 재현한 백테스트. run_kalman_live_replica와 진입측(칼만 타점/장기추세필터/
@@ -1096,7 +1103,16 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
 
         window_start = i - kf_window
         enough_data = i >= kf_window
-        if enough_data:
+        # (2026-08-04) 타점 갱신 주기와 체결 판정 주기를 분리한다.
+        # 실거래는 '타점은 5분봉 완성 시 1회 갱신, 체결 판정은 매 틱'이다. 반면 5분봉
+        # 백테스트는 판정까지 5분에 1회라 봉 안에서 고가·저가 중 무엇이 먼저였는지 알 수
+        # 없고, 아래 청산부가 고가로 peak를 먼저 올린 뒤 저가를 보므로 LONG 청산이 실제보다
+        # 유리하게 잡힌다. 그렇다고 1분봉으로 그냥 바꾸면 타점까지 1분마다 갱신돼 전략 자체가
+        # 달라진다(실측: 동일 설정에서 거래 1,275 → 1,910건).
+        # signal_only_on_5min=True면 타점·추세 갱신은 5분 경계에서만 하고 체결 판정은 매 봉
+        # 수행해, 전략은 그대로 두고 체결 정밀도만 올린다.
+        _recalc = enough_data and (not signal_only_on_5min or minute % 5 == 0 or target_long == float('inf'))
+        if _recalc:
             window_closes = closes[window_start:i]
             x, P = None, 1.0
             kf_path = np.empty(len(window_closes))
