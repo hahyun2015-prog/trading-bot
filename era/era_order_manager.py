@@ -557,6 +557,18 @@ class ERAOrderManager:
         if self.trading_mode in ('futures', 'both'):
             self.futures_sync_timer.start(300000)  # 5분
 
+        # (2026-08-04 #4) 틱과 무관한 주기적 청산 감시 타이머 — 틱이 끊기는 구간에서도
+        # 보유 포지션의 샹들리에 스탑/강제청산이 계속 작동하도록. (2026-08-04 #1) 마감창
+        # 고속 동기화 타이머 — 15:30~15:50 보유 포지션이 있으면 계좌동기화를 자주 돌려
+        # 청산 체결 여부를 5분이 아니라 십수 초 내에 확인한다.
+        self.futures_exit_monitor_timer = QTimer()
+        self.futures_exit_monitor_timer.timeout.connect(self._futures_exit_monitor_tick)
+        self.futures_eod_fast_sync_timer = QTimer()
+        self.futures_eod_fast_sync_timer.timeout.connect(self._futures_eod_fast_sync_tick)
+        if self.trading_mode in ('futures', 'both'):
+            self.futures_exit_monitor_timer.start(5000)    # 5초
+            self.futures_eod_fast_sync_timer.start(15000)  # 15초
+
         # ── 선물 실시간 K값 변동성 돌파 전략 ─────────────────────────────
         self.futures_strategy_active = False
         self.futures_best_k = 0.5
@@ -604,6 +616,7 @@ class ERAOrderManager:
         self.futures_last_long_exit_time = 0.0   # 재진입 쿨다운용 최종 청산 시각(epoch)
         self.futures_last_short_exit_price = 0.0
         self.futures_last_short_exit_time = 0.0
+        self.futures_last_any_exit_time = 0.0    # (2026-08-04) 방향무관 재진입 쿨다운용 최종 청산 시각(epoch)
         self.futures_std_error = 0.5            # Kalman Filter 최근 주간 잔차 표준편차
         self.futures_kf_sl_mult = 5.0           # Kalman Filter 하이브리드 손절 배수 (최적값 5.0)
         self.futures_kf_ts_trigger_mult = 1.5   # 이익보전 활성화 배수 (기본값 1.5)
@@ -1180,6 +1193,14 @@ class ERAOrderManager:
             _eeh = futures_settings.get("entry_end_hour", None)
             self.futures_entry_end_hour = int(_eeh) if _eeh is not None else None
             self.futures_entry_end_minute = int(futures_settings.get("entry_end_minute", 0))
+            # (2026-08-04) 계약당 고정 증거금. None이면 기존 정률(가격x승수x10%) 방식 유지.
+            # 실측(모의계좌, 미니 코스피200): 10,360,560원/계약 — 명목가치와 무관하게 일정.
+            # 실계좌·종목·시기에 따라 거래소가 조정하므로 하드코딩하지 않고 설정값으로 둔다.
+            _mpc = futures_settings.get("margin_per_contract", None)
+            self.futures_margin_per_contract = float(_mpc) if _mpc is not None else None
+            # (2026-08-04) 최대 계약수 상한. 기존 하드코딩 15를 설정으로 옮긴 것으로,
+            # 미설정 시 15가 그대로 적용돼 동작이 바뀌지 않는다.
+            self.futures_max_contracts = int(futures_settings.get("max_contracts", 15))
             # KIS(한국투자증권)로 별도 수집 중인 야간선물 코드 (kis/kis_night_futures_collector.py가
             # futures_ohlcv에 1분봉으로 적재). 주간 진입타점 계산 시 이 데이터를 병합해 간밤의
             # 가격 흐름을 반영한다 (2026-07-17 도입). 월물 만기가 바뀌면 이 값도 갱신 필요.
@@ -1217,6 +1238,23 @@ class ERAOrderManager:
             self.futures_tick_recovery_streak = int(futures_settings.get("tick_recovery_streak", 20))
             self.futures_tick_recovery_band_pct = float(futures_settings.get("tick_recovery_band_pct", 0.01))
             self.futures_tick_health_alert = bool(futures_settings.get("tick_health_alert", True))
+            # (2026-08-04) 청산 신뢰성 강화 4종 (오버나잇 방치 사고 대응, 모두 config 플래그)
+            self.futures_exit_confirm_resync = bool(futures_settings.get("exit_confirm_resync", True))   # #1 청산 직후 잔고 능동 재조회
+            self.futures_exit_retry_max = int(futures_settings.get("exit_retry_max", 3))                  # #3 재시도 한도
+            self.futures_exit_monitor_enabled = bool(futures_settings.get("exit_monitor_enabled", True))  # #4 틱무관 주기 청산감시
+            self.futures_eod_fast_sync_enabled = bool(futures_settings.get("eod_fast_sync_enabled", True))# #1 마감창 고속 동기화
+            # (2026-08-04) 재진입 즉시-플립 방지: (a) 청산 시점에 재진입 추적값을 기록해 체결콜백
+            # 누락 시에도 필터가 작동하게, (b) 방향무관 짧은 쿨다운으로 청산 직후 반대방향 즉시
+            # 진입(틱단위 플립)을 차단. 백테스트상 다봉(5분+) 차단은 추세추종까지 막아 손해라
+            # 초단위(기본 90초)로만 둔다 — 정상 다음봉(300초) 진입엔 영향 없음.
+            self.futures_exit_record_on_send = bool(futures_settings.get("exit_record_on_send", True))
+            self.futures_global_cooldown_sec = float(futures_settings.get("global_cooldown_sec", 90.0))
+            # (2026-08-04) 하드 초기손절 — 본전이동 도달 이전 구간 전용. se_mult 우선(변동성 적응),
+            # hard_stop_pt 지정 시 고정값. 백테스트로 최악손실·PF·평균손 개선 검증.
+            self.futures_hard_stop_enabled = bool(futures_settings.get("hard_stop_enabled", True))
+            self.futures_hard_stop_se_mult = float(futures_settings.get("hard_stop_se_mult", 1.5))
+            _hsp = futures_settings.get("hard_stop_pt", None)
+            self.futures_hard_stop_pt = float(_hsp) if _hsp is not None else None
             self.futures_std_trim_outliers = int(futures_settings.get("std_trim_outliers", 0))
             _dcm = futures_settings.get("dynamic_cap_mult", None)
             self.futures_dynamic_cap_mult = float(_dcm) if _dcm is not None else None
@@ -1470,6 +1508,23 @@ class ERAOrderManager:
             exit_price = self.futures_last_long_exit_price if direction == "LONG" else self.futures_last_short_exit_price
             exit_time = self.futures_last_long_exit_time if direction == "LONG" else self.futures_last_short_exit_time
 
+        # (2026-08-04 #2) 방향무관 쿨다운 — 어떤 청산이든 직후 N초는 양방향 신규 진입을 모두 차단해
+        # '청산 직후 즉시 반대방향 플립'을 막는다. 같은 방향 쿨다운/휩소밴드(아래)와 독립적으로,
+        # 이 검사는 해당 방향의 exit_price가 0이어도(=방금 반대방향을 청산한 경우) 동작한다.
+        gcd = getattr(self, "futures_global_cooldown_sec", 0.0)
+        last_any = getattr(self, "futures_last_any_exit_time", 0.0)
+        if gcd > 0 and last_any > 0:
+            import time as _t_gc
+            _elapsed_any = _t_gc.time() - last_any
+            if _elapsed_any < gcd:
+                _lk = f"global_{direction}_{is_night}"
+                if not hasattr(self, "_last_reentry_log_time"):
+                    self._last_reentry_log_time = {}
+                if _t_gc.time() - self._last_reentry_log_time.get(_lk, 0) > 60:
+                    print(f"[선물 재진입 차단] 방향무관 쿨다운: 최근 청산 후 {_elapsed_any:.0f}초 경과 (최소 {gcd:.0f}초 필요) — {direction} 진입 보류")
+                    self._last_reentry_log_time[_lk] = _t_gc.time()
+                return False
+
         if exit_price <= 0:
             return True
 
@@ -1580,6 +1635,19 @@ class ERAOrderManager:
         if be_trig is not None and mfe >= be_trig:
             be_buf = getattr(self, "futures_profit_lock_be_stage_buffer_pt", 0.0)
             floor = (entry + be_buf) if is_long else (entry - be_buf)
+        elif getattr(self, "futures_hard_stop_enabled", False):
+            # (2026-08-04) 하드 초기손절 — 본전이동(be_move_trigger_pt) 도달 '이전' 구간에만 적용.
+            # 한 번도 이익권(4pt)에 못 간 트레이드가 넓은 샹들리에 트레일(≈28pt)을 그대로 맞는 걸
+            # 방지한다. 이익보전 대상(4pt 도달 트레이드)은 위 if 분기라 전혀 건드리지 않는다.
+            # 백테스트(31,277봉): 최악손실 -108.6→-17.9pt, PF 28.95→37.28, 평균손 -4.2→-2.7pt,
+            # 수익 유지(+13,881→+13,957%). se_mult 우선, hard_stop_pt 지정 시 고정값 사용.
+            _hspt = getattr(self, "futures_hard_stop_pt", None)
+            if _hspt is not None and _hspt > 0:
+                _hs = _hspt
+            else:
+                _hs = getattr(self, "futures_hard_stop_se_mult", 0.0) * getattr(self, "futures_day_entry_std_error", 0.0)
+            if _hs and _hs > 0:
+                floor = (entry - _hs) if is_long else (entry + _hs)
         trig = getattr(self, "futures_profit_lock_trigger_pt", 8.0)
         if mfe >= trig:
             atr = getattr(self, "futures_atr_14", 5.0)
@@ -3293,6 +3361,46 @@ class ERAOrderManager:
         except Exception as e:
             print(f"[선물 동기화 요청 오류] {e}")
 
+    def _futures_exit_monitor_tick(self):
+        """(2026-08-04 #4) 틱과 무관하게 주기적으로 보유 주간 포지션의 청산 감시를 돌린다.
+        개장/마감 단일가나 피드 락아웃으로 실시간 틱이 끊겨도 샹들리에 스탑·강제청산이
+        작동하도록. 포지션이 있을 때만 호출하므로 _process_day_tick은 청산/보유 관리만 하고
+        신규 진입 경로엔 들어가지 않는다(보유 중이면 진입블록 직전에서 return)."""
+        try:
+            if not getattr(self, "futures_exit_monitor_enabled", True):
+                return
+            if not getattr(self, "futures_strategy_active", False):
+                return
+            pos_key = "KOSPI200"
+            pos = self.futures_positions.get(pos_key)
+            if not pos:
+                return  # 포지션이 없을 때는 절대 호출하지 않음(진입 오발 방지)
+            now = datetime.now()
+            if not (8 <= now.hour < 16):
+                return  # 주간 세션 시간대에서만(야간은 틱 경로가 담당)
+            last_price = pos.get('current_price') or getattr(self, 'futures_day_entry_price', 0.0)
+            if not last_price or last_price <= 0:
+                return
+            code = getattr(self, 'real_day_code', '') or (getattr(self, 'futures_prefix', '101') + '00000')
+            self._process_day_tick(code, float(last_price), now)
+        except Exception as e:
+            print(f"[선물 청산감시 타이머 오류] {e}")
+
+    def _futures_eod_fast_sync_tick(self):
+        """(2026-08-04 #1) 마감 청산 창(15:30~15:50)에 주간 포지션이 남아 있으면 계좌동기화를
+        더 자주 돌려, 청산 체결 여부를 5분 주기가 아니라 십수 초 내에 확인한다."""
+        try:
+            if not getattr(self, "futures_eod_fast_sync_enabled", True):
+                return
+            now = datetime.now()
+            if not (now.hour == 15 and 30 <= now.minute <= 50):
+                return
+            if "KOSPI200" not in self.futures_positions:
+                return
+            self.sync_futures_positions_and_balance()
+        except Exception as e:
+            print(f"[선물 EOD 고속동기화 오류] {e}")
+
     def _load_prev_range(self):
         """futures_data.db 에서 전일 고저폭(Range) 계산"""
         try:
@@ -4948,12 +5056,31 @@ class ERAOrderManager:
                 qty = self.futures_fixed_qty
             else:
                 multiplier = 50000 if getattr(self, 'futures_prefix', '101') == '105' else 250000
-                margin_per = current_price * multiplier * 0.10
-                
+                # (2026-08-04) 증거금은 명목가치의 정률이 아니라 '계약당 고정액'이다.
+                # 2026-08-04 실측: 진입가가 962~1003pt로 변하는 동안에도 청산 시 반환된
+                # 증거금이 계약당 10,360,560원으로 일정했다(6건 편차 0.0042%). 기존
+                # 정률 10% 가정(≈4,950,300원)은 실제의 절반이라 계약수를 2.11배 과대
+                # 산정했다 — 지금은 max_contracts=15 상한에 가려 드러나지 않지만,
+                # 상한을 올리거나 계좌가 줄면 증거금 부족으로 주문이 거부된다.
+                # margin_per_contract 미설정 시에는 기존 정률 방식을 그대로 쓴다.
+                _mpc = getattr(self, 'futures_margin_per_contract', None)
+                if _mpc is not None and _mpc > 0:
+                    margin_per = _mpc
+                else:
+                    margin_per = current_price * multiplier * 0.10
+
                 # [AMATS 최적화] active_strategy.json의 마진캡(최적화 적용값 50%)을 반영한 자본 대비 계약 수 계산
                 margin_cap = getattr(self, 'futures_margin_cap_ratio', 0.30)
                 qty = max(1, int((self.futures_available_balance * margin_cap) / margin_per)) if margin_per > 0 else 1
-                qty = min(qty, 15)  # 최대 계약수 한도 15계약으로 제약 (과도한 레버리지 노출 제약)
+                # 최대 계약수 한도 — 과도한 레버리지 노출 제약.
+                # (2026-08-04) 하드코딩 15를 config로 뺐다. 값 자체는 기본 15로 그대로여서
+                # 설정하지 않으면 동작이 바뀌지 않는다. 실측 증거금(계약당 10,360,560원)
+                # 기준으로 현재 잔고에서는 30계약이 산정되므로 이 상한이 실질 제약이며,
+                # 조정하려면 코드를 고쳐야 했던 상태를 해소하는 것이 목적이다.
+                # ※ 상한 인상은 백테스트로 판단하지 말 것 — 전체기간 MDD는 계좌가 1.3억이던
+                #    2025-12-19에 찍힌 값이 그대로 남아 상한을 올려도 2.40%로 고정돼, 위험
+                #    증가가 지표에 전혀 반영되지 않는다(2026-08-04 확인).
+                qty = min(qty, getattr(self, 'futures_max_contracts', 15))
 
         session_label = "야간" if is_night else "주간"
         print(f"\n[{session_label}선물 주문] {label} | {current_price:.2f}pt | {qty}계약 | {order_code}")
@@ -4970,6 +5097,30 @@ class ERAOrderManager:
                 # 청산 주문 전송 즉시 로컬 상태에 is_exiting=True 마킹하여 중복 주문 방지
                 if pos_key in self.futures_positions:
                     self.futures_positions[pos_key]['is_exiting'] = True
+
+                    # (2026-08-04 #1) 재진입 필터가 쓰는 최종 청산가/시각을 '청산 주문을 낼 때'
+                    # 여기서 기록한다. 기존엔 체결콜백(chejan)에서만 기록돼, 모의서버가 콜백을
+                    # 누락하면 청산가=0으로 남아 재진입 필터가 통과되고 즉시 재진입/플립이 났다.
+                    # (체결콜백이 나중에 실체결가로 덮어써도 무방 — 시각/근사가가 먼저 잡히는 게 핵심)
+                    # 아울러 방향무관 쿨다운(#2)용 '마지막 청산 시각'도 함께 찍는다.
+                    if getattr(self, "futures_exit_record_on_send", True):
+                        import time as _t_exit
+                        _exit_epoch = _t_exit.time()
+                        self.futures_last_any_exit_time = _exit_epoch
+                        if signal_type == "LONG_EXIT":
+                            if is_night:
+                                self.futures_night_last_long_exit_price = current_price
+                                self.futures_night_last_long_exit_time = _exit_epoch
+                            else:
+                                self.futures_last_long_exit_price = current_price
+                                self.futures_last_long_exit_time = _exit_epoch
+                        elif signal_type == "SHORT_EXIT":
+                            if is_night:
+                                self.futures_night_last_short_exit_price = current_price
+                                self.futures_night_last_short_exit_time = _exit_epoch
+                            else:
+                                self.futures_last_short_exit_price = current_price
+                                self.futures_last_short_exit_time = _exit_epoch
 
                     # 청산 주문 후 일정 시간 내 체결 미확인 시 재시도 (최대 3회 초과 시 로컬 포지션 강제 초기화)
                     # 모의투자 환경에서 체결 콜백이 오지 않아 is_exiting이 영구 해제 → 재주문 → 루프가 발생하는 것을 방지
@@ -5004,20 +5155,21 @@ class ERAOrderManager:
                         if not pos.get('is_exiting'):
                             return  # 유예 도중 다른 경로(정상 체결 처리 등)로 이미 처리됨
 
-                        if retry_count >= 3:
-                            print(f"[{session_label}선물] 🚨 청산 주문 {retry_count}회 체결 미확인 (취소 유예 종료) → 로컬 포지션 강제 초기화 (과매매 방지)")
-                            del self.futures_positions[pos_key]
+                        if retry_count >= getattr(self, "futures_exit_retry_max", 3):
+                            # (2026-08-04 #3) 로컬 강제삭제(브로커와의 불일치를 은폐)를 폐기한다.
+                            # 포지션을 유지한 채 자동 재시도만 중단하고 크게 경고 — 08:45 안전청산과
+                            # 수동청산(!전량매도)이 이 포지션을 계속 볼 수 있어 조용한 오버나잇 방치를
+                            # 막는다. (#1 능동 재조회로 '실제 체결됐는데 콜백만 누락'된 경우는 이미
+                            # 위 pos is None 분기에서 걸러지므로, 여기까지 왔다는 건 정말로 미청산일
+                            # 가능성이 높다.)
+                            print(f"[{session_label}선물] 🚨 청산 주문 {retry_count}회 체결 미확인 → 자동 재시도 중단, 포지션 유지 + 경고(로컬 삭제 안 함)")
+                            pos['is_exiting'] = False
                             setattr(self, lock_attr, False)
-                            if is_night:
-                                self.futures_night_entry_price = 0.0
-                            else:
-                                self.futures_day_entry_price = 0.0
-                                self.futures_day_peak = 0.0
                             if notifier:
                                 notifier.send_message(
-                                    f"🚨 <b>[{session_label}선물 강제 로컬 청산]</b>\n"
-                                    f"청산 주문 {retry_count}회 체결 미확인 → 로컬 포지션 초기화\n"
-                                    f"⚠️ 실제 브로커 포지션과 불일치 가능 — 수동 확인 필요"
+                                    f"🚨 <b>[{session_label}선물 청산 반복 실패 {retry_count}회]</b>\n"
+                                    f"{pos.get('type')} {pos.get('qty')}계약 자동청산이 계속 미확인입니다.\n"
+                                    f"⚠️ 포지션이 열린 채 유지 중 — <code>!전량매도</code> 또는 영웅문4에서 수동 청산 필요"
                                 )
                         else:
                             print(f"[{session_label}선물] ⚠️ 청산 주문 {retry_count}회 체결 미확인 (취소 유예 종료) → 즉시 재주문")
@@ -5065,9 +5217,21 @@ class ERAOrderManager:
                                 # 시간을 주는 편이 이중체결 방지에 유리하다(유예 종료 시점의
                                 # 포지션 존재 확인이 그 판정을 한다).
                                 print(f"[{session_label}선물] ⚠️ 원주문번호 미확보 — 취소 전송 불가, {CANCEL_GRACE_MS // 1000}초 유예 후 재시도 판단")
+                                # (2026-08-04 #2) 취소를 못 보내는 경우일수록 원주문이 실제로 체결됐는지
+                                # 능동 확인이 중요하다. 잔고 재조회를 걸어, 유예 종료 시점의 포지션
+                                # 존재 판정이 5분 주기 동기화가 아니라 최신 상태로 이뤄지게 한다.
+                                if getattr(self, "futures_exit_confirm_resync", True):
+                                    self.sync_futures_positions_and_balance()
 
                             QTimer.singleShot(CANCEL_GRACE_MS, lambda rc=retry_count: _finalize_exit_after_cancel_grace(rc))
                     QTimer.singleShot(UNCONFIRMED_MS, _clear_exiting_if_no_fill)
+
+                    # (2026-08-04 #1) 청산 주문 직후 계좌잔고를 능동 재조회 — 미확인/취소유예
+                    # 판정이 5분 주기 동기화가 아니라 최신 포지션 상태로 이뤄지게 한다. 원주문이
+                    # 실제로 체결됐으면 이 재조회로 포지션이 사라져 재시도/강제처리가 취소된다.
+                    if getattr(self, "futures_exit_confirm_resync", True):
+                        QTimer.singleShot(2500, self.sync_futures_positions_and_balance)
+                        QTimer.singleShot(max(3000, UNCONFIRMED_MS - 500), self.sync_futures_positions_and_balance)
 
                     # (2026-08-03) 마감 창 초과 감시 — 창(15:45)이 지나도 주간 포지션이 남아
                     # 있으면 조용히 오버나잇으로 넘기지 않고 반드시 알린다. 2026-08-03에는
