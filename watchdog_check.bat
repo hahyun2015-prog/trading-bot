@@ -26,6 +26,20 @@ if "%TCA_ALIVE%"=="0" (
     (echo 2) > "%~dp0watchdog_cooldown_tca.tmp"
     start "AMATS | TCA" "%PY%" "%~dp0tca\tca_controller.py"
 )
+
+:: KIS 야간선물 수집기는 세션 창(평일 17:55~다음날 05:15)에만 살아있어야 하므로,
+:: 그 창 안에서만 생존을 확인하고 죽어있으면 재기동한다 (2026-08-07 재부팅으로
+:: 수집기가 죽었는데 세션 도중 아무도 되살리지 않은 사고 이후 추가).
+call :check_window KIS_WINDOW
+if "%KIS_WINDOW%"=="1" (
+    call :check_alive "kis\night_collector.pid" KIS_ALIVE
+    call :apply_cooldown "watchdog_cooldown_kis.tmp" KIS_ALIVE
+)
+if "%KIS_WINDOW%"=="1" if "%KIS_ALIVE%"=="0" (
+    echo [%date% %time%] KIS night collector down - restarting >> "%~dp0watchdog.log"
+    (echo 2) > "%~dp0watchdog_cooldown_kis.tmp"
+    schtasks /run /tn "AMATS KIS Night Collector Start" >nul 2>&1
+)
 exit /b 0
 
 :check_alive
@@ -54,4 +68,12 @@ if !_CD! gtr 0 (
 ) else (
     del /f /q %1 >nul 2>&1
 )
+exit /b 0
+
+:check_window
+:: %1 = 결과를 담을 변수명. 지금이 KIS 야간선물 세션 창(평일 17:55~다음날 05:15,
+:: "AMATS KIS Night Collector Start/Stop" 예약 작업의 요일 설정과 동일)인지 확인.
+set "%~1=0"
+"%PY%" -c "import datetime,sys; n=datetime.datetime.now(); wd=n.weekday(); t=n.time(); ok=(wd in (0,1,2,3,4) and t>=datetime.time(17,55)) or (wd in (1,2,3,4,5) and t<datetime.time(5,15)); sys.exit(0 if ok else 1)" >nul 2>&1
+if %errorlevel%==0 set "%~1=1"
 exit /b 0

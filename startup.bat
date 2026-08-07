@@ -35,16 +35,28 @@ if not exist "%~dp0venv32\Scripts\python.exe" (
 )
 set "PY=%~dp0venv32\Scripts\python.exe"
 
-echo [1/2] Launching TCA Telegram Controller...
+echo [1/3] Launching TCA Telegram Controller...
 start "AMATS | TCA" "%PY%" "%~dp0tca\tca_controller.py"
 
 
 :: Delay for 5 seconds using ping (safe for non-interactive shells)
 ping 127.0.0.1 -n 6 > nul
 
-echo [2/2] Launching ERA Trading Engine...
+echo [2/3] Launching ERA Trading Engine...
 :: era_order_manager.py 직접 실행은 리더종목 필터를 우회하므로, 검증된 예약 작업을 트리거한다
 schtasks /run /tn "AMATS ERA Reconnect" >nul 2>&1
+
+echo [3/3] Checking KIS night futures collector...
+:: 세션 도중(평일 17:55~다음날 05:15) 재부팅되면 수집기가 죽는데, 예약된 Start 트리거는
+:: 하루 한 번뿐이라 다음 트리거까지 아무도 되살리지 않는 사고가 있었음 (2026-08-07).
+:: 재부팅이 세션 창 안에서 일어났으면 즉시 예약 작업을 트리거해 빈틈을 메운다.
+"%PY%" -c "import datetime,sys; n=datetime.datetime.now(); wd=n.weekday(); t=n.time(); ok=(wd in (0,1,2,3,4) and t>=datetime.time(17,55)) or (wd in (1,2,3,4,5) and t<datetime.time(5,15)); sys.exit(0 if ok else 1)" >nul 2>&1
+if %errorlevel% equ 0 (
+    echo [KIS] Within night session window - restarting collector...
+    schtasks /run /tn "AMATS KIS Night Collector Start" >nul 2>&1
+) else (
+    echo [KIS] Outside night session window - skip.
+)
 
 echo.
 echo ====================================================
