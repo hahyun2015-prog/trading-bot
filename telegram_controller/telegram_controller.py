@@ -88,6 +88,7 @@ def get_unified_status():
         else:
             msg += "───────────────\n"
             total_invested = 0
+            total_eval_amt = 0
             total_profit_amt = 0
             
             for code, pos in portfolio.items():
@@ -108,24 +109,31 @@ def get_unified_status():
                 current_price = pos.get('current_price', buy_price)
                 qty = pos.get('qty', 0)
                 
+                bought_amt = buy_price * qty
+                eval_amt = current_price * qty
                 profit_pct = ((current_price - buy_price) / buy_price) * 100
                 profit_amt = (current_price - buy_price) * qty
                 icon = "🔥" if profit_amt > 0 else ("💧" if profit_amt < 0 else "➖")
                 
-                total_invested += (buy_price * qty)
+                total_invested += bought_amt
+                total_eval_amt += eval_amt
                 total_profit_amt += profit_amt
                 
                 msg += f"{icon} <b>[{strat}] {name}</b> ({qty}주)\n"
                 msg += f"  • 매입: {buy_price:,}원 ➡️ 현재: {current_price:,}원\n"
+                msg += f"  • 계약금액(매입): <b>{bought_amt:,}원</b> | 평가금액: <b>{eval_amt:,}원</b>\n"
                 msg += f"  • 수익: <b>{profit_amt:+,}원</b> ({profit_pct:+.2f}%)\n\n"
                 
             total_profit_pct = (total_profit_amt / total_invested * 100) if total_invested > 0 else 0
             t_icon = "🔥" if total_profit_amt > 0 else ("💧" if total_profit_amt < 0 else "➖")
+            stock_total_assets = total_balance + total_eval_amt
             
             msg += f"───────────────\n"
             msg += f"📊 <b>[현재 포트폴리오 총합]</b>\n"
-            msg += f"  • 총 매입금액: {total_invested:,}원\n"
+            msg += f"  • 총 계약금액(매입): {total_invested:,}원\n"
+            msg += f"  • 총 주식 평가금액: {total_eval_amt:,}원\n"
             msg += f"  • 총 평가수익: {t_icon} <b>{total_profit_amt:+,}원</b> ({total_profit_pct:+.2f}%)\n"
+            msg += f"  • <b>주식 계좌 합산금액 (예수금+주식): {stock_total_assets:,}원</b>\n"
             msg += "───────────────\n"
                 
         msg += f"🕒 업데이트: {data.get('last_updated', '')}"
@@ -148,6 +156,7 @@ def get_futures_status():
             
         avail_balance = data.get("futures_balance", 0)
         positions = data.get("futures_positions", {})
+        strat_info = data.get("futures_strategy", {})
         
         msg = f"📉 <b>[선물 봇 실시간 현황]</b>\n"
         msg += f"💸 주문가능 현금: {avail_balance:,}원\n\n"
@@ -156,14 +165,28 @@ def get_futures_status():
             msg += "텅~ (현재 진입한 포지션이 없습니다)\n"
         else:
             for code, pos in positions.items():
-                p_type = "📈 LONG (매수)" if pos.get('type') == 'LONG' else "📉 SHORT (매도)"
+                p_type_raw = pos.get('type', 'LONG')
+                p_type = "📈 LONG (매수)" if p_type_raw == 'LONG' else "📉 SHORT (매도)"
                 buy_price = pos.get('price', 0)
+                current_price = pos.get('current_price', buy_price)
                 qty = pos.get('qty', 0)
+                
+                fut_prefix = strat_info.get("prefix")
+                multiplier = 50000 if fut_prefix == '105' else 250000
+                bought_contract = buy_price * qty * multiplier
+                eval_contract = current_price * qty * multiplier
+                if p_type_raw == 'LONG':
+                    pnl = (current_price - buy_price) * qty * multiplier
+                else:
+                    pnl = (buy_price - current_price) * qty * multiplier
+                p_icon = "🔥" if pnl > 0 else ("💧" if pnl < 0 else "➖")
                 
                 msg += f"🎯 <b>{code}</b>\n"
                 msg += f"  • 방향: {p_type}\n"
-                msg += f"  • 진입단가: {buy_price:,.2f}pt\n"
+                msg += f"  • 진입단가: {buy_price:,.2f}pt ➡️ 현재가: {current_price:,.2f}pt\n"
                 msg += f"  • 보유수량: {qty}계약\n"
+                msg += f"  • 계약명목금액: <b>{bought_contract:,.0f}원</b> (평가명목: {eval_contract:,.0f}원)\n"
+                msg += f"  • 평가손익: {p_icon} <b>{int(pnl):+,}원</b>\n\n"
                 
         msg += f"\n🕒 업데이트: {data.get('last_updated', '')}"
         return msg

@@ -426,6 +426,7 @@ class TCAController:
             else:
                 msg += "───────────────\n"
                 total_invested = 0
+                total_eval_amt = 0
                 total_profit_amt = 0
                 
                 for code, pos in portfolio.items():
@@ -435,24 +436,31 @@ class TCAController:
                     current_price = pos.get('current_price', buy_price)
                     qty = pos.get('qty', 0)
                     
+                    bought_amt = buy_price * qty
+                    eval_amt = current_price * qty
                     profit_pct = ((current_price - buy_price) / buy_price) * 100
                     profit_amt = (current_price - buy_price) * qty
                     icon = "🔥" if profit_amt > 0 else ("💧" if profit_amt < 0 else "➖")
                     
-                    total_invested += (buy_price * qty)
+                    total_invested += bought_amt
+                    total_eval_amt += eval_amt
                     total_profit_amt += profit_amt
                     
                     msg += f"{icon} <b>[{strat}] {name}</b> ({qty}주)\n"
                     msg += f"  • 평단: {buy_price:,}원 ➡️ 현재: {current_price:,}원\n"
+                    msg += f"  • 계약금액(매입): <b>{bought_amt:,}원</b> | 평가금액: <b>{eval_amt:,}원</b>\n"
                     msg += f"  • 수익: <b>{profit_amt:+,}원</b> ({profit_pct:+.2f}%)\n\n"
                     
                 total_profit_pct = (total_profit_amt / total_invested * 100) if total_invested > 0 else 0
                 t_icon = "🔥" if total_profit_amt > 0 else ("💧" if total_profit_amt < 0 else "➖")
+                stock_total_assets = total_balance + total_eval_amt
                 
                 msg += f"───────────────\n"
                 msg += f"📊 <b>[주식 포트폴리오 총합]</b>\n"
-                msg += f"  • 총 매입금액: {total_invested:,}원\n"
+                msg += f"  • 총 계약금액(매입): {total_invested:,}원\n"
+                msg += f"  • 총 주식 평가금액: {total_eval_amt:,}원\n"
                 msg += f"  • 총 평가수익: {t_icon} <b>{total_profit_amt:+,}원</b> ({total_profit_pct:+.2f}%)\n"
+                msg += f"  • <b>주식 계좌 합산금액 (예수금+주식): {stock_total_assets:,}원</b>\n"
                 msg += "───────────────\n"
                     
             msg += f"🕒 업데이트: {data.get('last_updated', '')}"
@@ -504,12 +512,9 @@ class TCAController:
                     qty = pos.get('qty', 0)
                     current_price = pos.get('current_price', buy_price)
 
-                    # 국내선물 거래승수 (표준 250,000원, 미니 50,000원 판별)
-                    # (2026-07-21 수정) code는 딕셔너리 키인 "KOSPI200"/"KOSPI200_NIGHT" 세션
-                    # 라벨이라 '105' 포함 여부로 판별이 항상 실패해(표준 승수로 고정) 미니선물
-                    # 실현손익이 5배로 부풀려 표시되던 버그. era가 export_status에 실어보내는
-                    # 전역 상품접두사(futures_prefix)로 판별한다.
                     multiplier = 50000 if strat_info.get('prefix') == '105' else 250000
+                    bought_contract = buy_price * qty * multiplier
+                    eval_contract = current_price * qty * multiplier
                     if p_type == 'LONG':
                         pnl = (current_price - buy_price) * qty * multiplier
                     else:
@@ -521,6 +526,7 @@ class TCAController:
                     msg += f"  • 방향: {p_label}\n"
                     msg += f"  • 진입단가: {buy_price:,.2f}pt ➡️ 현재가: {current_price:,.2f}pt\n"
                     msg += f"  • 보유수량: {qty}계약\n"
+                    msg += f"  • 계약명목금액: <b>{bought_contract:,.0f}원</b> (평가명목: {eval_contract:,.0f}원)\n"
                     msg += f"  • 평가손익: {p_icon} <b>{int(pnl):+,}원</b>\n\n"
                     
             msg += f"🕒 업데이트: {data.get('last_updated', '')}"
@@ -556,11 +562,13 @@ class TCAController:
                 stock_profit += (current_price - buy_price) * qty
             
             stock_profit_pct = (stock_profit / stock_invested * 100) if stock_invested > 0 else 0
-            stock_total_val = stock_bal + stock_invested + stock_profit
+            stock_eval_val = stock_invested + stock_profit
+            stock_total_val = stock_bal + stock_eval_val
             
             # 선물 부문 잔고 및 평가손익 계산
             fut_bal     = f_data.get("futures_balance", 0)
             futures_positions = f_data.get("futures_positions", {})
+            fut_contract_val = 0
             futures_profit = 0
             for code, pos in futures_positions.items():
                 p_type = pos.get('type', 'LONG')
@@ -568,12 +576,10 @@ class TCAController:
                 qty = pos.get('qty', 0)
                 current_price = pos.get('current_price', buy_price)
 
-                # 국내선물 거래승수 (표준 250,000원, 미니 50,000원 판별)
-                # (2026-07-21 수정) code는 "KOSPI200"/"KOSPI200_NIGHT" 세션 라벨이라 '105' 포함
-                # 여부 판별이 항상 실패하던 버그 — era가 export_status에 실어보내는 전역
-                # 상품접두사(futures_prefix)로 판별한다.
                 fut_prefix = f_data.get("futures_strategy", {}).get("prefix")
                 multiplier = 50000 if fut_prefix == '105' else 250000
+                fut_contract_val += buy_price * qty * multiplier
+
                 if p_type == 'LONG':
                     pnl = (current_price - buy_price) * qty * multiplier
                 else:
@@ -585,6 +591,7 @@ class TCAController:
             # 통합 계산
             total_cash = stock_bal + fut_bal
             total_invested = stock_invested
+            total_contract = stock_invested + fut_contract_val
             total_profit = stock_profit + futures_profit
             total_assets = stock_total_val + fut_total_val
             
@@ -602,22 +609,24 @@ class TCAController:
             msg += f"📈 <b>주식 부문 (Stock Account)</b>\n"
             msg += f"  • 계좌번호: <code>{stock_acc}</code>\n"
             msg += f"  • 예수금(현금): {stock_bal:,}원\n"
-            msg += f"  • 투자금액(매입): {stock_invested:,}원\n"
+            msg += f"  • 주식 계약금액(매입): {stock_invested:,}원\n"
+            msg += f"  • 주식 평가금액: {stock_eval_val:,}원\n"
             msg += f"  • 평가손익(수익): {s_icon} <b>{stock_profit:+,}원</b> ({stock_profit_pct:+.2f}%)\n"
-            msg += f"  • 주식자산평가액: {stock_total_val:,}원\n\n"
+            msg += f"  • <b>주식 부문 합산금액 (예수금+주식): {stock_total_val:,}원</b>\n\n"
             
             msg += f"📉 <b>선물 부문 (Futures Account)</b>\n"
             msg += f"  • 계좌번호: <code>{futures_acc}</code>\n"
             msg += f"  • 예수금(현금): {fut_bal:,}원\n"
+            msg += f"  • 선물 계약명목금액: {fut_contract_val:,.0f}원\n"
             msg += f"  • 평가손익(수익): {f_icon} <b>{int(futures_profit):+,}원</b>\n"
-            msg += f"  • 선물자산평가액: {int(fut_total_val):,}원\n\n"
+            msg += f"  • <b>선물 부문 합산금액 (예수금+손익): {int(fut_total_val):,}원</b>\n\n"
             
             msg += f"───────────────\n"
             msg += f"📊 <b>통합 자산 총합 (Combined Assets)</b>\n"
             msg += f"  • 총 현금자산: {total_cash:,}원\n"
-            msg += f"  • 총 주식투자: {total_invested:,}원\n"
+            msg += f"  • 총 계약금액 (주식매입+선물명목): {total_contract:,.0f}원\n"
             msg += f"  • 총 평가손익: {t_icon} <b>{int(total_profit):+,}원</b> ({total_profit_pct:+.2f}%)\n"
-            msg += f"  • <b>총 평가자산 (Net Worth): {int(total_assets):,}원</b>\n"
+            msg += f"  • <b>통합 자산 합산총액 (Net Worth): {int(total_assets):,}원</b>\n"
             msg += f"───────────────\n"
             msg += f"🕒 업데이트: {s_data.get('last_updated', '-')}"
             return msg
