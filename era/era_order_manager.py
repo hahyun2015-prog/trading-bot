@@ -617,6 +617,7 @@ class ERAOrderManager:
         self.futures_last_short_exit_price = 0.0
         self.futures_last_short_exit_time = 0.0
         self.futures_last_any_exit_time = 0.0    # (2026-08-04) 방향무관 재진입 쿨다운용 최종 청산 시각(epoch)
+        self.futures_day_entry_time = 0.0        # (2026-08-07) 타임스톱용 진입 시각(epoch)
         self.futures_std_error = 0.5            # Kalman Filter 최근 주간 잔차 표준편차
         self.futures_kf_sl_mult = 5.0           # Kalman Filter 하이브리드 손절 배수 (최적값 5.0)
         self.futures_kf_ts_trigger_mult = 1.5   # 이익보전 활성화 배수 (기본값 1.5)
@@ -1260,6 +1261,12 @@ class ERAOrderManager:
             self.futures_hard_stop_se_mult = float(futures_settings.get("hard_stop_se_mult", 1.5))
             _hsp = futures_settings.get("hard_stop_pt", None)
             self.futures_hard_stop_pt = float(_hsp) if _hsp is not None else None
+            # (2026-08-07) 타임스톱 — 진입 후 N분 내 MFE가 트리거에 못 미치면 즉시 청산. 하드손절
+            # (가격캡)과 상호보완: '시간을 끌지만 이익권에 못 가는' 트레이드를 본전 근처에서
+            # 조기 청산해 자본을 회전. 백테스트: PF 38.7→59.1, 수익·승률·평균손 전부 개선.
+            self.futures_time_stop_enabled = bool(futures_settings.get("time_stop_enabled", True))
+            self.futures_time_stop_minutes = float(futures_settings.get("time_stop_minutes", 10.0))
+            self.futures_time_stop_mfe_pt = float(futures_settings.get("time_stop_mfe_pt", 4.0))
             self.futures_std_trim_outliers = int(futures_settings.get("std_trim_outliers", 0))
             _dcm = futures_settings.get("dynamic_cap_mult", None)
             self.futures_dynamic_cap_mult = float(_dcm) if _dcm is not None else None
@@ -1660,6 +1667,25 @@ class ERAOrderManager:
             buf = getattr(self, "futures_profit_lock_be_buffer_pt", 1.0)
             floor = (entry + buf) if is_long else (entry - buf)
         return dist, floor
+
+    def _day_time_stop_fire(self, entry, is_long):
+        """(2026-08-07) 타임스톱: 진입 후 time_stop_minutes 경과 시점에 미실현 최대이익(MFE)이
+        time_stop_mfe_pt에 못 미치면 True(→ 즉시 시장가 청산). 하드손절이 '가격'을 캡한다면
+        타임스톱은 '시간은 끌지만 이익권(4pt)에 못 가는' 정체 트레이드를 본전 근처에서 조기
+        청산해 자본을 회전시킨다. 샹들리에 주간 전용. time_stop_enabled=False면 항상 False."""
+        if not getattr(self, "futures_time_stop_enabled", False):
+            return False
+        et = getattr(self, "futures_day_entry_time", 0.0)
+        if not et or entry <= 0:
+            return False
+        import time as _t_ts
+        if (_t_ts.time() - et) < getattr(self, "futures_time_stop_minutes", 10.0) * 60:
+            return False
+        peak = getattr(self, "futures_day_peak", 0.0)
+        if peak <= 0:
+            return False
+        mfe = (peak - entry) if is_long else (entry - peak)
+        return mfe < getattr(self, "futures_time_stop_mfe_pt", 4.0)
 
     def _check_daily_reset(self):
         try:
@@ -4218,7 +4244,10 @@ class ERAOrderManager:
                             stop_price = self.futures_day_peak - dist
                             if _pl_floor is not None:
                                 stop_price = max(stop_price, _pl_floor)
-                            if current_price <= stop_price:
+                            _ts_fire = self._day_time_stop_fire(entry, True)
+                            if current_price <= stop_price or _ts_fire:
+                                if _ts_fire:
+                                    print(f"[주간선물(샹들리에)] ⏱️ 타임스톱 LONG 청산 (진입 {self.futures_time_stop_minutes:.0f}분 경과, MFE<{self.futures_time_stop_mfe_pt:.0f}pt)")
                                 realized_pnl = current_price - entry
                                 peak_snapshot = self.futures_day_peak
                                 if realized_pnl < 0:
@@ -4407,7 +4436,10 @@ class ERAOrderManager:
                             stop_price = self.futures_day_peak + dist
                             if _pl_floor is not None:
                                 stop_price = min(stop_price, _pl_floor)
-                            if current_price >= stop_price:
+                            _ts_fire = self._day_time_stop_fire(entry, False)
+                            if current_price >= stop_price or _ts_fire:
+                                if _ts_fire:
+                                    print(f"[주간선물(샹들리에)] ⏱️ 타임스톱 SHORT 청산 (진입 {self.futures_time_stop_minutes:.0f}분 경과, MFE<{self.futures_time_stop_mfe_pt:.0f}pt)")
                                 realized_pnl = entry - current_price
                                 peak_snapshot = self.futures_day_peak
                                 if realized_pnl < 0:
@@ -4588,6 +4620,7 @@ class ERAOrderManager:
                                     return
                             
                             self.futures_day_entry_price = current_price
+                            import time as _t_ent; self.futures_day_entry_time = _t_ent.time()  # 타임스톱 기준
                             self.futures_day_peak = current_price # 진입 즉시 초기화
                             # 진입 시점의 std_error/ATR/3-Sigma 목표가를 스냅샷 — 보유 중 매 5분봉마다
                             # 칼만 필터가 재추정되며 이 값들이 크게 튀면(재시딩 특성상 발생 가능), 라이브 값을
@@ -4636,6 +4669,7 @@ class ERAOrderManager:
                                     return
                             
                             self.futures_day_entry_price = current_price
+                            import time as _t_ent; self.futures_day_entry_time = _t_ent.time()  # 타임스톱 기준
                             self.futures_day_peak = current_price # 진입 즉시 초기화
                             # 진입 시점의 std_error/ATR/3-Sigma 목표가를 스냅샷 (LONG 쪽과 동일한 이유 — 위 주석 참조)
                             self.futures_day_entry_std_error = getattr(self, "futures_std_error", 0.5)
