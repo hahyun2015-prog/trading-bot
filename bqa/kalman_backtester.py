@@ -912,7 +912,8 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                                  hard_stop_enabled=False, hard_stop_se_mult=1.5, hard_stop_pt=None,
                                  margin_per_contract=None, margin_rate=None,
                                  signal_only_on_5min=False,
-                                 time_stop_enabled=False, time_stop_minutes=10.0, time_stop_mfe_pt=4.0):
+                                 time_stop_enabled=False, time_stop_minutes=10.0, time_stop_mfe_pt=4.0,
+                                 realistic_gap_fill=False, gap_guard_mult=None):
     """
     era_order_manager.py의 실전 주간선물 "샹들리에 청산"(2026-07-15 도입, futures_strategy_type=
     "chandelier")을 재현한 백테스트. run_kalman_live_replica와 진입측(칼만 타점/장기추세필터/
@@ -978,6 +979,17 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
         본전±be_stage_buffer_pt로 끌어올린다. 2단계(trigger_pt): MFE가 trigger_pt(기본 8)
         도달 시 트레일링 폭을 profit_lock_mult*ATR14로 좁히고 손절선을 본전±be_buffer_pt로 잠근다.
 
+    realistic_gap_fill / gap_guard_mult (2026-08-08 이식, run_kalman_breakout_fair에 이미
+    있던 걸 뒤늦게 이식 — 기본 False/None=기존 동작과 100% 동일):
+      - 기존 동작(기본): target_long/target_short를 봉의 시가가 이미 갭으로 넘어섰어도
+        target 가격 그대로 체결 처리한다. 전날 종가 대비 큰 갭이 난 다음날, 실제로는
+        시장가에 한참 못 미치는(즉 실현 불가능한) 가격에 체결된 것처럼 계산돼 손익이
+        허구로 부풀려진다(2026-08-08 모의투자 실거래 대조 중 발견 — 07-16 갭다운 하루치
+        백테스트 손익 전체 이익의 99%가 이런 유령체결이었음).
+      - realistic_gap_fill=True: 시가가 target을 이미 넘었으면 target이 아니라 시가
+        기준으로 체결(더 보수적/현실적).
+      - gap_guard_mult 지정 시: 갭 크기가 std_error의 이 배수를 넘으면 그 진입 자체를
+        건너뛴다(실제로는 그런 상황에서 진입을 안 했을 수 있다는 가정).
     time_stop_enabled (2026-08-08 이식, 기본 False=기존 동작과 100% 동일):
       - era_order_manager.py의 _day_time_stop_fire(2026-08-07 도입, 라이브 실장)를 재현한다.
         진입 후 time_stop_minutes분이 지난 시점에도 미실현 최대이익(MFE)이 time_stop_mfe_pt에
@@ -1285,12 +1297,15 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
             continue
 
         if c_high >= target_long:
-            if not disable_trend_filter and trend == "DOWN":
+            open_gap = max(c_open - target_long, 0.0)  # 봉 시가가 target을 이미 넘어선 갭 크기
+            if gap_guard_mult is not None and open_gap > gap_guard_mult * std_error:
+                pass  # 갭으로 target을 너무 크게 넘어선 진입은 건너뜀
+            elif not disable_trend_filter and trend == "DOWN":
                 continue
             elif regime_filter_enabled and trend != "UP":
                 continue
             elif not enable_reentry_filter or reentry_ok(1, target_long):
-                fill = target_long + SLIP_ENTRY
+                fill = (max(c_open, target_long) + SLIP_ENTRY) if realistic_gap_fill else (target_long + SLIP_ENTRY)
                 pos, entry_price, peak_price = 1, fill, fill
                 entry_std_error = std_error
                 entry_time = dt_index[i]
@@ -1301,12 +1316,15 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                     pos_contracts = contracts
                 contracts_log.append(pos_contracts)
         elif c_low <= target_short:
-            if not disable_trend_filter and trend == "UP":
+            open_gap = max(target_short - c_open, 0.0)
+            if gap_guard_mult is not None and open_gap > gap_guard_mult * std_error:
+                pass
+            elif not disable_trend_filter and trend == "UP":
                 continue
             elif regime_filter_enabled and trend != "DOWN":
                 continue
             elif not enable_reentry_filter or reentry_ok(-1, target_short):
-                fill = target_short - SLIP_ENTRY
+                fill = (min(c_open, target_short) - SLIP_ENTRY) if realistic_gap_fill else (target_short - SLIP_ENTRY)
                 pos, entry_price, peak_price = -1, fill, fill
                 entry_std_error = std_error
                 entry_time = dt_index[i]
