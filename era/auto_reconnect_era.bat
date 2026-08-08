@@ -36,6 +36,36 @@ if exist "%~dp0era.pid" (
 echo Terminating ERA/TCA python processes...
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process -Filter \"name='python.exe'\" | Where-Object { $_.CommandLine -like '*leader_order_manager.py*' -or $_.CommandLine -like '*tca_controller.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >nul 2>&1
 
+:: 2b. 종료 확인 (2026-08-08 도입) — 위 taskkill/Stop-Process는 >nul 2>&1로 실패를 가리므로,
+:: 권한 부족 등으로 조용히 실패해도 그대로 진행해왔다. 그 결과 옛 프로세스가 포트 9991을
+:: 계속 쥔 채 60초 뒤 재기동이 충돌해서 죽는 사고가 실제로 있었다(이 배치를 관리자 권한
+:: 없이 직접 실행했을 때 재현 — 정상 경로인 schtasks/TCA 트리거는 권한을 상속받아 대부분
+:: 문제없지만, 실패를 감지 못 하는 구조 자체가 위험하므로 명시적으로 확인한다).
+:: tasklist로 PID 존재만 확인한다 — Get-CimInstance의 CommandLine 필터는 관리자 권한
+:: 프로세스를 비관리자 세션에서 조회할 때 빈 값을 반환해(2026-08-08 직접 재현 확인)
+:: 바로 이 시나리오에서 오탐(거짓 성공)을 낸다.
+if not defined ERA_PID goto eraKillOk
+set "KILL_RETRY=0"
+:checkEraKilled
+tasklist /FI "PID eq %ERA_PID%" 2>nul | find /i "python.exe" >nul
+if errorlevel 1 goto eraKillOk
+set /a KILL_RETRY+=1
+if %KILL_RETRY% GEQ 5 goto eraKillFailed
+ping 127.0.0.1 -n 3 >nul
+goto checkEraKilled
+
+:eraKillFailed
+echo.
+echo [FATAL] 기존 ERA 프로세스를 종료하지 못했습니다 (권한 부족 추정 — 이 배치가
+echo         관리자 권한 없이 실행되면 옛 프로세스에 대한 taskkill이 조용히 실패합니다).
+echo         포트 충돌로 재기동이 실패하는 것보다 안전하니, 여기서 중단합니다.
+"%~dp0..\venv32\Scripts\python.exe" -c "import sys; sys.path.insert(0, r'%~dp0..'); import notifier, time; notifier.send_message('🚨 <b>[ERA 재연동 실패]</b> 기존 프로세스 종료 실패(권한 부족 추정)로 재기동을 중단했습니다. 관리자 권한으로 다시 시도해주세요.'); time.sleep(2)" >nul 2>&1
+if exist "%~dp0..\system_stopped.flag" del /f /q "%~dp0..\system_stopped.flag" >nul 2>&1
+timeout /t 3 >nul
+exit /b 1
+
+:eraKillOk
+
 :: 3. Terminate Kiwoom OpenAPI processes to clear session
 echo Terminating Kiwoom OpenAPI helper processes...
 taskkill /f /im opstarter.exe /t >nul 2>&1
