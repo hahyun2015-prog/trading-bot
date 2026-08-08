@@ -1165,6 +1165,11 @@ class ERAOrderManager:
 
             # 칼만 필터 기본값 설정
             self.futures_strategy_type = futures_settings.get("futures_strategy_type", "volatility_breakout")
+            # (2026-08-09) 초저변동성 구간 진입 차단 ATR 임계값. 기존엔 active_strategy.json
+            # (BQA 자동최적화 출력 전용 파일)에서만 덮어쓸 수 있어 수동으로 고른 값을 넣기엔
+            # 용도가 안 맞았다. config.json에서도 직접 설정 가능하게 하되, active_strategy.json에
+            # atr_cutoff가 있으면 여전히 그쪽이 우선한다(아래 로드 순서 그대로 유지).
+            self.futures_atr_cutoff = float(futures_settings.get("atr_cutoff", 0.5))
             self.futures_kf_q = float(futures_settings.get("kf_q", 0.0001))
             self.futures_kf_r = float(futures_settings.get("kf_r", 0.5))
             self.futures_kf_mult = float(futures_settings.get("kf_mult", 1.0))
