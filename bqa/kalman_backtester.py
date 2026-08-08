@@ -911,7 +911,8 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                                  reentry_pullback_mult=0.5, reentry_breakout_mult=0.2,
                                  hard_stop_enabled=False, hard_stop_se_mult=1.5, hard_stop_pt=None,
                                  margin_per_contract=None, margin_rate=None,
-                                 signal_only_on_5min=False):
+                                 signal_only_on_5min=False,
+                                 time_stop_enabled=False, time_stop_minutes=10.0, time_stop_mfe_pt=4.0):
     """
     era_order_manager.py의 실전 주간선물 "샹들리에 청산"(2026-07-15 도입, futures_strategy_type=
     "chandelier")을 재현한 백테스트. run_kalman_live_replica와 진입측(칼만 타점/장기추세필터/
@@ -976,6 +977,13 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
         1단계(선택, be_move_trigger_pt): 미실현 최대이익(MFE)이 이 값 도달 시 손절선을
         본전±be_stage_buffer_pt로 끌어올린다. 2단계(trigger_pt): MFE가 trigger_pt(기본 8)
         도달 시 트레일링 폭을 profit_lock_mult*ATR14로 좁히고 손절선을 본전±be_buffer_pt로 잠근다.
+
+    time_stop_enabled (2026-08-08 이식, 기본 False=기존 동작과 100% 동일):
+      - era_order_manager.py의 _day_time_stop_fire(2026-08-07 도입, 라이브 실장)를 재현한다.
+        진입 후 time_stop_minutes분이 지난 시점에도 미실현 최대이익(MFE)이 time_stop_mfe_pt에
+        못 미치면, 가격 트레일링과 무관하게 그 봉 종가로 즉시 청산한다("시간은 끌지만
+        이익권에 못 가는" 정체 트레이드를 조기 정리). profit_lock_enabled와 독립적으로
+        동작하며, 두 기능의 MFE 계산은 각각 별도로 이뤄진다.
     """
     n = len(df)
     if n < kf_window + 10:
@@ -1196,11 +1204,16 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                 stop_price = peak_price - eff_dist
                 if pl_floor is not None:
                     stop_price = max(stop_price, pl_floor)
+                _ts_fire = (time_stop_enabled and entry_time is not None and
+                            (dt_index[i] - entry_time).total_seconds() >= time_stop_minutes * 60 and
+                            (peak_price - entry_price) < time_stop_mfe_pt)
                 if force_close or vol_force_close:
                     exit_price = c_close
                     is_force = True
                 elif c_low <= stop_price:
                     exit_price = stop_price
+                elif _ts_fire:
+                    exit_price = c_close
             else:
                 peak_price = min(peak_price, c_low)
                 eff_dist, pl_floor = dist, None
@@ -1218,11 +1231,16 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                 stop_price = peak_price + eff_dist
                 if pl_floor is not None:
                     stop_price = min(stop_price, pl_floor)
+                _ts_fire = (time_stop_enabled and entry_time is not None and
+                            (dt_index[i] - entry_time).total_seconds() >= time_stop_minutes * 60 and
+                            (entry_price - peak_price) < time_stop_mfe_pt)
                 if force_close or vol_force_close:
                     exit_price = c_close
                     is_force = True
                 elif c_high >= stop_price:
                     exit_price = stop_price
+                elif _ts_fire:
+                    exit_price = c_close
 
             if exit_price is not None:
                 exit_slip = SLIP_EXIT_FORCE if is_force else SLIP_EXIT_NORMAL
