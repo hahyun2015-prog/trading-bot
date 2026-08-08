@@ -14,16 +14,44 @@ import subprocess
 import os
 import json
 
-BOT_TOKEN = "8710417841:AAGm1AZxo-u9RTQX_MeRRDpz_ggvS4mvexk"
-ALLOWED_CHAT_ID = 8578720404
-BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
 # 각 봇의 경로 (현재 파일 기준 동적 설정)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UNIFIED_DIR = os.path.join(BASE_DIR, "unified_trader")
 FUTURES_DIR = os.path.join(BASE_DIR, "futures_trader")
 CONTROLLER_DIR = os.path.join(BASE_DIR, "telegram_controller")
 ERA_DIR = os.path.join(BASE_DIR, "era")
+
+def _load_config():
+    config_path = os.path.join(BASE_DIR, 'config', 'config.json')
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+    except Exception as e:
+        print(f"[telegram_controller] config.json 로드 실패: {e}")
+        return {}
+    # config_local.json 오버라이드 (동기화 제외 파일)
+    local_path = os.path.join(BASE_DIR, 'config', 'config_local.json')
+    if os.path.exists(local_path):
+        try:
+            with open(local_path, 'r', encoding='utf-8') as f:
+                local = json.load(f)
+            for key, val in local.items():
+                if isinstance(val, dict) and isinstance(cfg.get(key), dict):
+                    cfg[key].update(val)
+                else:
+                    cfg[key] = val
+        except Exception:
+            pass
+    return cfg
+
+_CONFIG = _load_config()
+_TELEGRAM = _CONFIG.get("telegram", {})
+_ENV = _CONFIG.get("environment", "mock")
+# 모의투자 PC에 dev_bot_token이 있으면 그것을 사용 (2대 동시 가동 시 알림 채널 분리)
+_DEV_TOKEN = _TELEGRAM.get("dev_bot_token", "")
+BOT_TOKEN = _DEV_TOKEN if (_DEV_TOKEN and _ENV != "live") else _TELEGRAM.get("bot_token")
+ALLOWED_CHAT_ID = _TELEGRAM.get("allowed_chat_id")
+BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 def send_message(text):
     url = f"{BASE_URL}/sendMessage"
