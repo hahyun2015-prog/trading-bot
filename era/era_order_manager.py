@@ -5065,6 +5065,33 @@ class ERAOrderManager:
                     self.save_futures_exit_state()
                     self._execute_futures_direct("SHORT_ENTER", current_price, code, pos_key)
 
+    def _calc_futures_margin_per_contract(self, price):
+        """지수선물(코스피200/미니) 1계약 위탁증거금. _execute_futures_direct와
+        _poll_futures_signals가 공용으로 쓴다 — 예전에 이 계산이 두 곳에 각각
+        복붙돼 있어 요율 수정(0.10->요율 기반)이 한쪽에만 반영된 채 방치된 적이
+        있어(2026-08-08) 통합했다.
+
+        증거금 = 기준가격 × 승수 × 요율.
+        (2026-08-04 1차) 하루치 실측만 보고 "계약당 고정액(10,360,560원)"으로
+        판단해 고정값을 넣었으나 오판이었다. 여러 날을 보면 계약당 반환액이
+        758만~1,214만원으로 움직인다. 하루 안에서 일정했던 건 기준가격이 그날
+        안 바뀌었기 때문이고, 실제로는 20% × 기준가격 × 승수다
+        (검증: 20% × 1036.28pt × 50,000 = 10,362,800원 vs 실측 10,360,560원, 오차 0.02%).
+        공식 위탁증거금률은 19.8%(유지 13.2%, 2026-07-06 기준).
+
+        기존 코드의 0.10은 실제(약 0.20)의 절반이라 계약수를 2.11배 과대 산정했다.
+        max_contracts 상한에 가려 있지만, 상한을 올리거나 지수가 오르면 증거금
+        부족으로 주문이 거부된다.
+
+        margin_rate 미설정 시 0.10이 적용돼 기존 동작이 유지된다. margin_per_contract를
+        지정하면 그 고정값이 요율보다 우선한다(정확한 값을 아는 경우에만 사용 —
+        기준가격이 갱신되면 어긋나므로 권장하지 않는다)."""
+        multiplier = 50000 if getattr(self, 'futures_prefix', '101') == '105' else 250000
+        _mpc = getattr(self, 'futures_margin_per_contract', None)
+        if _mpc is not None and _mpc > 0:
+            return _mpc
+        return price * multiplier * getattr(self, 'futures_margin_rate', 0.10)
+
     def _execute_futures_direct(self, signal_type, current_price, order_code, pos_key):
         """선물 주문 직접 집행 (주간/야간 공용 — DB 신호 우회)"""
         is_night = (pos_key == "KOSPI200_NIGHT")
@@ -5094,28 +5121,8 @@ class ERAOrderManager:
             if getattr(self, 'futures_fixed_qty', None) is not None:
                 qty = self.futures_fixed_qty
             else:
-                multiplier = 50000 if getattr(self, 'futures_prefix', '101') == '105' else 250000
-                # 증거금 = 기준가격 × 승수 × 요율.
-                #
-                # (2026-08-04 1차) 하루치 실측만 보고 "계약당 고정액(10,360,560원)"으로
-                # 판단해 고정값을 넣었으나 오판이었다. 여러 날을 보면 계약당 반환액이
-                # 758만~1,214만원으로 움직인다. 하루 안에서 일정했던 건 기준가격이 그날
-                # 안 바뀌었기 때문이고, 실제로는 20% × 기준가격 × 승수다
-                # (검증: 20% × 1036.28pt × 50,000 = 10,362,800원 vs 실측 10,360,560원, 오차 0.02%).
-                # 공식 위탁증거금률은 19.8%(유지 13.2%, 2026-07-06 기준).
-                #
-                # 기존 코드의 0.10은 실제(약 0.20)의 절반이라 계약수를 2.11배 과대 산정했다.
-                # 지금은 max_contracts 상한에 가려 있지만, 상한을 올리거나 지수가 오르면
-                # 증거금 부족으로 주문이 거부된다.
-                #
-                # margin_rate 미설정 시 0.10이 적용돼 기존 동작이 유지된다.
-                # margin_per_contract를 지정하면 그 고정값이 요율보다 우선한다(정확한 값을
-                # 아는 경우에만 사용 — 기준가격이 갱신되면 어긋나므로 권장하지 않는다).
-                _mpc = getattr(self, 'futures_margin_per_contract', None)
-                if _mpc is not None and _mpc > 0:
-                    margin_per = _mpc
-                else:
-                    margin_per = current_price * multiplier * getattr(self, 'futures_margin_rate', 0.10)
+                # 증거금 계산 근거·이력은 _calc_futures_margin_per_contract 참고
+                margin_per = self._calc_futures_margin_per_contract(current_price)
 
                 # [AMATS 최적화] active_strategy.json의 마진캡(최적화 적용값 50%)을 반영한 자본 대비 계약 수 계산
                 margin_cap = getattr(self, 'futures_margin_cap_ratio', 0.30)
@@ -6048,9 +6055,10 @@ class ERAOrderManager:
                 if getattr(self, 'futures_fixed_qty', None) is not None:
                     qty = self.futures_fixed_qty
                 else:
-                    # 선물 1계약 위탁증거금 계산
-                    multiplier = 50000 if getattr(self, 'futures_prefix', '101') == '105' else 250000
-                    margin_per_contract = price * multiplier * 0.10  # 승수 5만(미니) 또는 25만(일반), 위탁증거금률 10%
+                    # 선물 1계약 위탁증거금 계산 (자동매매 경로와 동일한 공용 계산 —
+                    # 2026-08-08 이전엔 여기만 요율 0.10 하드코딩이 남아있어 수동/TCA
+                    # 주문에서 계약수가 2.11배 과대 산정되던 버그였다)
+                    margin_per_contract = self._calc_futures_margin_per_contract(price)
                     safe_budget = self.futures_available_balance * self.futures_margin_cap_ratio
                     qty = int(safe_budget // margin_per_contract)
                     
