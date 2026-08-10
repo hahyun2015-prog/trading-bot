@@ -9,10 +9,32 @@ def patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
 socket.getaddrinfo = patched_getaddrinfo
 
 import os
+import re
 import sys
 import json
 import time
 import requests
+
+# requests가 던지는 예외 메시지에는 요청 URL이 통째로 들어간다. 텔레그램 API URL은
+# 경로에 봇 토큰을 담고 있어서, 전송 실패를 그대로 print하면 토큰이 로그에 평문으로
+# 남는다. 실제로 era_order_manager.log 등 5개 로그에 남아 있었다(2026-08-10 발견).
+# .gitignore의 *.log에 걸려 커밋되지는 않았으나, 로그를 첨부·공유하면 그대로 나간다.
+_BOT_URL_RE = re.compile(r"(/bot)(\d+:)?[A-Za-z0-9_\-]{20,}")
+
+
+def _mask_secrets(msg):
+    """예외·로그 문자열에서 봇 토큰을 가린다. 어떤 봇인지는 남겨 추적은 가능하게 둔다."""
+    text = str(msg)
+    text = _BOT_URL_RE.sub(lambda m: f"{m.group(1)}{m.group(2) or ''}<masked>", text)
+    # BOT_TOKEN은 이 함수보다 아래(모듈 하단)에서 정의된다. 호출은 항상 임포트 완료 후라
+    # 정상 동작하지만, 임포트 도중 예외 경로로 불려도 죽지 않도록 globals()로 조회한다.
+    token = globals().get("BOT_TOKEN")
+    if token:
+        text = text.replace(token, "<masked>")
+        # 봇ID:시크릿 형태에서 시크릿만 별도로 노출되는 경우까지 덮는다
+        if ":" in token:
+            text = text.replace(token.split(":", 1)[1], "<masked>")
+    return text
 
 # 윈도우 CP949 콘솔 인코딩 에러(이모지 출력 크래시) 원천 방지 래퍼 클래스
 class SafeStreamWrapper:
@@ -120,10 +142,10 @@ def _send_message_sync(text, max_retries=MAX_RETRIES):
         except Exception as e:
             if attempt < max_retries:
                 wait = 2 ** attempt
-                print(f"[텔레그램 알림] 전송 실패({e}) — {wait}초 후 재시도 ({attempt + 1}/{max_retries})")
+                print(f"[텔레그램 알림] 전송 실패({_mask_secrets(e)}) — {wait}초 후 재시도 ({attempt + 1}/{max_retries})")
                 time.sleep(wait)
             else:
-                print(f"[텔레그램 알림 오류] {max_retries}회 재시도 후 최종 실패: {e}")
+                print(f"[텔레그램 알림 오류] {max_retries}회 재시도 후 최종 실패: {_mask_secrets(e)}")
                 return
 
 def _worker():
