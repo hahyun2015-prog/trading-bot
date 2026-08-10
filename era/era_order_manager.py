@@ -4730,8 +4730,16 @@ class ERAOrderManager:
                             _ma_v = getattr(self, "futures_ma_filter_value", None)
                             _ma_c = getattr(self, "futures_ma_filter_close", None)
                             if _ma_v is not None and _ma_c is not None and _ma_c < _ma_v:
-                                self._note_entry_block("이평선방향", f"직전종가 {_ma_c:.2f} < MA {_ma_v:.2f}")
-                                print(f"[주간선물] 🚫 LONG 진입 차단 (이평선 방향): 직전종가 {_ma_c:.2f} < MA{getattr(self,'futures_ma_filter_period',0)} {_ma_v:.2f}")
+                                # _process_day_tick은 틱마다 호출된다. 여기서 매번 로그를 찍으면
+                                # 추세일 하루에 수천 줄이 쌓이고, _note_entry_block에 넣으면
+                                # 60회를 몇 초 만에 넘겨 "진입 전면 차단" 경보가 매일 울린다.
+                                # 한 방향을 막는 것은 이 필터의 의도된 동작이지 고장이 아니므로
+                                # 경보 대상에서 빼고, 로그는 방향별로 하루 1회만 남긴다.
+                                _mk = f"ma_LONG_{datetime.now():%Y%m%d}"
+                                if getattr(self, "_ma_block_logged", None) != _mk:
+                                    self._ma_block_logged = _mk
+                                    print(f"[주간선물] 🚫 LONG 진입 차단 (이평선 방향, 당일 최초): "
+                                          f"직전종가 {_ma_c:.2f} < MA{getattr(self,'futures_ma_filter_period',0)} {_ma_v:.2f}")
                                 return
 
                             # 볼린저 밴드 결합 필터링
@@ -4791,8 +4799,16 @@ class ERAOrderManager:
                             _ma_v = getattr(self, "futures_ma_filter_value", None)
                             _ma_c = getattr(self, "futures_ma_filter_close", None)
                             if _ma_v is not None and _ma_c is not None and _ma_c > _ma_v:
-                                self._note_entry_block("이평선방향", f"직전종가 {_ma_c:.2f} > MA {_ma_v:.2f}")
-                                print(f"[주간선물] 🚫 SHORT 진입 차단 (이평선 방향): 직전종가 {_ma_c:.2f} > MA{getattr(self,'futures_ma_filter_period',0)} {_ma_v:.2f}")
+                                # _process_day_tick은 틱마다 호출된다. 여기서 매번 로그를 찍으면
+                                # 추세일 하루에 수천 줄이 쌓이고, _note_entry_block에 넣으면
+                                # 60회를 몇 초 만에 넘겨 "진입 전면 차단" 경보가 매일 울린다.
+                                # 한 방향을 막는 것은 이 필터의 의도된 동작이지 고장이 아니므로
+                                # 경보 대상에서 빼고, 로그는 방향별로 하루 1회만 남긴다.
+                                _mk = f"ma_SHORT_{datetime.now():%Y%m%d}"
+                                if getattr(self, "_ma_block_logged", None) != _mk:
+                                    self._ma_block_logged = _mk
+                                    print(f"[주간선물] 🚫 SHORT 진입 차단 (이평선 방향, 당일 최초): "
+                                          f"직전종가 {_ma_c:.2f} > MA{getattr(self,'futures_ma_filter_period',0)} {_ma_v:.2f}")
                                 return
 
                             # 볼린저 밴드 결합 필터링
