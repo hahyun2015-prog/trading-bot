@@ -58,3 +58,9 @@ kis/*.xlsx
 *.bak_*
 *.py.bak*
 
+
+# KIS 야간수집기 산출물
+kis/*.pid
+kis/*.mst
+kis/*.mst.zip
+kis/__pycache__/
