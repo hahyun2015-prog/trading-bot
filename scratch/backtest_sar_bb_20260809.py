@@ -29,9 +29,11 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                            realistic_gap_fill=True, gap_guard_mult=None,
                            reentry_pullback_mult=0.5, reentry_breakout_mult=0.2,
                            sar_af_init=0.02, sar_af_step=0.02, sar_af_max=0.20,
+                           sar_sl_mult=1.0,
                            bb_window=20, bb_sigma=2.0, bb_trail_std_mult=1.5, bb_trail_exit_mult=0.5,
                            squeeze_window=100, squeeze_quantile=0.25, use_squeeze_filter=True,
                            entry_target_mode='kalman_band', breakout_k=0.2,
+                           ma_filter_period=None, allow_overnight=False,
                            regime_filter_enabled=False,
                            time_stop_enabled=False, time_stop_minutes=10.0, time_stop_mfe_pt=4.0,
                            return_trades=False):
@@ -84,6 +86,12 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
     bandwidth = (bb_upper - bb_lower) / bb_mid
     squeeze_limit = pd.Series(bandwidth).rolling(squeeze_window).quantile(squeeze_quantile).values
 
+    # [2026-08-11] 장기 이평선 방향 필터.
+    # 종가가 이평선 위면 LONG만, 아래면 SHORT만 허용한다. 역방향 진입을 원천 차단해
+    # 추세를 거스르는 거래를 없애려는 것. None이면 비활성(기존 동작과 100% 동일).
+    ma_line = (pd.Series(closes).rolling(ma_filter_period).mean().values
+               if ma_filter_period else None)
+
     SLIP_ENTRY, SLIP_EXIT_SL = slip_entry_pt, slip_exit_sl_pt
     SLIP_EXIT_NORMAL, SLIP_EXIT_FORCE = slip_exit_normal_pt, slip_exit_force_pt
 
@@ -129,8 +137,15 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
             day_low = min(day_low, lows[i])
 
         hour, minute = ts.hour, ts.minute
-        force_close = (hour == force_close_hour and force_close_minute <= minute <= force_close_minute + force_close_window_min)
-        vol_force_close = (hour == 15 and 35 <= minute <= 45)
+        # [2026-08-11] allow_overnight=True면 1일청산을 없앤다 — 장마감(15:35~15:45)
+        # 무조건청산과 익일 08:45 안전청산 둘 다. 포지션이 여러 날에 걸쳐 유지되며
+        # 청산은 오직 전략 자신의 손절·트레일링으로만 일어난다.
+        # 오버나잇 갭 위험을 그대로 떠안는다는 뜻이다(2026-06-11 거래정지 갭 -117.98pt 사례).
+        if allow_overnight:
+            force_close = vol_force_close = False
+        else:
+            force_close = (hour == force_close_hour and force_close_minute <= minute <= force_close_minute + force_close_window_min)
+            vol_force_close = (hour == 15 and 35 <= minute <= 45)
 
         enough_data = i >= kf_window
         if enough_data:
@@ -204,7 +219,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                         if c_close > sar_ep:
                             sar_ep = c_close
                             sar_af = min(sar_af + sar_af_step, sar_af_max)
-                        sl_limit = max(atr14 * 1.0, 2.0)
+                        sl_limit = max(atr14 * sar_sl_mult, 2.0)   # [2026-08-11] 배수 파라미터화
                         if force_close or vol_force_close:
                             exit_price, is_force = c_close, True
                         elif c_low <= sar_value or pnl_pt <= -sl_limit:
@@ -212,7 +227,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                         elif ts_fire:
                             exit_price = c_close
                     else:
-                        sl_limit = max(atr14 * 1.0, 2.0)
+                        sl_limit = max(atr14 * sar_sl_mult, 2.0)   # [2026-08-11] 배수 파라미터화
                         if force_close or vol_force_close:
                             exit_price, is_force = c_close, True
                         elif pnl_pt <= -sl_limit:
@@ -243,7 +258,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                         if c_close < sar_ep:
                             sar_ep = c_close
                             sar_af = min(sar_af + sar_af_step, sar_af_max)
-                        sl_limit = max(atr14 * 1.0, 2.0)
+                        sl_limit = max(atr14 * sar_sl_mult, 2.0)   # [2026-08-11] 배수 파라미터화
                         if force_close or vol_force_close:
                             exit_price, is_force = c_close, True
                         elif c_high >= sar_value or pnl_pt <= -sl_limit:
@@ -251,7 +266,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                         elif ts_fire:
                             exit_price = c_close
                     else:
-                        sl_limit = max(atr14 * 1.0, 2.0)
+                        sl_limit = max(atr14 * sar_sl_mult, 2.0)   # [2026-08-11] 배수 파라미터화
                         if force_close or vol_force_close:
                             exit_price, is_force = c_close, True
                         elif pnl_pt <= -sl_limit:
@@ -308,6 +323,10 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
             continue
 
         if c_high >= target_long:
+            # 직전 봉 종가와 직전 봉 이평선으로 판정한다. 당봉 종가를 쓰면 진입 시점에
+            # 아직 모르는 값을 참조하는 셈이라 미래참조가 된다.
+            if ma_line is not None and (i < 1 or np.isnan(ma_line[i - 1]) or closes[i - 1] < ma_line[i - 1]):
+                continue          # 이평선 아래에서는 LONG 금지
             open_gap = max(c_open - target_long, 0.0)
             if gap_guard_mult is not None and open_gap > gap_guard_mult * std_error:
                 pass
@@ -324,8 +343,10 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                 pos, entry_price, peak_price = 1, fill, fill
                 entry_time = dt_index[i]
                 if strategy == 'sar':
-                    sar_value, sar_ep, sar_af, sar_bull = fill - atr14, fill, sar_af_init, True
+                    sar_value, sar_ep, sar_af, sar_bull = fill - atr14 * sar_sl_mult, fill, sar_af_init, True
         elif c_low <= target_short:
+            if ma_line is not None and (i < 1 or np.isnan(ma_line[i - 1]) or closes[i - 1] > ma_line[i - 1]):
+                continue          # 이평선 위에서는 SHORT 금지
             open_gap = max(target_short - c_open, 0.0)
             if gap_guard_mult is not None and open_gap > gap_guard_mult * std_error:
                 pass
@@ -342,7 +363,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                 pos, entry_price, peak_price = -1, fill, fill
                 entry_time = dt_index[i]
                 if strategy == 'sar':
-                    sar_value, sar_ep, sar_af, sar_bull = fill + atr14, fill, sar_af_init, False
+                    sar_value, sar_ep, sar_af, sar_bull = fill + atr14 * sar_sl_mult, fill, sar_af_init, False
 
     total = len(pnls)
     if total == 0:

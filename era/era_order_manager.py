@@ -649,6 +649,9 @@ class ERAOrderManager:
         self.sar_af_init = 0.02       # AF 초기값 (config에서 덮어쓰기 가능)
         self.sar_af_step = 0.02       # AF 증가폭
         self.sar_af_max = 0.20        # AF 최대값
+        self.futures_ma_filter_period = 0   # 이평선 방향필터 기간(0=비활성)
+        self.futures_ma_filter_value = None # 직전 봉 기준 이평선 값
+        self.futures_ma_filter_close = None # 직전 봉 종가
 
         # BB + PSAR 결합 필터 실시간 변수
         self.current_bb_mid = 0.0
@@ -915,12 +918,15 @@ class ERAOrderManager:
                 return
             conn = sqlite3.connect(self.futures_db_path, timeout=30)
             conn.execute("PRAGMA journal_mode=WAL;")
-            # 볼린저 밴드 및 100봉 롤링 Squeeze 계산을 위해 충분한 5분봉 조회 (최근 250개)
+            # 볼린저(20)·Squeeze(100)에 더해 방향필터용 장기 이평선(기본 200)까지 계산하므로
+            # 필요한 봉 수 = max(100, ma_period) + 여유. (2026-08-11 이평선 필터 도입)
+            _ma_p = int(getattr(self, "futures_ma_filter_period", 0) or 0)
+            _need = max(250, _ma_p + 50)
             df = pd.read_sql(
-                f"SELECT close FROM futures_ohlcv WHERE code='{code}' ORDER BY date DESC LIMIT 250", conn
+                f"SELECT close FROM futures_ohlcv WHERE code='{code}' ORDER BY date DESC LIMIT {_need}", conn
             )
             conn.close()
-            
+
             if df.empty or len(df) < 120:
                 return
             
@@ -935,12 +941,30 @@ class ERAOrderManager:
             # Squeeze Limit (최근 100봉의 25% 분위수)
             df['squeeze_limit'] = df['bandwidth'].rolling(window=100).quantile(0.25)
             
+            # 방향필터용 장기 이평선 (2026-08-11). 완결된 직전 봉 기준으로 잡는다 —
+            # 진행 중인 당봉의 종가는 진입 시점에 아직 확정되지 않았으므로 쓰면 미래참조다.
+            # 백테스트(scratch/backtest_sar_bb_20260809.py의 ma_filter_period)와 같은 기준.
+            self.futures_ma_filter_value = None
+            self.futures_ma_filter_close = None
+            if _ma_p > 0 and len(df) >= _ma_p + 1:
+                _ma_series = df['close'].rolling(window=_ma_p).mean()
+                _prev_ma = _ma_series.iloc[-2]
+                _prev_close = df['close'].iloc[-2]
+                if not pd.isna(_prev_ma):
+                    self.futures_ma_filter_value = float(_prev_ma)
+                    self.futures_ma_filter_close = float(_prev_close)
+
             last_row = df.iloc[-1]
             if not pd.isna(last_row['sma20']):
                 self.current_bb_mid = float(last_row['sma20'])
                 self.current_bb_bandwidth = float(last_row['bandwidth'])
                 self.current_bb_squeeze_limit = float(last_row['squeeze_limit'])
-                print(f"[ERA BB 필터] 갱신 완료 | 중심선={self.current_bb_mid:.2f} | 밴드폭={self.current_bb_bandwidth*100:.2f}% (임계={self.current_bb_squeeze_limit*100:.2f}%)")
+                _ma_txt = ""
+                if self.futures_ma_filter_value is not None:
+                    _dir = "상승(LONG만)" if self.futures_ma_filter_close >= self.futures_ma_filter_value else "하락(SHORT만)"
+                    _ma_txt = (f" | MA{_ma_p}={self.futures_ma_filter_value:.2f} "
+                               f"직전종가={self.futures_ma_filter_close:.2f} → {_dir}")
+                print(f"[ERA BB 필터] 갱신 완료 | 중심선={self.current_bb_mid:.2f} | 밴드폭={self.current_bb_bandwidth*100:.2f}% (임계={self.current_bb_squeeze_limit*100:.2f}%){_ma_txt}")
         except Exception as e:
             print(f"[ERA BB 필터 오류] {e}")
 
@@ -1339,6 +1363,8 @@ class ERAOrderManager:
             self.sar_af_init = float(futures_settings.get("sar_af_init", 0.02))
             self.sar_af_step = float(futures_settings.get("sar_af_step", 0.02))
             self.sar_af_max  = float(futures_settings.get("sar_af_max", 0.20))
+            # 이평선 방향필터 기간(5분봉 개수). 0/미설정이면 비활성.
+            self.futures_ma_filter_period = int(futures_settings.get("ma_filter_period", 0) or 0)
             self.bb_window   = int(futures_settings.get("bb_window", 20))
             self.bb_sigma    = float(futures_settings.get("bb_sigma", 2.0))
 
@@ -4696,6 +4722,18 @@ class ERAOrderManager:
                     if is_kalman and self.futures_tp_price_long > 0 and current_price >= self.futures_tp_price_long:
                         return
                     if not self.enable_reentry_filter or self._is_reentry_allowed("LONG", current_price, is_night=False):
+                            # 장기 이평선 방향 필터 (2026-08-11 도입).
+                            # 직전 봉 종가가 이평선 아래에 있으면 LONG 진입을 막는다.
+                            # 검증: 필터 없이는 LONG이 PF 0.86으로 적자였고(SHORT 1.49가 이를
+                            # 가리고 있었다), MA200 적용 시 LONG이 1.23으로 뒤집혔다. 워크포워드
+                            # 2회 모두 이 필터를 선택. 상세: 선물_이평선방향필터_및_손익폭_검증_20260811.md
+                            _ma_v = getattr(self, "futures_ma_filter_value", None)
+                            _ma_c = getattr(self, "futures_ma_filter_close", None)
+                            if _ma_v is not None and _ma_c is not None and _ma_c < _ma_v:
+                                self._note_entry_block("이평선방향", f"직전종가 {_ma_c:.2f} < MA {_ma_v:.2f}")
+                                print(f"[주간선물] 🚫 LONG 진입 차단 (이평선 방향): 직전종가 {_ma_c:.2f} < MA{getattr(self,'futures_ma_filter_period',0)} {_ma_v:.2f}")
+                                return
+
                             # 볼린저 밴드 결합 필터링
                             if getattr(self, "futures_strategy_type", "") == "parabolic_sar" and self.current_bb_mid > 0:
                                 if self.current_bb_bandwidth < self.current_bb_squeeze_limit:
@@ -4745,6 +4783,18 @@ class ERAOrderManager:
                     if is_kalman and self.futures_tp_price_short > 0 and current_price <= self.futures_tp_price_short:
                         return
                     if not self.enable_reentry_filter or self._is_reentry_allowed("SHORT", current_price, is_night=False):
+                            # 장기 이평선 방향 필터 (2026-08-11 도입).
+                            # 직전 봉 종가가 이평선 위에 있으면 SHORT 진입을 막는다.
+                            # 검증: 필터 없이는 LONG이 PF 0.86으로 적자였고(SHORT 1.49가 이를
+                            # 가리고 있었다), MA200 적용 시 LONG이 1.23으로 뒤집혔다. 워크포워드
+                            # 2회 모두 이 필터를 선택. 상세: 선물_이평선방향필터_및_손익폭_검증_20260811.md
+                            _ma_v = getattr(self, "futures_ma_filter_value", None)
+                            _ma_c = getattr(self, "futures_ma_filter_close", None)
+                            if _ma_v is not None and _ma_c is not None and _ma_c > _ma_v:
+                                self._note_entry_block("이평선방향", f"직전종가 {_ma_c:.2f} > MA {_ma_v:.2f}")
+                                print(f"[주간선물] 🚫 SHORT 진입 차단 (이평선 방향): 직전종가 {_ma_c:.2f} > MA{getattr(self,'futures_ma_filter_period',0)} {_ma_v:.2f}")
+                                return
+
                             # 볼린저 밴드 결합 필터링
                             if getattr(self, "futures_strategy_type", "") == "parabolic_sar" and self.current_bb_mid > 0:
                                 if self.current_bb_bandwidth < self.current_bb_squeeze_limit:
