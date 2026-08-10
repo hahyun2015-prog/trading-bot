@@ -944,8 +944,48 @@ class ERAOrderManager:
         except Exception as e:
             print(f"[ERA BB 필터 오류] {e}")
 
-    def update_kalman_targets(self, code):
-        """로컬 DB의 최근 5분봉 데이터를 활용해 칼만 필터 예측값 및 오차 표준편차를 구하고 돌파 타점을 설정하며, 15분봉 장기 추세 필터를 계산합니다."""
+    def _note_entry_block(self, reason, detail):
+        """진입 게이트가 조용히 반환할 때 그 사실을 기록하고, 하루 종일 막히면 알린다.
+
+        (2026-08-10) 08-09 SAR 전환 후 std_error 게이트가 모든 진입을 막았는데
+        `return`만 하고 로그가 없어, 목표가를 양방향으로 관통한 08-10 하루가
+        거래 0건으로 끝나도록 아무도 알아채지 못했다. 오류도 경고도 없어서
+        로그만 보면 "조용한 정상"과 구별되지 않았다.
+        어떤 게이트든 연속으로 막고 있으면 그 이름과 수치를 드러낸다.
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        if getattr(self, "_entry_block_date", None) != today:
+            self._entry_block_date = today
+            self._entry_block_counts = {}
+            self._entry_block_alerted = set()
+
+        # 사유별로 따로 센다. 한 카운터를 공유하면 먼저 걸린 사유가 계속 증가시켜
+        # 다른 사유는 임계값에 영원히 도달하지 못한다.
+        counts = self._entry_block_counts
+        counts[reason] = counts.get(reason, 0) + 1
+
+        # 5분봉 기준 하루 78봉. 같은 사유로 60회면 사실상 당일 전 구간이 막힌 것이다.
+        if counts[reason] < 60 or reason in self._entry_block_alerted:
+            return
+        self._entry_block_alerted.add(reason)
+
+        msg = (f"신규 진입이 60회 연속 차단됐습니다.\n"
+               f"게이트: {reason}\n조건: {detail}\n"
+               f"전략={getattr(self, 'futures_strategy_type', '?')}")
+        print(f"⚠️ [주간선물] {msg}")
+        if notifier:
+            notifier.send_message(f"⚠️ <b>[진입 전면 차단]</b>\n{msg}")
+
+    def update_kalman_targets(self, code, std_error_only=False):
+        """로컬 DB의 최근 5분봉 데이터를 활용해 칼만 필터 예측값 및 오차 표준편차를 구하고 돌파 타점을 설정하며, 15분봉 장기 추세 필터를 계산합니다.
+
+        std_error_only=True면 std_error(및 추세)만 갱신하고 **타점은 건드리지 않는다**.
+        parabolic_sar 전용 경로다 — SAR은 타점을 돌파 방식(시초가±전일Range×K, 4065행)
+        으로 잡는데, std_error는 진입 게이트(4604행 min_std_error_entry)가 쓰기 때문에
+        갱신은 되어야 한다. 종전에는 이 함수가 kalman/chandelier에서만 호출돼
+        SAR에서는 futures_std_error가 초기값 0.5(621행)에 그대로 머물렀고, 문턱 1.5와
+        비교되어 **모든 신규 진입이 조용히 반환**됐다(2026-08-10 실거래 0건).
+        """
         try:
             import sqlite3
             import pandas as pd
@@ -1093,6 +1133,23 @@ class ERAOrderManager:
             is_night = (code == getattr(self, 'real_night_code', '10500000').replace("A", ""))
             if getattr(self, 'real_day_code', '10100000').replace("A", "") == getattr(self, 'real_night_code', '10500000').replace("A", ""):
                 is_night = self._resolve_is_night_session(self.futures_positions)
+
+            if std_error_only:
+                # SAR 경로 — 타점은 돌파 방식을 유지해야 하므로 std_error/추세만 반영한다.
+                # 로그는 값이 눈에 띄게 바뀔 때만 남긴다(5분마다 찍히면 로그가 묻힌다).
+                if is_night:
+                    _prev = getattr(self, 'futures_night_std_error', 0.0)
+                    self.futures_night_std_error = std_error
+                    self.futures_night_trend_direction = trend_direction
+                else:
+                    _prev = getattr(self, 'futures_std_error', 0.0)
+                    self.futures_std_error = std_error
+                    self.futures_trend_direction = trend_direction
+                if _prev <= 0 or abs(std_error - _prev) / max(_prev, 1e-9) > 0.5:
+                    _sess = "야간" if is_night else "주간"
+                    print(f"[ERA 칼만 {_sess}] std_error 갱신(SAR): {_prev:.2f} → {std_error:.2f}pt "
+                          f"| 진입문턱={getattr(self, 'futures_min_std_error_entry', 0.0):.2f}pt | 타점 미변경")
+                return
 
             if is_night:
                 old_trend = self.futures_night_trend_direction
@@ -3101,6 +3158,11 @@ class ERAOrderManager:
             if getattr(self, "futures_strategy_type", "volatility_breakout") in ("kalman", "chandelier"):
                 self.update_kalman_targets(code)
             elif getattr(self, "futures_strategy_type", "volatility_breakout") == "parabolic_sar":
+                # (2026-08-10) BB/PSAR 필터만 갱신하던 것을 std_error 갱신과 함께 돌린다.
+                # std_error는 진입 게이트(min_std_error_entry)가 참조하는 값인데 SAR에서는
+                # 아무도 채우지 않아 초기값 0.5로 굳어 있었고, 그 탓에 진입이 전면 차단됐다.
+                # 타점은 std_error_only=True로 보호한다 — SAR은 돌파 타점을 쓴다.
+                self.update_kalman_targets(code, std_error_only=True)
                 self.update_bb_psar_filters(code)
         except Exception as e:
             import traceback
@@ -3354,7 +3416,13 @@ class ERAOrderManager:
         """실제 선물계좌의 예수금 및 포지션을 동기화하기 위해 키움 서버에 TR 요청"""
         if not self.futures_account:
             return
-        
+
+        # 휴장일에는 키움 서버가 TR에 응답하지 않아 60초 워치독 알림이 5분마다 반복
+        # 발생하는 문제가 있었음 — 시간대만 보고 요청을 쏘던 기존 로직에 거래일 여부를
+        # 추가로 확인해 휴장일에는 아예 요청 자체를 보내지 않는다.
+        if not self._is_trading_day():
+            return
+
         now = datetime.now()
         # 장중 시간대에만 실시간 조회 요청 (과도한 요청 방지 및 API 보호)
         # 주간 세션: 08:30 ~ 15:50
@@ -4058,9 +4126,16 @@ class ERAOrderManager:
             else:
                 self.futures_target_long  = day_open + self.futures_prev_range * self.futures_best_k
                 self.futures_target_short = day_open - self.futures_prev_range * self.futures_best_k
+                # (2026-08-10) 돌파 타점을 쓰는 전략도 진입 게이트가 std_error를 참조한다.
+                # 장 초반 5분봉 경계 갱신(3102행)이 돌기 전까지 초기값 0.5로 남지 않도록
+                # 세션 시작 시점에 한 번 채워둔다. 타점은 위에서 정한 값을 유지한다.
+                if getattr(self, "futures_strategy_type", "") == "parabolic_sar":
+                    self.update_kalman_targets(code, std_error_only=True)
                 src_label = "DB 시초가" if db_open > 0 else "현재가(폴백)"
                 print(f"\n[주간선물] ✅ 시초가 설정: {day_open:.2f}pt ({src_label})")
                 print(f"  LONG목표: {self.futures_target_long:.2f}  SHORT목표: {self.futures_target_short:.2f}")
+                print(f"  std_error: {getattr(self, 'futures_std_error', 0.0):.2f}pt "
+                      f"(진입문턱 {getattr(self, 'futures_min_std_error_entry', 0.0):.2f}pt)")
                 print(f"  손절: {self.futures_stop_loss_pt}pt | 익절: {self.futures_take_profit_pt}pt (고정)")
                 if notifier:
                     notifier.send_message(
@@ -4592,11 +4667,17 @@ class ERAOrderManager:
                 # [AMATS 최적화] 초저변동성 구간 진입 차단 필터링 (ATR Cutoff)
                 atr_val = getattr(self, 'futures_atr_14', 2.0)
                 if atr_val < self.futures_atr_cutoff:
+                    self._note_entry_block("ATR컷오프", f"ATR {atr_val:.2f} < {self.futures_atr_cutoff:.2f}")
                     return
                 # 저변동성(std_error) 진입 필터 — 3*std_error 익절목표가 손절플로어보다 작아지는
                 # 국면 자체를 회피 (2026-07-09 백테스트 검증 도입, 기본 0.0이면 비활성)
-                if getattr(self, 'futures_std_error', 0.5) < self.futures_min_std_error_entry:
+                _se = getattr(self, 'futures_std_error', 0.5)
+                if _se < self.futures_min_std_error_entry:
+                    self._note_entry_block("std_error", f"std_error {_se:.2f} < {self.futures_min_std_error_entry:.2f}")
                     return
+                # 게이트를 다 통과했으면 연속 카운트를 푼다 (막힘이 지속될 때만 알리기 위함)
+                if getattr(self, "_entry_block_counts", None):
+                    self._entry_block_counts.clear()
 
                 # 장기 칼만 필터 추세 필터링 (Proposal 3) — 샹들리에도 백테스트와 동일하게 추세필터 적용
                 is_kalman = (getattr(self, "futures_strategy_type", "volatility_breakout") == "kalman")
@@ -4738,6 +4819,9 @@ class ERAOrderManager:
             else:
                 self.futures_night_target_long  = night_open + self.futures_prev_range * self.futures_best_k
                 self.futures_night_target_short = night_open - self.futures_prev_range * self.futures_best_k
+                # 주간(4095행)과 같은 이유 — 진입 게이트가 참조하는 night_std_error를 채운다.
+                if getattr(self, "futures_strategy_type", "") == "parabolic_sar":
+                    self.update_kalman_targets(code, std_error_only=True)
                 src_label = "DB 시초가" if db_night_open > 0 else "현재가(폴백)"
                 print(f"\n[야간선물] ✅ 시초가 설정: {night_open:.2f}pt ({src_label})")
                 print(f"  LONG목표: {self.futures_night_target_long:.2f}  SHORT목표: {self.futures_night_target_short:.2f}")
