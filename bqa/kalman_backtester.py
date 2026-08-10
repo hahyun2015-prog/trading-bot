@@ -598,10 +598,18 @@ def run_kalman_live_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=2.0, atr_c
     MARGIN_RATE, INIT_CAPITAL = 0.10, 50_000_000
     # 상황별 차등 슬리피지 (새 인자가 하나라도 지정되면 차등모델 활성화, 아니면 기존 고정 상수)
     _any_new_slip = any(v is not None for v in (slip_entry_pt, slip_exit_sl_pt, slip_exit_normal_pt, slip_exit_force_pt))
-    SLIP_ENTRY      = slip_entry_pt       if slip_entry_pt       is not None else (1.5 if _any_new_slip else slip_fee_pt)
-    SLIP_EXIT_SL    = slip_exit_sl_pt     if slip_exit_sl_pt     is not None else (3.0 if _any_new_slip else slip_fee_pt)
-    SLIP_EXIT_NORMAL= slip_exit_normal_pt if slip_exit_normal_pt is not None else (0.5 if _any_new_slip else slip_fee_pt)
-    SLIP_EXIT_FORCE = slip_exit_force_pt  if slip_exit_force_pt  is not None else (2.0 if _any_new_slip else slip_fee_pt)
+    # [2026-08-11] 슬리피지 기본값을 실측에 맞춰 내렸다.
+    # 종전 1.5/3.0/0.5/2.0pt는 근거 없는 가정이었다. ERA 로그의 주문가 대비 체결가를
+    # 6,767건 실측하니 평균 -0.004pt / 중앙값 0.000pt, |슬리피지|>0.5pt는 2.6%뿐이었다
+    # (99.4%가 주문수량과 체결합계 일치, scratch/measure_real_slippage_20260811.py).
+    # 다만 전 구간 모의투자라 호가 잔량·시장충격·체결대기가 반영되지 않은 하한값이다.
+    # 그래서 실측 0이 아니라 0.25pt를 기본으로 둔다 — 워크포워드 OOS가 정확히 이 값에서
+    # 손익분기(PF 1.00)이므로, 기본값이 곧 "여기를 넘으면 손실" 기준선 역할을 한다.
+    # 손절 체결은 실계좌에서 더 나쁠 수 있다. 결론을 내기 전에 0.5pt로 스트레스할 것.
+    SLIP_ENTRY      = slip_entry_pt       if slip_entry_pt       is not None else (0.25 if _any_new_slip else slip_fee_pt)
+    SLIP_EXIT_SL    = slip_exit_sl_pt     if slip_exit_sl_pt     is not None else (0.25 if _any_new_slip else slip_fee_pt)
+    SLIP_EXIT_NORMAL= slip_exit_normal_pt if slip_exit_normal_pt is not None else (0.25 if _any_new_slip else slip_fee_pt)
+    SLIP_EXIT_FORCE = slip_exit_force_pt  if slip_exit_force_pt  is not None else (0.25 if _any_new_slip else slip_fee_pt)
 
     cap = float(INIT_CAPITAL)
     equity, pnls, wins = [cap], [], 0
@@ -1053,10 +1061,18 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
             return margin_per_contract
         return price * point_value * (margin_rate if margin_rate is not None else MARGIN_RATE)
     _any_new_slip = any(v is not None for v in (slip_entry_pt, slip_exit_sl_pt, slip_exit_normal_pt, slip_exit_force_pt))
-    SLIP_ENTRY      = slip_entry_pt       if slip_entry_pt       is not None else (1.5 if _any_new_slip else slip_fee_pt)
-    SLIP_EXIT_SL    = slip_exit_sl_pt     if slip_exit_sl_pt     is not None else (3.0 if _any_new_slip else slip_fee_pt)
-    SLIP_EXIT_NORMAL= slip_exit_normal_pt if slip_exit_normal_pt is not None else (0.5 if _any_new_slip else slip_fee_pt)
-    SLIP_EXIT_FORCE = slip_exit_force_pt  if slip_exit_force_pt  is not None else (2.0 if _any_new_slip else slip_fee_pt)
+    # [2026-08-11] 슬리피지 기본값을 실측에 맞춰 내렸다.
+    # 종전 1.5/3.0/0.5/2.0pt는 근거 없는 가정이었다. ERA 로그의 주문가 대비 체결가를
+    # 6,767건 실측하니 평균 -0.004pt / 중앙값 0.000pt, |슬리피지|>0.5pt는 2.6%뿐이었다
+    # (99.4%가 주문수량과 체결합계 일치, scratch/measure_real_slippage_20260811.py).
+    # 다만 전 구간 모의투자라 호가 잔량·시장충격·체결대기가 반영되지 않은 하한값이다.
+    # 그래서 실측 0이 아니라 0.25pt를 기본으로 둔다 — 워크포워드 OOS가 정확히 이 값에서
+    # 손익분기(PF 1.00)이므로, 기본값이 곧 "여기를 넘으면 손실" 기준선 역할을 한다.
+    # 손절 체결은 실계좌에서 더 나쁠 수 있다. 결론을 내기 전에 0.5pt로 스트레스할 것.
+    SLIP_ENTRY      = slip_entry_pt       if slip_entry_pt       is not None else (0.25 if _any_new_slip else slip_fee_pt)
+    SLIP_EXIT_SL    = slip_exit_sl_pt     if slip_exit_sl_pt     is not None else (0.25 if _any_new_slip else slip_fee_pt)
+    SLIP_EXIT_NORMAL= slip_exit_normal_pt if slip_exit_normal_pt is not None else (0.25 if _any_new_slip else slip_fee_pt)
+    SLIP_EXIT_FORCE = slip_exit_force_pt  if slip_exit_force_pt  is not None else (0.25 if _any_new_slip else slip_fee_pt)
 
     cap = float(INIT_CAPITAL)
     equity, equity_days, pnls, wins = [cap], [], [], 0
@@ -1436,10 +1452,18 @@ def run_kalman_night_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=5.0, atr_
 
     MARGIN_RATE, INIT_CAPITAL = 0.10, 50_000_000
     _any_new_slip = any(v is not None for v in (slip_entry_pt, slip_exit_sl_pt, slip_exit_normal_pt, slip_exit_force_pt))
-    SLIP_ENTRY      = slip_entry_pt       if slip_entry_pt       is not None else (1.5 if _any_new_slip else slip_fee_pt)
-    SLIP_EXIT_SL    = slip_exit_sl_pt     if slip_exit_sl_pt     is not None else (3.0 if _any_new_slip else slip_fee_pt)
-    SLIP_EXIT_NORMAL= slip_exit_normal_pt if slip_exit_normal_pt is not None else (0.5 if _any_new_slip else slip_fee_pt)
-    SLIP_EXIT_FORCE = slip_exit_force_pt  if slip_exit_force_pt  is not None else (2.0 if _any_new_slip else slip_fee_pt)
+    # [2026-08-11] 슬리피지 기본값을 실측에 맞춰 내렸다.
+    # 종전 1.5/3.0/0.5/2.0pt는 근거 없는 가정이었다. ERA 로그의 주문가 대비 체결가를
+    # 6,767건 실측하니 평균 -0.004pt / 중앙값 0.000pt, |슬리피지|>0.5pt는 2.6%뿐이었다
+    # (99.4%가 주문수량과 체결합계 일치, scratch/measure_real_slippage_20260811.py).
+    # 다만 전 구간 모의투자라 호가 잔량·시장충격·체결대기가 반영되지 않은 하한값이다.
+    # 그래서 실측 0이 아니라 0.25pt를 기본으로 둔다 — 워크포워드 OOS가 정확히 이 값에서
+    # 손익분기(PF 1.00)이므로, 기본값이 곧 "여기를 넘으면 손실" 기준선 역할을 한다.
+    # 손절 체결은 실계좌에서 더 나쁠 수 있다. 결론을 내기 전에 0.5pt로 스트레스할 것.
+    SLIP_ENTRY      = slip_entry_pt       if slip_entry_pt       is not None else (0.25 if _any_new_slip else slip_fee_pt)
+    SLIP_EXIT_SL    = slip_exit_sl_pt     if slip_exit_sl_pt     is not None else (0.25 if _any_new_slip else slip_fee_pt)
+    SLIP_EXIT_NORMAL= slip_exit_normal_pt if slip_exit_normal_pt is not None else (0.25 if _any_new_slip else slip_fee_pt)
+    SLIP_EXIT_FORCE = slip_exit_force_pt  if slip_exit_force_pt  is not None else (0.25 if _any_new_slip else slip_fee_pt)
 
     cap = float(INIT_CAPITAL)
     equity, pnls, wins = [cap], [], 0
@@ -1682,10 +1706,18 @@ def run_kalman_live_replica_oc(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=3.4, at
 
     MARGIN_RATE, INIT_CAPITAL = 0.10, 50_000_000
     _any_new_slip = any(v is not None for v in (slip_entry_pt, slip_exit_sl_pt, slip_exit_normal_pt, slip_exit_force_pt))
-    SLIP_ENTRY      = slip_entry_pt       if slip_entry_pt       is not None else (1.5 if _any_new_slip else slip_fee_pt)
-    SLIP_EXIT_SL    = slip_exit_sl_pt     if slip_exit_sl_pt     is not None else (3.0 if _any_new_slip else slip_fee_pt)
-    SLIP_EXIT_NORMAL= slip_exit_normal_pt if slip_exit_normal_pt is not None else (0.5 if _any_new_slip else slip_fee_pt)
-    SLIP_EXIT_FORCE = slip_exit_force_pt  if slip_exit_force_pt  is not None else (2.0 if _any_new_slip else slip_fee_pt)
+    # [2026-08-11] 슬리피지 기본값을 실측에 맞춰 내렸다.
+    # 종전 1.5/3.0/0.5/2.0pt는 근거 없는 가정이었다. ERA 로그의 주문가 대비 체결가를
+    # 6,767건 실측하니 평균 -0.004pt / 중앙값 0.000pt, |슬리피지|>0.5pt는 2.6%뿐이었다
+    # (99.4%가 주문수량과 체결합계 일치, scratch/measure_real_slippage_20260811.py).
+    # 다만 전 구간 모의투자라 호가 잔량·시장충격·체결대기가 반영되지 않은 하한값이다.
+    # 그래서 실측 0이 아니라 0.25pt를 기본으로 둔다 — 워크포워드 OOS가 정확히 이 값에서
+    # 손익분기(PF 1.00)이므로, 기본값이 곧 "여기를 넘으면 손실" 기준선 역할을 한다.
+    # 손절 체결은 실계좌에서 더 나쁠 수 있다. 결론을 내기 전에 0.5pt로 스트레스할 것.
+    SLIP_ENTRY      = slip_entry_pt       if slip_entry_pt       is not None else (0.25 if _any_new_slip else slip_fee_pt)
+    SLIP_EXIT_SL    = slip_exit_sl_pt     if slip_exit_sl_pt     is not None else (0.25 if _any_new_slip else slip_fee_pt)
+    SLIP_EXIT_NORMAL= slip_exit_normal_pt if slip_exit_normal_pt is not None else (0.25 if _any_new_slip else slip_fee_pt)
+    SLIP_EXIT_FORCE = slip_exit_force_pt  if slip_exit_force_pt  is not None else (0.25 if _any_new_slip else slip_fee_pt)
     cap = float(INIT_CAPITAL)
     equity, pnls, wins = [cap], [], 0
 
