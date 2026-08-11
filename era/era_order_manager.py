@@ -1555,11 +1555,46 @@ class ERAOrderManager:
         self.futures_night_entry_atr = 0.0
         self.futures_night_entry_tp_price = 0.0
 
+        import time   # 모듈 최상위에 time이 없다
+
+        # SAR 내부상태 기본값 — 복원 조건을 통과하지 못하면 이 값이 유지되고,
+        # 아래 _ensure_sar_state()가 진입가 기준으로 다시 세운다.
+        self.sar_value = 0.0
+        self.sar_ep = 0.0
+        self.sar_af = getattr(self, "sar_af_init", 0.02)
+        self.sar_bull = True
+        self._sar_state_restored = False
+
         path = os.path.join(self.workspace_root, "era", "futures_exit_state.json")
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     state = json.load(f)
+                # (2026-08-11) SAR 상태 복원. 낡은 상태를 되살리는 쪽이 더 위험하므로
+                # 같은 거래일 + 10분 이내일 때만 받아들인다. 어제 종가로 계산된
+                # sar_value로 오늘 포지션을 관리하면 엉뚱한 자리에서 청산된다.
+                # 방향 일치 검사는 여기서 못 한다 — 계좌 조회가 비동기라 이 시점엔
+                # futures_positions가 비어 있다. 그래서 실제 사용 직전에
+                # _ensure_sar_state()가 한 번 더 확인한다.
+                _saved_at = float(state.get("saved_at", 0) or 0)
+                _saved_date = state.get("saved_date", "")
+                _age = time.time() - _saved_at if _saved_at else 1e9
+                _same_day = (_saved_date == datetime.now().strftime("%Y-%m-%d"))
+                if _saved_at and _same_day and _age <= 600 and float(state.get("sar_value", 0) or 0) > 0:
+                    self.sar_value = float(state.get("sar_value", 0.0))
+                    self.sar_ep = float(state.get("sar_ep", 0.0))
+                    self.sar_af = float(state.get("sar_af", self.sar_af))
+                    self.sar_bull = bool(state.get("sar_bull", True))
+                    self.futures_day_entry_price = float(state.get("day_entry_price", 0.0))
+                    self.futures_day_entry_time = float(state.get("day_entry_time", 0.0) or 0.0)
+                    self.futures_std_error = float(state.get("day_std_error", 0.0)) or self.futures_std_error
+                    self._sar_state_restored = True
+                    print("[ERA SAR] 내부상태 복원: SAR=%.2f EP=%.2f AF=%.3f %s (%.0f초 전 저장)"
+                          % (self.sar_value, self.sar_ep, self.sar_af,
+                             "상승" if self.sar_bull else "하락", _age))
+                elif _saved_at:
+                    print("[ERA SAR] 내부상태 복원 안 함 — 저장 %.0f초 전, 같은날=%s. 진입가 기준으로 재구성합니다."
+                          % (_age, _same_day))
                 self.futures_last_long_exit_price = float(state.get("last_long_exit_price", 0.0))
                 self.futures_last_long_exit_time = float(state.get("last_long_exit_time", 0.0))
                 self.futures_last_short_exit_price = float(state.get("last_short_exit_price", 0.0))
@@ -1607,6 +1642,44 @@ class ERAOrderManager:
             except Exception as e:
                 print(f"[ERA] 선물 청산가 복원 실패: {e}")
 
+    def _ensure_sar_state(self, entry, is_long):
+        """SAR 상태가 지금 포지션과 맞는지 확인하고, 아니면 진입가 기준으로 다시 세운다.
+
+        (2026-08-11) 복원 시점에는 계좌 조회가 끝나지 않아 포지션 방향을 알 수 없다.
+        그래서 실제로 SAR을 쓰기 직전인 여기서 마지막으로 검사한다.
+
+        재구성이 필요한 경우는 셋이다.
+          · sar_value가 0 이하 — 복원이 거부됐거나 애초에 없던 상태
+          · sar_bull이 실제 포지션 방향과 반대 — 복원값이 다른 포지션의 것
+          · sar_value가 진입가에서 ATR의 3배 넘게 떨어짐 — 낡은 값으로 판단
+
+        재구성하면 트레일링은 처음부터 다시 시작하지만, 최소한 손절선이 존재한다.
+        아무것도 안 하면 LONG은 손절선이 0이라 영원히 청산되지 않는다.
+        """
+        atr = getattr(self, "futures_atr_14", 5.0) or 5.0
+        need = False
+        why = ""
+        if self.sar_value <= 0:
+            need, why = True, "sar_value=0"
+        elif self.sar_bull != is_long:
+            need, why = True, "방향 불일치(sar_bull=%s, 포지션=%s)" % (self.sar_bull, "LONG" if is_long else "SHORT")
+        elif abs(self.sar_value - entry) > atr * 3:
+            need, why = True, "진입가와 %.1fpt 이격(ATR %.1f의 3배 초과)" % (abs(self.sar_value - entry), atr)
+        if not need:
+            return
+
+        self.sar_value = (entry - atr) if is_long else (entry + atr)
+        self.sar_ep = entry
+        self.sar_af = getattr(self, "sar_af_init", 0.02)
+        self.sar_bull = is_long
+        msg = ("SAR 상태를 진입가 기준으로 재구성했습니다 (%s)." % why
+               + chr(10) + "진입 %.2f → SAR %.2f, AF %.3f. 트레일링이 처음부터 다시 시작됩니다."
+               % (entry, self.sar_value, self.sar_af))
+        print("[ERA SAR] " + msg)
+        if notifier and not getattr(self, "_sar_rebuild_alerted", False):
+            self._sar_rebuild_alerted = True
+            notifier.send_message("<b>[선물 SAR 상태 재구성]</b>" + chr(10) + msg)
+
     def save_futures_exit_state(self):
         """선물 청산가(재진입 방지용) 저장 — 신고점/신저가 갱신마다 실시간 틱 콜백 안에서
         호출되므로(트레일링 기준점 체크포인트), 쓰는 도중 프로세스가 죽어도(이 기능이
@@ -1616,6 +1689,7 @@ class ERAOrderManager:
         조용히 전부 0으로 초기화되어, 트레일링 기준점 유실 방지라는 이 기능의 목적 자체가
         무력화되는 문제가 있었음."""
         try:
+            import time   # 모듈 최상위에 time이 없다 — 이 파일의 다른 곳들과 같은 지역 임포트
             path = os.path.join(self.workspace_root, "era", "futures_exit_state.json")
             state = {
                 "last_long_exit_price": self.futures_last_long_exit_price,
@@ -1638,6 +1712,22 @@ class ERAOrderManager:
                 "night_entry_std_error": self.futures_night_entry_std_error,
                 "night_entry_atr": self.futures_night_entry_atr,
                 "night_entry_tp_price": self.futures_night_entry_tp_price,
+                # (2026-08-11) SAR 내부상태. 종전에는 저장되지 않아 재기동할 때마다
+                # __init__ 기본값(sar_value=0, sar_af=0.02, sar_bull=True)으로 되돌아갔다.
+                # LONG 보유 중이었다면 청산 조건 current_price <= sar_value 가 0 이하를
+                # 요구하게 되어 트레일링이 사실상 사라지고, SHORT였다면 sar_bull이 True로
+                # 복원되어 SHORT 청산 분기 자체가 실행되지 않는다.
+                # chandelier는 상태가 day_peak 하나뿐이고 그건 저장되고 있었다 — SAR로
+                # 바꾸며 상태가 넷으로 늘었는데 배관이 따라오지 않은 경우다.
+                "sar_value": self.sar_value,
+                "sar_ep": self.sar_ep,
+                "sar_af": self.sar_af,
+                "sar_bull": self.sar_bull,
+                "day_entry_price": self.futures_day_entry_price,
+                "day_entry_time": getattr(self, "futures_day_entry_time", 0.0),
+                "day_std_error": getattr(self, "futures_std_error", 0.0),
+                "saved_at": time.time(),
+                "saved_date": datetime.now().strftime("%Y-%m-%d"),
                 "daily_reset_done_date": self._daily_reset_done_date,
                 "night_reset_done_date": self._night_reset_done_date,
                 "night_start_done_date": self._night_start_done_date
@@ -4327,6 +4417,10 @@ class ERAOrderManager:
 
                         # ── Parabolic SAR 전략 청산 ──
                         if is_sar:
+                            # (2026-08-11) 재기동 등으로 SAR 상태가 유실·불일치면 여기서 재구성.
+                            # 이 검사가 없으면 sar_value=0 상태로 LONG을 들고 있을 때
+                            # 청산 조건(current_price <= 0)이 성립하지 않아 트레일링이 사라진다.
+                            self._ensure_sar_state(entry, True)
                             # SAR 실시간 업데이트
                             if self.sar_bull:  # 상승장: SAR이 아래
                                 self.sar_value = self.sar_value + self.sar_af * (self.sar_ep - self.sar_value)
@@ -4522,6 +4616,9 @@ class ERAOrderManager:
 
                         # ── Parabolic SAR 전략 청산 ──
                         if is_sar:
+                            # LONG 쪽(4330행 부근)과 같은 이유. 재기동 후 sar_bull이 True로
+                            # 돌아와 있으면 이 아래 SHORT 청산 분기가 통째로 실행되지 않는다.
+                            self._ensure_sar_state(entry, False)
                             if not self.sar_bull:  # 하락장: SAR이 위
                                 self.sar_value = self.sar_value - self.sar_af * (self.sar_value - self.sar_ep)
                                 self.sar_value = max(self.sar_value, self.futures_day_peak)
