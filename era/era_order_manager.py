@@ -4433,7 +4433,17 @@ class ERAOrderManager:
                                     self.sar_bull = False
                                     realized_pnl = current_price - entry
                                     exit_reason_str = "SAR역전" if current_price > entry - sl_limit else "SAR손절"
-                                    self.futures_day_consecutive_losses += (1 if realized_pnl < 0 else 0)
+                                    # (2026-08-11) 이익일 때 0을 더하고 있었다 — 리셋이 아니라서
+                                    # 카운터가 하루 종일 누적됐다. '연속 손절'이 아니라 '당일 누적
+                                    # 손실 횟수'로 동작한 셈이다(08-11 실측: 22거래 중 손실 6건, 카운터 6).
+                                    # SAR 청산은 배포 전략의 주 경로이고, 같은 날 진입게이트(4816행)를
+                                    # 전 전략 공통으로 바꿔 이 카운터가 실제로 진입을 막게 됐으므로
+                                    # 그대로 두면 이익을 아무리 내도 손실 5건이면 당일 매매가 멈춘다.
+                                    # 다른 청산 경로(샹들리에 4505행 등)가 쓰는 관용구로 맞춘다.
+                                    if realized_pnl < 0:
+                                        self.futures_day_consecutive_losses += 1
+                                    else:
+                                        self.futures_day_consecutive_losses = 0
                                     print(f"[주간선물(SAR)] 🔄 LONG {exit_reason_str} 청산! 진입:{entry:.2f} SAR:{self.sar_value:.2f} 현재:{current_price:.2f} 손익:{realized_pnl:+.2f}pt")
                                     self.save_futures_exit_state()
                                     self._execute_futures_direct("LONG_EXIT", current_price, code, pos_key)
@@ -4629,7 +4639,17 @@ class ERAOrderManager:
                                     self.sar_bull = True
                                     realized_pnl = entry - current_price
                                     exit_reason_str = "SAR역전" if realized_pnl >= 0 else "SAR손절"
-                                    self.futures_day_consecutive_losses += (1 if realized_pnl < 0 else 0)
+                                    # (2026-08-11) 이익일 때 0을 더하고 있었다 — 리셋이 아니라서
+                                    # 카운터가 하루 종일 누적됐다. '연속 손절'이 아니라 '당일 누적
+                                    # 손실 횟수'로 동작한 셈이다(08-11 실측: 22거래 중 손실 6건, 카운터 6).
+                                    # SAR 청산은 배포 전략의 주 경로이고, 같은 날 진입게이트(4816행)를
+                                    # 전 전략 공통으로 바꿔 이 카운터가 실제로 진입을 막게 됐으므로
+                                    # 그대로 두면 이익을 아무리 내도 손실 5건이면 당일 매매가 멈춘다.
+                                    # 다른 청산 경로(샹들리에 4505행 등)가 쓰는 관용구로 맞춘다.
+                                    if realized_pnl < 0:
+                                        self.futures_day_consecutive_losses += 1
+                                    else:
+                                        self.futures_day_consecutive_losses = 0
                                     print(f"[주간선물(SAR)] 🔄 SHORT {exit_reason_str} 청산! 진입:{entry:.2f} SAR:{self.sar_value:.2f} 현재:{current_price:.2f} 손익:{realized_pnl:+.2f}pt")
                                     self.save_futures_exit_state()
                                     self._execute_futures_direct("SHORT_EXIT", current_price, code, pos_key)
