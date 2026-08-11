@@ -43,6 +43,8 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                            ma_filter_period=None, allow_overnight=False,
                            daily_loss_limit_pt=None,
                            ma_slope_min=None, ma_slope_lookback=40,
+                           reverse_entry=False, ma_filter_invert=False,
+                           entry_anchor='open', entry_width_basis='prev_range',
                            regime_filter_enabled=False,
                            time_stop_enabled=False, time_stop_minutes=10.0, time_stop_mfe_pt=4.0,
                            return_trades=False):
@@ -93,18 +95,21 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
         kf_rng_path[j] = kf_r_
 
     atr_map, prev_range_map, intraday_atr_map = {}, {}, {}
+    prev_close_map = {}
     day_list = daily['date_day'].tolist()
     for i, dkey in enumerate(day_list):
         if i == 0:
             atr_map[dkey] = 2.0
             intraday_atr_map[dkey] = 2.0
             prev_range_map[dkey] = 0.0
+            prev_close_map[dkey] = 0.0
         else:
             v = kf_atr_path[i - 1]
             atr_map[dkey] = float(v) if pd.notna(v) and v > 0 else 2.0
             vr = kf_rng_path[i - 1]
             intraday_atr_map[dkey] = float(vr) if pd.notna(vr) and vr > 0 else 2.0
             prev_range_map[dkey] = float(daily['range'].iloc[i - 1])
+            prev_close_map[dkey] = float(daily['close'].iloc[i - 1])
 
     bucket60 = (df.index.astype('datetime64[ns]').astype(np.int64) // 10**9 // (trend_bar_minutes * 60))
 
@@ -150,6 +155,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
     last_long_exit, last_short_exit = 0.0, 0.0
     target_long, target_short = np.inf, -np.inf
     std_error, trend, atr14, prev_range = 0.5, "NEUTRAL", 2.0, 0.0
+    prev_close_px = 0.0
     consec_losses = 0
     daily_loss_pt = 0.0
     sar_value, sar_ep, sar_af, sar_bull = 0.0, 0.0, sar_af_init, True
@@ -178,6 +184,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
             atr14 = atr_map.get(day_key, 2.0)
             intraday_atr = intraday_atr_map.get(day_key, 2.0)   # [2026-08-11] 손절폭 전용
             prev_range = prev_range_map.get(day_key, 0.0)
+            prev_close_px = prev_close_map.get(day_key, 0.0)
             consec_losses = 0
             daily_loss_pt = 0.0          # 당일 누적 손실(pt, 양수=손실)
             last_long_exit, last_short_exit = 0.0, 0.0
@@ -221,11 +228,29 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                 std_error = 0.5
             band = std_error * mult
             if entry_target_mode == 'breakout':
+                # 앵커: 타점의 중심을 어디에 두는가.
+                #   open       시초가 — 갭이 타점을 통째로 밀어 올린다(현행)
+                #   prev_close 전일 종가 — 갭 자체가 돌파 판정에 포함된다
+                #   mid        둘의 중간 — 갭의 절반만 반영
+                if entry_anchor == 'prev_close':
+                    _anchor = prev_close_px if prev_close_px > 0 else day_open
+                elif entry_anchor == 'mid':
+                    _anchor = (day_open + prev_close_px) / 2.0 if prev_close_px > 0 else day_open
+                else:
+                    _anchor = day_open
+                # 폭의 기준: 전일 Range는 하루치 노이즈를 통째로 받는다.
+                # 칼만 ATR/std_error는 평활돼 있어 더 안정적일 수 있다.
+                if entry_width_basis == 'atr':
+                    _w = atr14
+                elif entry_width_basis == 'std_error':
+                    _w = std_error
+                else:
+                    _w = prev_range
                 # 실거래(era_order_manager.py:4065)가 SAR에 실제로 쓰던 타점.
                 # 시초가에서 전일 Range의 K배만큼 떨어진 고정 가격이라, 칼만 밴드와 달리
                 # 장중에 움직이지 않는다. std_error는 필터용으로만 계속 계산한다.
-                target_long = day_open + prev_range * breakout_k
-                target_short = day_open - prev_range * breakout_k
+                target_long = _anchor + _w * breakout_k
+                target_short = _anchor - _w * breakout_k
             else:
                 target_long, target_short = kf_price + band, kf_price - band
 
@@ -413,8 +438,12 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
         if c_high >= target_long:
             # 직전 봉 종가와 직전 봉 이평선으로 판정한다. 당봉 종가를 쓰면 진입 시점에
             # 아직 모르는 값을 참조하는 셈이라 미래참조가 된다.
-            if ma_line is not None and (i < 1 or np.isnan(ma_line[i - 1]) or closes[i - 1] < ma_line[i - 1]):
-                continue          # 이평선 아래에서는 LONG 금지
+            if ma_line is not None and i >= 1 and not np.isnan(ma_line[i - 1]):
+                _above = closes[i - 1] >= ma_line[i - 1]
+                if (not _above) != bool(ma_filter_invert):
+                    continue      # 이평선 아래에서는 LONG 금지 (invert면 위에서 금지)
+            elif ma_line is not None:
+                continue
             if ma_slope is not None and (i < 1 or np.isnan(ma_slope[i - 1]) or ma_slope[i - 1] < ma_slope_min):
                 continue          # 이평선이 충분히 상승 중이 아니면 LONG 금지
             open_gap = max(c_open - target_long, 0.0)
@@ -435,14 +464,21 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
             elif use_squeeze_filter and strategy == 'sar' and not np.isnan(bb_mid[i - 1]) and closes[i - 1] <= bb_mid[i - 1]:
                 continue
             elif reentry_ok(1, target_long):
-                fill = (max(c_open, target_long) + SLIP_ENTRY) if realistic_gap_fill else (target_long + SLIP_ENTRY)
-                pos, entry_price, peak_price = 1, fill, fill
+                _lvl = max(c_open, target_long) if realistic_gap_fill else target_long
+                _dir = -1 if reverse_entry else 1
+                fill = _lvl + SLIP_ENTRY * _dir      # 사면 비싸게, 팔면 싸게
+                pos, entry_price, peak_price = _dir, fill, fill
                 entry_time = dt_index[i]
                 if strategy == 'sar':
-                    sar_value, sar_ep, sar_af, sar_bull = fill - atr14 * sar_sl_mult, fill, sar_af_init, True
+                    sar_value = fill - atr14 * sar_sl_mult * _dir
+                    sar_ep, sar_af, sar_bull = fill, sar_af_init, _dir > 0
         elif c_low <= target_short:
-            if ma_line is not None and (i < 1 or np.isnan(ma_line[i - 1]) or closes[i - 1] > ma_line[i - 1]):
-                continue          # 이평선 위에서는 SHORT 금지
+            if ma_line is not None and i >= 1 and not np.isnan(ma_line[i - 1]):
+                _below = closes[i - 1] <= ma_line[i - 1]
+                if (not _below) != bool(ma_filter_invert):
+                    continue      # 이평선 위에서는 SHORT 금지 (invert면 아래에서 금지)
+            elif ma_line is not None:
+                continue
             if ma_slope is not None and (i < 1 or np.isnan(ma_slope[i - 1]) or ma_slope[i - 1] > -ma_slope_min):
                 continue          # 이평선이 충분히 하락 중이 아니면 SHORT 금지
             open_gap = max(target_short - c_open, 0.0)
@@ -458,11 +494,14 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
             elif use_squeeze_filter and strategy == 'sar' and not np.isnan(bb_mid[i - 1]) and closes[i - 1] >= bb_mid[i - 1]:
                 continue
             elif reentry_ok(-1, target_short):
-                fill = (min(c_open, target_short) - SLIP_ENTRY) if realistic_gap_fill else (target_short - SLIP_ENTRY)
-                pos, entry_price, peak_price = -1, fill, fill
+                _lvl = min(c_open, target_short) if realistic_gap_fill else target_short
+                _dir = 1 if reverse_entry else -1
+                fill = _lvl + SLIP_ENTRY * _dir
+                pos, entry_price, peak_price = _dir, fill, fill
                 entry_time = dt_index[i]
                 if strategy == 'sar':
-                    sar_value, sar_ep, sar_af, sar_bull = fill + atr14 * sar_sl_mult, fill, sar_af_init, False
+                    sar_value = fill - atr14 * sar_sl_mult * _dir
+                    sar_ep, sar_af, sar_bull = fill, sar_af_init, _dir > 0
 
     total = len(pnls)
     if total == 0:
