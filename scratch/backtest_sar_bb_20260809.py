@@ -25,7 +25,13 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                            entry_end_hour=None, entry_end_minute=0,
                            force_close_hour=8, force_close_minute=45, force_close_window_min=10,
                            commission_rate=0.000065,
-                           slip_entry_pt=1.5, slip_exit_sl_pt=3.0, slip_exit_normal_pt=0.5, slip_exit_force_pt=2.0,
+                           # [2026-08-11] 실측 반영. 종전 1.5/3.0/0.5/2.0은 근거 없는 가정이었고,
+                           # ERA 로그의 주문가 대비 체결가 6,767건 실측은 평균 -0.004pt / 중앙값 0.000이었다
+                           # (scratch/measure_real_slippage_20260811.py). 실측 0이 아니라 0.25를 쓰는 이유는
+                           # ① 전 구간 모의투자라 하한값이고 ② 워크포워드 OOS가 정확히 0.25pt에서 손익분기여서
+                           # 기본값이 "여기를 넘으면 손실" 기준선 역할을 하기 때문. 결론 전 0.5pt로 스트레스할 것.
+                           # 커밋 ff74807이 bqa/kalman_backtester.py만 고치고 이 파일을 빠뜨렸다.
+                           slip_entry_pt=0.25, slip_exit_sl_pt=0.25, slip_exit_normal_pt=0.25, slip_exit_force_pt=0.25,
                            realistic_gap_fill=True, gap_guard_mult=None,
                            reentry_pullback_mult=0.5, reentry_breakout_mult=0.2,
                            sar_af_init=0.02, sar_af_step=0.02, sar_af_max=0.20,
@@ -33,6 +39,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                            bb_window=20, bb_sigma=2.0, bb_trail_std_mult=1.5, bb_trail_exit_mult=0.5,
                            squeeze_window=100, squeeze_quantile=0.25, use_squeeze_filter=True,
                            entry_target_mode='kalman_band', breakout_k=0.2,
+                           use_intraday_atr_for_sl=False, sl_hard_cap_pt=None,
                            ma_filter_period=None, allow_overnight=False,
                            regime_filter_enabled=False,
                            time_stop_enabled=False, time_stop_minutes=10.0, time_stop_mfe_pt=4.0,
@@ -65,15 +72,36 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
             P_atr = (1 - K_atr) * P_atr
         kf_atr_path[j] = kf_atr
     daily['range'] = daily['high'] - daily['low']
-    atr_map, prev_range_map = {}, {}
+
+    # [2026-08-11] 일중 ATR. 기존 atr14는 일봉 TR(=오버나잇 갭 포함) 기반인데, 이 전략은
+    # 매일 15:35에 전량 청산해 갭을 감수하지 않으므로 손절폭 산출에 쓰기엔 horizon이 맞지
+    # 않는다. 갭을 뺀 일중 레인지(H-L)에 같은 칼만 평활을 적용한 계열을 따로 만든다.
+    # atr_cutoff 게이트는 계속 기존 atr14를 쓴다(용도가 다름 — 국면 필터).
+    # 미래참조 방지: atr_map과 완전히 동일하게 '전일까지'(kf_rng_path[i-1])만 참조한다.
+    kf_rng_path = np.empty(len(daily))
+    kf_r_, P_r, Q_r, R_r = None, 1.0, 0.002, 0.2
+    for j, rng_val in enumerate(daily['range'].values):
+        if kf_r_ is None:
+            kf_r_ = rng_val
+        else:
+            P_r = P_r + Q_r
+            K_r = P_r / (P_r + R_r)
+            kf_r_ = kf_r_ + K_r * (rng_val - kf_r_)
+            P_r = (1 - K_r) * P_r
+        kf_rng_path[j] = kf_r_
+
+    atr_map, prev_range_map, intraday_atr_map = {}, {}, {}
     day_list = daily['date_day'].tolist()
     for i, dkey in enumerate(day_list):
         if i == 0:
             atr_map[dkey] = 2.0
+            intraday_atr_map[dkey] = 2.0
             prev_range_map[dkey] = 0.0
         else:
             v = kf_atr_path[i - 1]
             atr_map[dkey] = float(v) if pd.notna(v) and v > 0 else 2.0
+            vr = kf_rng_path[i - 1]
+            intraday_atr_map[dkey] = float(vr) if pd.notna(vr) and vr > 0 else 2.0
             prev_range_map[dkey] = float(daily['range'].iloc[i - 1])
 
     bucket60 = (df.index.astype('datetime64[ns]').astype(np.int64) // 10**9 // (trend_bar_minutes * 60))
@@ -94,6 +122,15 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
 
     SLIP_ENTRY, SLIP_EXIT_SL = slip_entry_pt, slip_exit_sl_pt
     SLIP_EXIT_NORMAL, SLIP_EXIT_FORCE = slip_exit_normal_pt, slip_exit_force_pt
+
+    # [2026-08-11] 손절폭 산출 전용 헬퍼. use_intraday_atr_for_sl=False, sl_hard_cap_pt=None이면
+    # 기존 식(max(atr14*mult, 2.0))과 100% 동일하다. 되돌리려면 이 함수와 두 호출부를 원복.
+    def _sl_limit(mult_):
+        base = intraday_atr if use_intraday_atr_for_sl else atr14
+        v = max(base * mult_, 2.0)
+        if sl_hard_cap_pt is not None:
+            v = min(v, sl_hard_cap_pt)
+        return v
 
     cap = float(INIT_CAPITAL)
     equity, pnls, wins = [cap], [], 0
@@ -129,6 +166,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
             day_high, day_low = highs[i], lows[i]
             day_open = opens[i]          # 돌파 타점(entry_target_mode='breakout')용
             atr14 = atr_map.get(day_key, 2.0)
+            intraday_atr = intraday_atr_map.get(day_key, 2.0)   # [2026-08-11] 손절폭 전용
             prev_range = prev_range_map.get(day_key, 0.0)
             consec_losses = 0
             last_long_exit, last_short_exit = 0.0, 0.0
@@ -219,7 +257,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                         if c_close > sar_ep:
                             sar_ep = c_close
                             sar_af = min(sar_af + sar_af_step, sar_af_max)
-                        sl_limit = max(atr14 * sar_sl_mult, 2.0)   # [2026-08-11] 배수 파라미터화
+                        sl_limit = _sl_limit(sar_sl_mult)   # [2026-08-11] 일중ATR/절대캡 반영
                         if force_close or vol_force_close:
                             exit_price, is_force = c_close, True
                         elif c_low <= sar_value or pnl_pt <= -sl_limit:
@@ -227,7 +265,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                         elif ts_fire:
                             exit_price = c_close
                     else:
-                        sl_limit = max(atr14 * sar_sl_mult, 2.0)   # [2026-08-11] 배수 파라미터화
+                        sl_limit = _sl_limit(sar_sl_mult)   # [2026-08-11] 일중ATR/절대캡 반영
                         if force_close or vol_force_close:
                             exit_price, is_force = c_close, True
                         elif pnl_pt <= -sl_limit:
@@ -235,8 +273,12 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                         elif ts_fire:
                             exit_price = c_close
                 elif strategy == 'bb':
-                    sl_limit = max(atr14 * 1.2, 2.0)
-                    bb_tp = bb_upper[i]
+                    sl_limit = _sl_limit(1.2)   # [2026-08-11] 일중ATR/절대캡 반영
+                    # [2026-08-11 미래참조 제거] bb_upper[i]는 당봉 종가까지 포함해 만든 밴드다.
+                    # 그걸 당봉 고가(c_high)와 비교하면, 봉이 끝나야 알 수 있는 값으로 봉 도중의
+                    # 체결을 판정하는 미래참조가 된다. 직전 완결봉 기준으로 옮긴다
+                    # (ma_line[i-1]/closes[i-1]과 같은 관례). 되돌리려면 [i-1]을 [i]로.
+                    bb_tp = bb_upper[i - 1]
                     max_pnl_pt = peak_price - entry_price
                     if force_close or vol_force_close:
                         exit_price, is_force = c_close, True
@@ -258,7 +300,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                         if c_close < sar_ep:
                             sar_ep = c_close
                             sar_af = min(sar_af + sar_af_step, sar_af_max)
-                        sl_limit = max(atr14 * sar_sl_mult, 2.0)   # [2026-08-11] 배수 파라미터화
+                        sl_limit = _sl_limit(sar_sl_mult)   # [2026-08-11] 일중ATR/절대캡 반영
                         if force_close or vol_force_close:
                             exit_price, is_force = c_close, True
                         elif c_high >= sar_value or pnl_pt <= -sl_limit:
@@ -266,7 +308,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                         elif ts_fire:
                             exit_price = c_close
                     else:
-                        sl_limit = max(atr14 * sar_sl_mult, 2.0)   # [2026-08-11] 배수 파라미터화
+                        sl_limit = _sl_limit(sar_sl_mult)   # [2026-08-11] 일중ATR/절대캡 반영
                         if force_close or vol_force_close:
                             exit_price, is_force = c_close, True
                         elif pnl_pt <= -sl_limit:
@@ -274,8 +316,9 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                         elif ts_fire:
                             exit_price = c_close
                 elif strategy == 'bb':
-                    sl_limit = max(atr14 * 1.2, 2.0)
-                    bb_tp = bb_lower[i]
+                    sl_limit = _sl_limit(1.2)   # [2026-08-11] 일중ATR/절대캡 반영
+                    # [2026-08-11 미래참조 제거] LONG 쪽과 동일한 이유(위 주석 참조).
+                    bb_tp = bb_lower[i - 1]
                     max_pnl_pt = entry_price - peak_price
                     if force_close or vol_force_close:
                         exit_price, is_force = c_close, True
@@ -287,6 +330,30 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                         exit_price = max(c_close, min(peak_price + bb_trail_exit_mult * std_error, c_high))
 
             if exit_price is not None:
+                # [2026-08-11 추가] 청산 사유 분류. 손익 계산에는 일절 관여하지 않고
+                # return_trades=True일 때 trade_log에만 기록한다(미래참조 수정 전후의
+                # 청산 사유 분포를 대조하기 위해 필요). 위 분기에서 이미 확정된 지역변수만
+                # 재사용하므로 전략 로직은 바뀌지 않는다. 되돌리려면 이 블록과
+                # trade_log의 'reason' 항목을 삭제.
+                if is_force:
+                    exit_reason = '강제청산'
+                elif strategy == 'sar':
+                    if pos == 1 and sar_bull and c_low <= sar_value:
+                        exit_reason = 'SAR역전'
+                    elif pos == -1 and (not sar_bull) and c_high >= sar_value:
+                        exit_reason = 'SAR역전'
+                    elif pnl_pt <= -sl_limit:
+                        exit_reason = '손절'
+                    else:
+                        exit_reason = '타임스톱'
+                else:
+                    if pnl_pt <= -sl_limit:
+                        exit_reason = '손절'
+                    elif (not np.isnan(bb_tp) and bb_tp > 0 and
+                          ((pos == 1 and c_high >= bb_tp) or (pos == -1 and c_low <= bb_tp))):
+                        exit_reason = 'BB익절'
+                    else:
+                        exit_reason = '트레일링'
                 exit_slip = SLIP_EXIT_FORCE if is_force else (SLIP_EXIT_SL if (exit_price < entry_price) == (pos == 1) else SLIP_EXIT_NORMAL)
                 raw_pnl = (exit_price - entry_price) if pos == 1 else (entry_price - exit_price)
                 commission_cost = entry_price * point_value * commission_rate * 2
@@ -307,7 +374,8 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                     trade_log.append({'entry_time': entry_time, 'exit_time': dt_index[i],
                                        'direction': 'LONG' if pos == 1 else 'SHORT',
                                        'entry_price': entry_price, 'exit_price': exit_price,
-                                       'pnl_pt': raw_pnl - exit_slip, 'is_force': is_force})
+                                       'pnl_pt': raw_pnl - exit_slip, 'is_force': is_force,
+                                       'reason': exit_reason})
                 pos, entry_price, peak_price = 0, 0.0, 0.0
             continue
 
@@ -334,9 +402,15 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                 continue
             elif regime_filter_enabled and trend != "UP":
                 continue
-            elif use_squeeze_filter and strategy == 'sar' and not np.isnan(squeeze_limit[i]) and bandwidth[i] < squeeze_limit[i]:
+            # [2026-08-11 미래참조 제거] bandwidth/squeeze_limit/bb_mid는 당봉 종가까지 포함해
+            # 만든 값이다. 진입은 당봉 고가가 target_long을 치는 순간 일어나므로, 그 시점엔
+            # 아직 당봉 종가를 알 수 없다 → 직전 완결봉 기준으로 옮긴다. 중심선 방향 판정도
+            # 당봉 종가(c_close) 대신 직전봉 종가(closes[i-1])와 비교해 이평선 필터
+            # (ma_line[i-1]/closes[i-1])와 같은 관례로 통일한다. 되돌리려면 [i-1]을 [i]로,
+            # closes[i-1]을 c_close로.
+            elif use_squeeze_filter and strategy == 'sar' and not np.isnan(squeeze_limit[i - 1]) and bandwidth[i - 1] < squeeze_limit[i - 1]:
                 continue
-            elif use_squeeze_filter and strategy == 'sar' and not np.isnan(bb_mid[i]) and c_close <= bb_mid[i]:
+            elif use_squeeze_filter and strategy == 'sar' and not np.isnan(bb_mid[i - 1]) and closes[i - 1] <= bb_mid[i - 1]:
                 continue
             elif reentry_ok(1, target_long):
                 fill = (max(c_open, target_long) + SLIP_ENTRY) if realistic_gap_fill else (target_long + SLIP_ENTRY)
@@ -354,9 +428,10 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                 continue
             elif regime_filter_enabled and trend != "DOWN":
                 continue
-            elif use_squeeze_filter and strategy == 'sar' and not np.isnan(squeeze_limit[i]) and bandwidth[i] < squeeze_limit[i]:
+            # [2026-08-11 미래참조 제거] LONG 쪽과 동일한 이유(위 주석 참조).
+            elif use_squeeze_filter and strategy == 'sar' and not np.isnan(squeeze_limit[i - 1]) and bandwidth[i - 1] < squeeze_limit[i - 1]:
                 continue
-            elif use_squeeze_filter and strategy == 'sar' and not np.isnan(bb_mid[i]) and c_close >= bb_mid[i]:
+            elif use_squeeze_filter and strategy == 'sar' and not np.isnan(bb_mid[i - 1]) and closes[i - 1] >= bb_mid[i - 1]:
                 continue
             elif reentry_ok(-1, target_short):
                 fill = (min(c_open, target_short) - SLIP_ENTRY) if realistic_gap_fill else (target_short - SLIP_ENTRY)
