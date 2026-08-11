@@ -916,12 +916,53 @@ class ERAOrderManager:
             print(f"[주간선물] 금일 고/저가 DB 조회 실패: {e}")
         return 0.0, 0.0
 
+    def _invalidate_filter_state(self, why):
+        """이평선·BB 필터 값을 무효화한다.
+
+        (2026-08-11) update_bb_psar_filters가 데이터 부족으로 조기 return하면 직전
+        계산값이 그대로 남아 있었다. 월물이 바뀌면 새 코드의 5분봉이 120개 쌓일 때까지
+        이 상태가 이어지므로, 이전 월물로 계산한 MA200과 BB로 진입 방향을 판단하게 된다.
+        어제까지는 아무도 안 읽던 값이었으나, 이평선 필터를 진입 게이트에 연결한 뒤로는
+        실제 매매에 영향을 준다.
+
+        무효화하면 진입 게이트가 이평선 조건을 건너뛰고(값이 None), BB 스퀴즈 조건도
+        current_bb_mid > 0 이 거짓이 되어 통과한다 — 즉 필터가 없는 상태로 되돌아갈 뿐
+        거래를 막지는 않는다. 낡은 값으로 잘못된 방향을 고르는 것보다 낫다고 판단.
+        """
+        self.futures_ma_filter_value = None
+        self.futures_ma_filter_close = None
+        self.current_bb_mid = 0.0
+        self.current_bb_bandwidth = 0.0
+        self.current_bb_squeeze_limit = 0.0
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        if getattr(self, "_filter_fail_date", None) != today:
+            self._filter_fail_date = today
+            self._filter_fail_count = 0
+            self._filter_fail_alerted = False
+        self._filter_fail_count = getattr(self, "_filter_fail_count", 0) + 1
+        print("[ERA BB 필터] 갱신 실패(%s) — 이평선·BB 값 무효화 (당일 %d회)"
+              % (why, self._filter_fail_count))
+
+        # 5분봉 경계마다 호출되므로 12회면 약 1시간. 롤오버 직후의 일시적 부족과
+        # 데이터 공급이 끊긴 상태를 구분하려는 문턱이다.
+        if self._filter_fail_count == 12 and not getattr(self, "_filter_fail_alerted", False):
+            self._filter_fail_alerted = True
+            msg = ("이평선·BB 필터 갱신이 12회 연속 실패했습니다 (사유: %s)." % why
+                   + chr(10) + "월물 교체 직후라면 데이터가 쌓이며 자연 복구되지만, "
+                   "계속되면 구독 코드나 데이터 공급을 확인해야 합니다."
+                   + chr(10) + "그동안 방향 필터 없이 매매합니다.")
+            print("[ERA BB 필터] " + msg)
+            if notifier:
+                notifier.send_message("<b>[선물 필터 갱신 실패]</b>" + chr(10) + msg)
+
     def update_bb_psar_filters(self, code):
         """실시간 선물 데이터에서 볼린저 밴드 중심선 및 Squeeze 필터 변수 업데이트"""
         try:
             import pandas as pd
             import numpy as np
             if not os.path.exists(self.futures_db_path):
+                self._invalidate_filter_state("DB 파일 없음")
                 return
             conn = sqlite3.connect(self.futures_db_path, timeout=30)
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -935,6 +976,7 @@ class ERAOrderManager:
             conn.close()
 
             if df.empty or len(df) < 120:
+                self._invalidate_filter_state("%s 봉 %d개 (<120)" % (code, len(df)))
                 return
             
             df = df.iloc[::-1].reset_index(drop=True) # 과거에서 최근 순으로 정렬
@@ -5308,6 +5350,33 @@ class ERAOrderManager:
         if getattr(self, lock_attr):
             return
         setattr(self, lock_attr, True)
+
+        # (2026-08-11) 진입 락 타임아웃.
+        # 이 락을 푸는 곳은 체결 콜백과 08:40 일일 리셋뿐이었다. 체결 콜백을 한 번
+        # 놓치면 다음 날 아침까지 진입이 통째로 죽는데, 오류도 경보도 없어 어제 겪은
+        # std_error 무음 차단과 같은 형태가 된다.
+        # 30초 뒤에도 락이 걸려 있으면 계좌를 다시 조회해 실제 포지션을 확인한 뒤 푼다.
+        # 포지션이 잡혀 있으면 체결은 됐고 콜백만 유실된 것이므로 그대로 두고,
+        # 없으면 주문이 성립하지 않은 것이므로 락을 풀어 다음 기회를 살린다.
+        def _release_stale_lock(_attr=lock_attr, _key=pos_key):
+            if not getattr(self, _attr, False):
+                return
+            has_pos = bool(self.futures_positions.get(_key, {}).get("qty", 0))
+            if has_pos:
+                print("[선물 주문락] 30초 경과 — 포지션이 확인되어 락을 유지합니다 (%s)" % _attr)
+                return
+            setattr(self, _attr, False)
+            msg = ("주문 락이 30초간 풀리지 않아 해제했습니다 (%s)." % _attr
+                   + chr(10) + "체결 콜백이 유실된 것으로 보이며, 계좌 조회에 포지션이 "
+                   "없어 주문 미성립으로 판단했습니다.")
+            print("[선물 주문락] " + msg)
+            if notifier:
+                notifier.send_message("<b>[선물 주문락 자동 해제]</b>" + chr(10) + msg)
+
+        try:
+            QTimer.singleShot(30000, _release_stale_lock)
+        except Exception as _lock_err:
+            print("[선물 주문락] 타임아웃 등록 실패: %s" % _lock_err)
 
         # ord_kind: 1: 신규 (청산도 신규 주문종류로 전송해야 함), 2: 정정, 3: 취소
         # slby_tp: "1": 매도, "2": 매수
