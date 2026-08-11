@@ -24,6 +24,35 @@ DB_PATH = os.path.join(current_dir, "futures_data.db")
 CONFIG_PATH = os.path.join(current_dir, "config", "active_strategy.json")
 AUTO_RECONNECT_BAT = os.path.join(current_dir, "era", "auto_reconnect_era.bat")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# (2026-08-11) 자동 전략 전환 차단 스위치.
+#
+# False면 ADX/BB Width 판정, 콘솔 로그, 텔레그램 알림은 **그대로 전부 수행**하고,
+# 아래 두 가지 '실행' 부작용만 차단한다:
+#
+#   (1) save_active_strategy() — config/active_strategy.json에 futures_strategy_type을
+#       써 넣는 것. 이 키가 한 번 기록되면 era_order_manager.py:1394-1395의 설정
+#       우선순위(config.json → config_local.json → active_strategy.json)상
+#       config_local.json의 수동 설정(parabolic_sar)을 영구히 덮어쓴다. 사용자가
+#       config_local.json을 고쳐도 엔진에는 반영되지 않는 상태가 된다.
+#
+#   (2) run_reconnect_script() — era/auto_reconnect_era.bat 실행(ERA 엔진 강제 재기동).
+#       이 배치는 포지션 보유 여부를 전혀 확인하지 않고 taskkill /f 후 60초를 대기하므로,
+#       포지션 보유 중 전환이 걸리면 그 구간 손절/트레일링 감시가 통째로 멈춘다. 게다가
+#       재기동 후 SAR 내부상태(sar_value/sar_ep/sar_af/sar_bull)는 futures_exit_state.json에
+#       저장되지 않아 복원되지 않는다 — 특히 SHORT 보유 중이면 sar_bull이 True로
+#       초기화되어 SAR 트레일링이 죽은 채 재개된다.
+#
+# 또한 전환 대상인 bollinger_band 전략은 현재 std_error가 갱신되지 않아 진입 게이트
+# (min_std_error_entry=1.5)에 전량 차단되므로, 전환되는 즉시 거래가 0건이 된다.
+#
+# 근거: 선물_전략_전수_종합분석_및_개선안_20260811.md (C-3, C-4, H-4)
+#
+# 되돌리는 법: 아래 값을 True로 바꾸기만 하면 종전 동작과 100% 동일해진다.
+#              (이 파일의 다른 로직은 일절 변경하지 않았음)
+AUTO_SWITCH_ENABLED = False
+# ─────────────────────────────────────────────────────────────────────────────
+
 def load_active_strategy():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -110,6 +139,90 @@ def calculate_metrics(until_date_str=None):
     latest = daily.iloc[-1]
     return float(latest['adx']), float(latest['bb_w'])
 
+# ─────────────────────────────────────────────────────────────────────────────
+# (2026-08-11) 포지션 보유 중 엔진 재기동 차단 가드.
+#
+# auto_reconnect_era.bat은 포지션 유무를 전혀 확인하지 않고 taskkill /f 후 60초를
+# 대기한다. 보유 중 전환이 걸리면 (1) 그 구간 손절/트레일링 감시가 통째로 멈추고,
+# (2) 재기동 후 SAR 내부상태(sar_value/ep/af/bull)가 복원되지 않으며,
+# (3) 진입 규칙과 다른 전략의 청산 규칙이 그 포지션에 적용된다.
+#
+# 이 가드는 AUTO_SWITCH_ENABLED와 **독립적으로** 동작한다 — 나중에 자동 전환을
+# 다시 켜더라도 포지션 보유 중에는 재기동이 일어나지 않는다(다중 방어).
+#
+# 판정 소스: ERA가 내보내는 tca/system_status_*.json의 futures_positions.
+#   - era/futures_exit_state.json은 포지션 정보 자체가 없고 day_peak도 청산 시
+#     저장되지 않아 신뢰할 수 없다(실측: day_peak=0.0인데 파일은 2시간째 정체).
+#   - 상태 파일은 잔고 동기화 TR(장중 약 10초 주기)과 **모든 체결 콜백**에서 갱신된다.
+#     신규 진입은 반드시 체결 콜백을 거치므로, 파일이 다소 오래됐더라도
+#     futures_positions가 비어 있으면 "그 이후 체결이 없었다"는 뜻이라 안전하다.
+#   - 읽기 실패/파일 없음은 '확인 불가'로 보고 **포지션이 있다고 간주**한다(안전측).
+#
+# 되돌리려면: 아래 두 함수를 삭제하고, 전환 실행부의 `if _defer_switch_if_position_open(...)`
+#             블록 2곳(perform_morning_analysis / perform_intraday_check)을 지우면 된다.
+STATUS_CANDIDATES = [
+    os.path.join(current_dir, "tca", "system_status_futures.json"),
+    os.path.join(current_dir, "tca", "system_status.json"),
+]
+
+# 연기 알림 throttle. intraday_switched를 세우지 않고 5분마다 재시도하므로,
+# 알림까지 5분마다 보내면 스팸이 된다. 연기 자체는 매번 수행하고 알림만 제한한다.
+_DEFER_ALERT_MIN_INTERVAL_SEC = 1800
+_last_defer_alert_ts = 0.0
+
+
+def get_open_futures_positions():
+    """(positions, source_path, last_updated) 반환.
+    positions가 None이면 '확인 불가' — 호출부는 포지션이 있다고 간주해야 한다."""
+    newest = None
+    for path in STATUS_CANDIDATES:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            return None, path, f"읽기 실패({e})"
+        open_pos = dict(data.get("futures_positions") or {})
+        for k, v in (data.get("isf_positions") or {}).items():
+            open_pos[f"ISF:{k}"] = v
+        if open_pos:
+            return open_pos, path, data.get("last_updated", "?")
+        newest = (path, data.get("last_updated", "?"))
+    if newest is None:
+        return None, "(상태 파일 없음)", "-"
+    return {}, newest[0], newest[1]
+
+
+def _defer_switch_if_position_open(context_label, current_strat, recommended):
+    """포지션 보유(또는 확인 불가)면 True. True면 호출부는 전환을 건너뛰어야 한다."""
+    global _last_defer_alert_ts
+    positions, source, last_updated = get_open_futures_positions()
+    if positions:
+        detail = "\n".join(f"• {k}: {v.get('type')} {v.get('qty')}계약 @ {v.get('price', 0)}"
+                           for k, v in positions.items())
+        reason = f"선물 포지션 보유 중 ({len(positions)}건)\n{detail}"
+    elif positions is None:
+        reason = f"포지션 상태를 확인할 수 없음 ({source})"
+    else:
+        return False
+
+    print(f"[Regime Monitor] ⏸️ {context_label} 전략 전환 연기 — {reason} | 소스={source} ({last_updated})")
+    now_ts = time.time()
+    if now_ts - _last_defer_alert_ts >= _DEFER_ALERT_MIN_INTERVAL_SEC:
+        _last_defer_alert_ts = now_ts
+        send_telegram(
+            f"⏸️ <b>[{context_label} 전략 전환 연기]</b>\n"
+            f"권고: <b>{current_strat} ➔ {recommended}</b>\n"
+            f"사유: {reason}\n"
+            f"포지션 보유 중 엔진 재기동은 손절 감시 공백을 만들기 때문에 수행하지 않습니다.\n"
+            f"포지션이 정리되면 다음 점검 주기에 자동으로 재시도합니다.\n"
+            f"<i>(소스: {os.path.basename(source)}, 갱신 {last_updated})</i>"
+        )
+    return True
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def run_reconnect_script():
     if not os.path.exists(AUTO_RECONNECT_BAT):
         print(f"[Regime Monitor] 재시작 스크립트 없음: {AUTO_RECONNECT_BAT}")
@@ -168,6 +281,22 @@ def perform_morning_analysis():
                f"• 현재 활성 전략: <code>{current_strat}</code>\n"
                
     if recommended and recommended != current_strat:
+        # (2026-08-11) 자동 전환 차단 — 판정/알림은 위에서 이미 끝났고, 여기서
+        # 설정 기록(save_active_strategy)과 엔진 재기동(run_reconnect_script)만 건너뛴다.
+        # 되돌리려면 상단 AUTO_SWITCH_ENABLED를 True로.
+        if not AUTO_SWITCH_ENABLED:
+            msg_body += (f"⏸️ <b>전환 권고 감지: {current_strat} ➔ {recommended}</b>\n"
+                         f"자동 전환이 <b>비활성화</b>되어 있어 실행하지 않습니다 (판정/알림만 수행).\n"
+                         f"현재 전략 <code>{current_strat}</code>이 그대로 유지됩니다.")
+            send_telegram(msg_header + msg_body)
+            return adx
+        # (2026-08-11) 포지션 보유 중이면 설정 기록도 재기동도 하지 않고 연기한다.
+        # AUTO_SWITCH_ENABLED와 독립적으로 동작하는 2차 방어선(상단 가드 주석 참조).
+        if _defer_switch_if_position_open("아침", current_strat, recommended):
+            msg_body += f"⏸️ 전환 권고({current_strat} ➔ {recommended})가 있었으나 " \
+                        f"<b>포지션 보유 중이라 연기</b>했습니다."
+            send_telegram(msg_header + msg_body)
+            return adx
         # 전략 변경 필요
         config["futures_strategy_type"] = recommended
         config["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -214,6 +343,23 @@ def perform_intraday_check(morning_adx, last_adx, intraday_switched):
         current_strat = config.get("futures_strategy_type", "unknown")
         
         if recommended and recommended != current_strat:
+            # (2026-08-11) 자동 전환 차단 — 아침 분석부와 동일한 이유(상단 주석 참조).
+            # intraday_switched를 세워 같은 권고로 5분마다 반복 알림하는 것만 막는다.
+            # 되돌리려면 상단 AUTO_SWITCH_ENABLED를 True로.
+            if not AUTO_SWITCH_ENABLED:
+                send_telegram(
+                    f"⏸️ <b>[장중 전략 전환 권고 — 실행 안 함]</b>\n"
+                    f"• 실시간 ADX: <b>{adx:.2f}</b> ({get_regime_name(adx)})\n"
+                    f"• 권고: <b>{current_strat} ➔ {recommended}</b>\n"
+                    f"자동 전환이 비활성화되어 있어 설정 변경·엔진 재기동을 수행하지 않습니다."
+                )
+                intraday_switched = True
+                return adx, intraday_switched
+            # (2026-08-11) 포지션 보유 중이면 연기. intraday_switched는 **세우지 않는다** —
+            # 포지션이 정리되면 다음 5분 주기에 그대로 재시도되어야 하기 때문.
+            # (알림 스팸은 _defer_switch_if_position_open 내부 throttle로 막는다.)
+            if _defer_switch_if_position_open("장중", current_strat, recommended):
+                return adx, intraday_switched
             config["futures_strategy_type"] = recommended
             config["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if save_active_strategy(config):

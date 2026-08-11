@@ -4762,6 +4762,21 @@ class ERAOrderManager:
                             self.futures_day_entry_std_error = getattr(self, "futures_std_error", 0.5)
                             self.futures_day_entry_atr = getattr(self, "futures_atr_14", 5.0)
                             self.futures_day_entry_tp_price = getattr(self, "futures_tp_price_long", 0.0)
+                            # (2026-08-11) 볼린저 익절 밴드 버퍼를 진입 시점에 리셋.
+                            # bb_close_buf(4233행)는 포지션 보유 중에만 쌓이는데 청산 시 비워지지
+                            # 않아, 직전 포지션의 잔여 20틱으로 만들어진 bb_upper/bb_lower가 새
+                            # 포지션 첫 틱부터 유효했다. 그 상태면 진입 직후 곧바로 밴드를 터치한
+                            # 것으로 판정되어 '진입 → 즉시 익절 → 쿨다운 → 재진입'이 반복될 수 있다
+                            # (2026-07-01 칼만 3-Sigma 즉시 재청산 무한루프와 같은 유형).
+                            # 밴드까지 0으로 내리는 이유: 버퍼만 비우면 20틱이 다시 찰 때까지
+                            # (4236행 조건 미충족) 직전 값이 그대로 살아남는다.
+                            # 0일 때의 안전성: 익절 비교문이 `bb_tp > 0 and ...`(4321/4514행)이라
+                            # 밴드가 0이면 익절 분기를 건너뛰고 폴백 트레일링으로 넘어간다.
+                            # 되돌리려면 이 3줄을 삭제. 현재 운영 전략(parabolic_sar)은 bb_upper/
+                            # bb_lower를 읽지 않으므로(4309/4502행 `elif is_bb:` 내부 전용) 무영향.
+                            self.bb_close_buf = []
+                            self.bb_upper = 0.0
+                            self.bb_lower = 0.0
                             # 추세 확인(LONG인데 trend=UP) 시에만 3-Sigma 목표가를 더 멀리 확대.
                             # 진입 시점에 한 번만 계산해 스냅샷 — 위 무한루프 버그와 동일한 이유로
                             # 보유 중 매 틱마다 재계산하면 안 됨. (2026-07-11 백테스트 검증: trend_tp_sigma_mult=10)
@@ -4827,6 +4842,11 @@ class ERAOrderManager:
                             self.futures_day_entry_std_error = getattr(self, "futures_std_error", 0.5)
                             self.futures_day_entry_atr = getattr(self, "futures_atr_14", 5.0)
                             self.futures_day_entry_tp_price = getattr(self, "futures_tp_price_short", 0.0)
+                            # (2026-08-11) 볼린저 익절 밴드 버퍼 리셋 — LONG 쪽과 동일한 이유
+                            # (위 LONG 진입부 주석 참조). 되돌리려면 이 3줄을 삭제.
+                            self.bb_close_buf = []
+                            self.bb_upper = 0.0
+                            self.bb_lower = 0.0
                             # 추세 확인(SHORT인데 trend=DOWN) 시에만 3-Sigma 목표가를 더 멀리 확대(LONG과 동일 원리)
                             trend_tp_mult = getattr(self, "futures_trend_tp_sigma_mult", None)
                             if trend_tp_mult is not None and is_kalman and trend == "DOWN":
