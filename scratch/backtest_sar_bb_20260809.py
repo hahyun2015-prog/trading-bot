@@ -41,6 +41,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                            entry_target_mode='kalman_band', breakout_k=0.2,
                            use_intraday_atr_for_sl=False, sl_hard_cap_pt=None,
                            ma_filter_period=None, allow_overnight=False,
+                           daily_loss_limit_pt=None,
                            regime_filter_enabled=False,
                            time_stop_enabled=False, time_stop_minutes=10.0, time_stop_mfe_pt=4.0,
                            return_trades=False):
@@ -142,6 +143,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
     target_long, target_short = np.inf, -np.inf
     std_error, trend, atr14, prev_range = 0.5, "NEUTRAL", 2.0, 0.0
     consec_losses = 0
+    daily_loss_pt = 0.0
     sar_value, sar_ep, sar_af, sar_bull = 0.0, 0.0, sar_af_init, True
 
     def reentry_ok(direction, price):
@@ -169,6 +171,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
             intraday_atr = intraday_atr_map.get(day_key, 2.0)   # [2026-08-11] 손절폭 전용
             prev_range = prev_range_map.get(day_key, 0.0)
             consec_losses = 0
+            daily_loss_pt = 0.0          # 당일 누적 손실(pt, 양수=손실)
             last_long_exit, last_short_exit = 0.0, 0.0
         else:
             day_high = max(day_high, highs[i])
@@ -366,6 +369,13 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                     consec_losses += 1
                 else:
                     consec_losses = 0
+                # 일일 손실 누적 — 라이브(_execute_futures_direct)와 같은 방식으로
+                # 이익이 나면 차감한다. pt 단위이며 15계약 환산 한도와 비교한다.
+                _net_pt = (raw_pnl - exit_slip)
+                if _net_pt < 0:
+                    daily_loss_pt += -_net_pt
+                else:
+                    daily_loss_pt = max(0.0, daily_loss_pt - _net_pt)
                 if pos == 1:
                     last_long_exit = exit_price
                 else:
@@ -385,6 +395,8 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
             continue
         if consec_losses >= consecutive_loss_limit:
             continue
+        if daily_loss_limit_pt is not None and daily_loss_pt >= daily_loss_limit_pt:
+            continue          # 일일 손실 한도 — 신규 진입만 차단(청산은 위에서 이미 처리)
         if atr14 < atr_cutoff:
             continue
         if std_error < min_std_error_entry:
