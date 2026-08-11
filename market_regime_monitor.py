@@ -245,12 +245,24 @@ def get_regime_name(adx):
         return "중립장 (Neutral)"
 
 def get_recommended_strategy(adx):
+    # (2026-08-11) 박스권(adx<20) 대안을 공석으로 둔다.
+    # 종전에는 bollinger_band를 반환했으나, BB를 제대로 된 평균회귀로 재설계해
+    # 48개 변형을 측정한 결과 전체기간 PF 1.0을 넘은 것이 하나도 없었다
+    # (최선 엣지 0.121pt vs 왕복비용 0.63pt). "저변동 구간이 평균회귀의 서식지"라는
+    # 가설도 기각됐다 — 조용한 구간이 모든 변형에서 가장 나빴다.
+    # 없는 것보다 손실 나는 전략을 배정하는 쪽이 더 위험하다.
+    #
+    # None을 반환하면 기존 전략(parabolic_sar)이 유지된다. SAR의 atr_cutoff=15가
+    # 저변동 구간 진입을 이미 막으므로, 박스권에서는 자연히 거래를 쉬는 쪽으로 수렴한다.
+    #
+    # AUTO_SWITCH_ENABLED=False로도 막혀 있지만, 스위치 하나에만 의존하지 않도록
+    # 전환 대상 자체에서 지운다. 대안이 필요하면 신호 엣지를 먼저 측정한 새 후보를
+    # 찾아야 하며, 그전까지 비워두는 것이 정직한 상태다.
+    # 상세: 선물_전략전수분석_및_사이징검증_종합_20260811.md §4.7
     if adx > 25:
         return "parabolic_sar"
-    elif adx < 20:
-        return "bollinger_band"
     else:
-        return None  # Neutral 상태는 변경 안 함
+        return None  # 박스권·중립 모두 현행 전략 유지
 
 def send_telegram(msg):
     print(f"[Telegram Notification] {msg}")

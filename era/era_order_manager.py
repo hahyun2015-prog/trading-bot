@@ -518,6 +518,13 @@ class ERAOrderManager:
         self._night_reset_done_date = ""   # 05:00 야간 리셋 중복 실행 방지
         self._night_start_done_date = ""   # 18:00 야간 세션 시작 중복 실행 방지
         self.futures_day_consecutive_losses = 0
+        # (2026-08-11) 선물 일일 손실 서킷브레이커. 주식은 stock_daily_loss로 같은 장치를
+        # 갖고 있었으나 선물에는 금액 기준 한도가 전혀 없었다 — 연속손절 횟수 제한만 있어
+        # 한 번에 크게 맞는 경우를 막지 못했다. 예수금 대비 %로 잡고, 초과 시
+        # **신규 진입만** 차단한다(청산·트레일링은 계속 동작해야 하므로 건드리지 않는다).
+        self.futures_daily_loss = 0.0          # 당일 실현손실 누적(원, 양수=손실)
+        self.futures_daily_halted = False
+        self.futures_daily_loss_limit_pct = 0.03
         self.futures_night_consecutive_losses = 0
         self.futures_consecutive_loss_limit = 5  # 이 횟수만큼 연속 손실 시 당일 신규진입 정지 (2026-07-07: 3회는 시뮬레이션상 초반 손실 클러스터에 과민 반응해 순손익 악화 확인, 5회로 완화)
         self.futures_day_trade_count = 0
@@ -1306,6 +1313,7 @@ class ERAOrderManager:
             self.futures_reentry_cooldown_sec = float(futures_settings.get("reentry_cooldown_sec", 0.0))  # 청산 후 같은 방향 재진입 최소 대기시간(초, 0=비활성)
             self.futures_consecutive_loss_limit = int(futures_settings.get("consecutive_loss_limit", 5))
             self.futures_min_std_error_entry = float(futures_settings.get("min_std_error_entry", 0.0))
+            self.futures_daily_loss_limit_pct = float(futures_settings.get("daily_loss_limit_pct", 0.03))
             # ── (2026-07-30 도입) 레짐필터 + 이익보전 (샹들리에 전용) ──────────────────────
             # 백테스트(bqa 30,950봉, 레짐+이익보전+진입임계1.5): 승률 56%→82%, PF 4.2→13.6,
             # MDD 27.7%→8.6%, 최악단일손실 -77.7pt→-28.6pt. 표준코스피200·최근장에서도 동일 방향 개선.
@@ -1836,6 +1844,8 @@ class ERAOrderManager:
             self.futures_last_short_exit_price = 0.0
             self.futures_last_short_exit_time = 0.0
             self.futures_day_consecutive_losses = 0
+            self.futures_daily_loss = 0.0
+            self.futures_daily_halted = False
             self.futures_day_trade_count = 0
             self.ohlcv_buffer.clear()
             # (2026-08-04) 틱 이상치 거부 스트릭도 함께 초기화한다. ohlcv_buffer만 비우면
@@ -4659,10 +4669,20 @@ class ERAOrderManager:
             is_unlimited = getattr(self, "futures_strategy_type", "") in ["parabolic_sar", "bollinger_band", "kalman", "chandelier"]
             if not is_unlimited and self.futures_day_trade_count >= self.futures_max_trades_day:
                 return
-            # 칼만/샹들리에는 무제한 거래 중에도 연속 손실 N회 시 즉시 당일 거래 정지
-            is_kalman = (getattr(self, "futures_strategy_type", "") == "kalman")
-            is_chandelier = (getattr(self, "futures_strategy_type", "") == "chandelier")
-            if (is_kalman or is_chandelier) and getattr(self, "futures_day_consecutive_losses", 0) >= self.futures_consecutive_loss_limit:
+            # 연속 손실 N회 시 즉시 당일 거래 정지
+            # (2026-08-11) 전 전략 공통으로 바꿨다. 종전에는 kalman/chandelier에만 걸려
+            # SAR·BB는 연속 손실이 몇 번이든 계속 진입했다. 백테스트는 전략과 무관하게
+            # consecutive_loss_limit을 적용하고 있었으므로, 이 제한을 없애는 쪽이
+            # 라이브-백테스트 정합에도 맞는다(백테스트 대비 거래수가 줄어드는 방향).
+            if getattr(self, "futures_day_consecutive_losses", 0) >= self.futures_consecutive_loss_limit:
+                self._note_entry_block("연속손절", f"{getattr(self, 'futures_day_consecutive_losses', 0)}회 >= {self.futures_consecutive_loss_limit}회")
+                return
+            # (2026-08-11) 일일 손실 서킷브레이커. 횟수가 아니라 금액으로 바닥을 만든다 —
+            # 연속손절 한도만으로는 한 번에 크게 맞는 경우를 못 막는다.
+            # 신규 진입만 차단하고 청산·트레일링은 위쪽에서 이미 처리되므로 영향 없다.
+            if getattr(self, "futures_daily_halted", False):
+                self._note_entry_block("일일손실한도",
+                                       f"당일손실 {getattr(self, 'futures_daily_loss', 0):,.0f}원 >= 한도 {self._futures_daily_loss_limit_won():,.0f}원")
                 return
             # (2026-07-21 추가) 09:00 정각 개장은 실시간 시세 폭주 + 통신 끊김 하드 리셋이
             # 반복 재현되는 구간(2026-07-14/15/16/20/21 확인)이자, KIS 야간데이터 병합이 구조적으로
@@ -5176,10 +5196,13 @@ class ERAOrderManager:
             is_unlimited = getattr(self, "futures_strategy_type", "") in ["parabolic_sar", "bollinger_band", "kalman", "chandelier"]
             if not is_unlimited and self.futures_night_trade_count >= self.futures_max_trades_night:
                 return
-            # 칼만/샹들리에는 무제한 거래 중에도 연속 손실 N회 시 즉시 당일 거래 정지
-            is_kalman = (getattr(self, "futures_strategy_type", "") == "kalman")
-            is_chandelier = (getattr(self, "futures_strategy_type", "") == "chandelier")
-            if (is_kalman or is_chandelier) and getattr(self, "futures_night_consecutive_losses", 0) >= self.futures_consecutive_loss_limit:
+            # 연속 손실 N회 시 즉시 당일 거래 정지
+            # (2026-08-11) 전 전략 공통으로 바꿨다. 종전에는 kalman/chandelier에만 걸려
+            # SAR·BB는 연속 손실이 몇 번이든 계속 진입했다. 백테스트는 전략과 무관하게
+            # consecutive_loss_limit을 적용하고 있었으므로, 이 제한을 없애는 쪽이
+            # 라이브-백테스트 정합에도 맞는다(백테스트 대비 거래수가 줄어드는 방향).
+            if getattr(self, "futures_night_consecutive_losses", 0) >= self.futures_consecutive_loss_limit:
+                self._note_entry_block("연속손절", f"{getattr(self, 'futures_night_consecutive_losses', 0)}회 >= {self.futures_consecutive_loss_limit}회")
                 return
             # [AMATS 최적화] 초저변동성 구간 진입 차단 필터링 (ATR Cutoff)
             atr_val = getattr(self, 'futures_atr_14', 2.0)
@@ -5267,6 +5290,16 @@ class ERAOrderManager:
             return _mpc
         return price * multiplier * getattr(self, 'futures_margin_rate', 0.10)
 
+    def _futures_daily_loss_limit_won(self):
+        """일일 손실 한도(원). 예수금 × daily_loss_limit_pct.
+        예수금을 못 읽으면 0을 반환해 한도를 적용하지 않는다 — 잘못된 값으로
+        멀쩡한 거래를 막는 것보다, 한도가 잠시 없는 편이 낫다고 판단."""
+        pct = getattr(self, "futures_daily_loss_limit_pct", 0.0)
+        if pct <= 0:
+            return 0.0
+        bal = getattr(self, "futures_available_balance", 0) or 0
+        return float(bal) * pct
+
     def _execute_futures_direct(self, signal_type, current_price, order_code, pos_key):
         """선물 주문 직접 집행 (주간/야간 공용 — DB 신호 우회)"""
         is_night = (pos_key == "KOSPI200_NIGHT")
@@ -5292,6 +5325,36 @@ class ERAOrderManager:
         # 수량 계산
         if "EXIT" in signal_type and pos_key in self.futures_positions:
             qty = self.futures_positions[pos_key].get("qty", 1)
+            # (2026-08-11) 일일 손실 누적. 여러 청산 경로(손절·트레일링·SAR·강제청산)가
+            # 각자 realized_pnl을 계산하므로, 모든 경로가 반드시 지나는 이 지점에서 한 번만 센다.
+            # 호출부가 futures_day_entry_price를 0으로 되돌리는 것은 이 호출 **뒤**이므로
+            # 여기서는 아직 진입가를 읽을 수 있다.
+            try:
+                _entry = (self.futures_night_entry_price if is_night else self.futures_day_entry_price) or 0.0
+                if _entry > 0:
+                    _pt = (current_price - _entry) if signal_type == "LONG_EXIT" else (_entry - current_price)
+                    # 승수는 5764행과 같은 방식으로 판정한다(미니 105=50,000 / 표준 250,000).
+                    # 과거 '105' in code 로 판정하다 항상 거짓이 되어 손익이 5배로 계산된 적이 있어,
+                    # futures_prefix를 기준으로 통일한다.
+                    _mult = 50000 if getattr(self, 'futures_prefix', '101') == '105' else 250000
+                    _krw = _pt * qty * _mult
+                    if _krw < 0:
+                        self.futures_daily_loss += -_krw
+                        _limit = self._futures_daily_loss_limit_won()
+                        if _limit > 0 and self.futures_daily_loss >= _limit and not self.futures_daily_halted:
+                            self.futures_daily_halted = True
+                            _msg = (f"당일 실현손실 {self.futures_daily_loss:,.0f}원이 한도 "
+                                    f"{_limit:,.0f}원(예수금의 {self.futures_daily_loss_limit_pct*100:.1f}%)에 도달했습니다.\n"
+
+                                    f"금일 신규 진입을 중단합니다. 보유 포지션 청산·트레일링은 계속 동작합니다.")
+                            print(f"🚨 [선물 일일손실 한도] {_msg}")
+                            if notifier:
+                                notifier.send_message(f"🚨 <b>[선물 일일손실 한도 도달]</b>\n"
+                                    f"{_msg}")
+                    else:
+                        self.futures_daily_loss = max(0.0, self.futures_daily_loss - _krw)
+            except Exception as _dl_err:
+                print(f"[선물 일일손실 누적 오류] {_dl_err}")
         else:
             if getattr(self, 'futures_fixed_qty', None) is not None:
                 qty = self.futures_fixed_qty
@@ -6206,7 +6269,9 @@ class ERAOrderManager:
                                                           self.futures_day_max_trades_hard_cap)
                         label = "주간"
 
-                    if losses >= 3:
+                    # (2026-08-11) 하드코딩 3 → 설정값. 자동 경로는 futures_consecutive_loss_limit을
+                    # 쓰는데 이 수동 조회만 3으로 고정돼 있어, 한도를 바꾸면 두 경로가 어긋났다.
+                    if losses >= self.futures_consecutive_loss_limit:
                         print(f"  => [거절] {label}선물 3연속 손실로 신규 진입 정지 중 (수동 명령 포함)")
                         cursor.execute("UPDATE signals SET status = 'SKIPPED_CIRCUIT_BREAKER' WHERE id = ?", (signal_id,))
                         conn.commit()
