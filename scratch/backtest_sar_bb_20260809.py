@@ -42,6 +42,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                            use_intraday_atr_for_sl=False, sl_hard_cap_pt=None,
                            ma_filter_period=None, allow_overnight=False,
                            daily_loss_limit_pt=None,
+                           ma_slope_min=None, ma_slope_lookback=40,
                            regime_filter_enabled=False,
                            time_stop_enabled=False, time_stop_minutes=10.0, time_stop_mfe_pt=4.0,
                            return_trades=False):
@@ -120,6 +121,13 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
     # 추세를 거스르는 거래를 없애려는 것. None이면 비활성(기존 동작과 100% 동일).
     ma_line = (pd.Series(closes).rolling(ma_filter_period).mean().values
                if ma_filter_period else None)
+
+    # 이평선 기울기(pt/봉). 직전 봉까지만 쓰므로 인과적이다.
+    # ma_slope_min은 "이평선이 최소 이만큼은 기울어 있어야 추세로 인정한다"는 문턱.
+    ma_slope = None
+    if ma_line is not None and ma_slope_min is not None:
+        _m = pd.Series(ma_line)
+        ma_slope = ((_m - _m.shift(ma_slope_lookback)) / float(ma_slope_lookback)).values
 
     SLIP_ENTRY, SLIP_EXIT_SL = slip_entry_pt, slip_exit_sl_pt
     SLIP_EXIT_NORMAL, SLIP_EXIT_FORCE = slip_exit_normal_pt, slip_exit_force_pt
@@ -407,6 +415,8 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
             # 아직 모르는 값을 참조하는 셈이라 미래참조가 된다.
             if ma_line is not None and (i < 1 or np.isnan(ma_line[i - 1]) or closes[i - 1] < ma_line[i - 1]):
                 continue          # 이평선 아래에서는 LONG 금지
+            if ma_slope is not None and (i < 1 or np.isnan(ma_slope[i - 1]) or ma_slope[i - 1] < ma_slope_min):
+                continue          # 이평선이 충분히 상승 중이 아니면 LONG 금지
             open_gap = max(c_open - target_long, 0.0)
             if gap_guard_mult is not None and open_gap > gap_guard_mult * std_error:
                 pass
@@ -433,6 +443,8 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
         elif c_low <= target_short:
             if ma_line is not None and (i < 1 or np.isnan(ma_line[i - 1]) or closes[i - 1] > ma_line[i - 1]):
                 continue          # 이평선 위에서는 SHORT 금지
+            if ma_slope is not None and (i < 1 or np.isnan(ma_slope[i - 1]) or ma_slope[i - 1] > -ma_slope_min):
+                continue          # 이평선이 충분히 하락 중이 아니면 SHORT 금지
             open_gap = max(target_short - c_open, 0.0)
             if gap_guard_mult is not None and open_gap > gap_guard_mult * std_error:
                 pass
