@@ -10,6 +10,15 @@ from bs4 import BeautifulSoup
 current_dir = os.path.dirname(os.path.abspath(__file__))
 log_file = os.path.join(current_dir, "era_order_manager.log")
 
+# ── 지표 계산 단일화 (2026-08-12) ─────────────────────────────────────────
+# 지표 수식은 전부 워크스페이스 루트의 indicators.py 한 곳에서만 정의한다.
+# era 는 '어떤 봉을 먹일지'와 '결과를 어디에 쓸지'만 책임진다.
+# 이 파일이 era/ 아래에 있으므로 루트를 sys.path 에 올려야 import 가 잡힌다.
+_indicators_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _indicators_root not in sys.path:
+    sys.path.insert(0, _indicators_root)
+import indicators as ind
+
 # 윈도우 CP949 콘솔 인코딩 에러(이모지 출력 크래시) 원천 방지 래퍼 클래스 + 파일 실시간 백업 로깅
 class SafeStreamWrapper:
     MAX_LOG_BYTES = 20 * 1024 * 1024  # 로그 파일 1개당 20MB 제한 (무인 장기운영 시 디스크 무한증가 방지)
@@ -400,6 +409,61 @@ class MorningPrepWorker(QThread):
             print(f"[MorningPrepWorker] 크롤링 에러: {e}")
         return leaders
 
+# ── 선물 최근월물 선택 ───────────────────────────────────────────────
+# 종목코드 형식: 접두사(3) + 연도끝자리(1) + 월문자(1) + "000"
+#   A0568000 = A05(미니) + 6(2026년) + 8(8월물)      — 실계좌·모의 모두 확인
+#   A016C000 = A01(정규) + 6(2026년) + C(12월물)
+# 월문자는 1~9가 1~9월, A/B/C가 10/11/12월이다.
+_FUT_MONTH_CHARS = {str(i): i for i in range(1, 10)}
+_FUT_MONTH_CHARS.update({"A": 10, "B": 11, "C": 12})
+
+
+def _futures_expiry_date(year, month):
+    """KOSPI200 선물 최종거래일 — 만기월 두 번째 목요일."""
+    first = datetime(year, month, 1)
+    first_thu = 1 + (3 - first.weekday()) % 7      # weekday(): 월=0 … 목=3
+    return datetime(year, month, first_thu + 7)
+
+
+def _parse_futures_code(code, today):
+    """코드에서 (연, 월)을 복원한다. 형식이 안 맞으면 None.
+
+    연도는 끝자리 한 글자뿐이라 오늘 기준 [-1, +8]년 범위에서 맞는 해를 찾는다.
+    (2026년 12월물을 2027년 1월에 조회하는 경우까지 커버)"""
+    if not code or len(code) != 8 or not code.endswith("000"):
+        return None
+    ych, mch = code[3], code[4].upper()
+    if not ych.isdigit() or mch not in _FUT_MONTH_CHARS:
+        return None
+    for y in range(today.year - 1, today.year + 9):
+        if y % 10 == int(ych):
+            return y, _FUT_MONTH_CHARS[mch]
+    return None
+
+
+def pick_front_month(codes, today=None):
+    """만기가 아직 안 지난 월물 중 가장 가까운 것을 고른다.
+
+    (2026-08-13) 종전에는 GetFutureList 결과의 codes[0]을 그대로 썼다. 키움이
+    만기순으로 준다는 보장이 없고, 무엇보다 만기 당일에도 그 월물을 계속 쥐고
+    있었다. 미니 코스피200은 월물이라 매달 갈아타야 하는데, 8월 만기일에
+    8월물을 잡으면 유동성이 이미 9월물로 빠진 계약을 거래하게 된다.
+
+    만기일(둘째 목요일) 당일은 제외한다 — 최종거래일에는 이미 다음 월물로
+    갈아타는 것이 맞다. 반환값이 빈 문자열이면 호출부가 폴백으로 넘어간다."""
+    today = today or datetime.now()
+    cands = []
+    for c in codes:
+        parsed = _parse_futures_code(c, today)
+        if not parsed:
+            continue
+        exp = _futures_expiry_date(*parsed)
+        if exp.date() > today.date():
+            cands.append((exp, c))
+    cands.sort()
+    return cands[0][1] if cands else ""
+
+
 class ERAOrderManager:
     def __init__(self):
         self.kiwoom = QAxWidget("KHOPENAPI.KHOpenAPICtrl.1")
@@ -656,6 +720,10 @@ class ERAOrderManager:
         self.sar_af_init = 0.02       # AF 초기값 (config에서 덮어쓰기 가능)
         self.sar_af_step = 0.02       # AF 증가폭
         self.sar_af_max = 0.20        # AF 최대값
+        # (2026-08-13) SAR 전진 주기. "tick"=종전과 동일(틱마다), "bar"=5분봉당 1회.
+        # 기본값 tick 이면 아래 _sar_step 이 _sar_tick 을 그대로 호출하므로 동작 무변경.
+        self.futures_sar_update_mode = "tick"
+        self._sar_last_bar_key = None  # bar 모드에서 "이미 전진한 봉" 표시
         self.futures_ma_filter_period = 0   # 이평선 방향필터 기간(0=비활성)
         self.futures_ma_filter_value = None # 직전 봉 기준 이평선 값
         self.futures_ma_filter_close = None # 직전 봉 종가
@@ -858,24 +926,12 @@ class ERAOrderManager:
                 return
 
             # TR 계산 (첫 행의 NaN 값을 high - low로 채워 Kalman Filter 전파 차단)
-            daily['tr'] = np.maximum(daily['high'] - daily['low'],
-                                     np.maximum(abs(daily['high'] - daily['close'].shift(1)),
-                                                abs(daily['low'] - daily['close'].shift(1)))).fillna(daily['high'] - daily['low'])
+            # ★ 미완성 봉 취급: **제외**. 위에서 당일 일봉을 이미 잘라냈다(daily.iloc[:-1]).
+            #   오버나잇 갭을 포함하는 정통 TR 정의 그대로다(intraday_range 아님).
+            daily['tr'] = ind.true_range(daily['high'].values, daily['low'].values,
+                                         daily['close'].shift(1).values)
             # 1차원 칼만 필터를 적용하여 지연 없는 변동성(Kalman ATR) 산출
-            kf_atr = None
-            P_atr = 1.0
-            Q_atr = 0.002
-            R_atr = 0.2
-            for tr_val in daily['tr'].values:
-                if kf_atr is None:
-                    kf_atr = tr_val
-                else:
-                    P_atr = P_atr + Q_atr
-                    K_atr = P_atr / (P_atr + R_atr)
-                    kf_atr = kf_atr + K_atr * (tr_val - kf_atr)
-                    P_atr = (1 - K_atr) * P_atr
-
-            atr_val = kf_atr
+            atr_val = ind.kalman_atr(daily['tr'].values, q=0.002, r=0.2)[-1]
             if pd.isna(atr_val) or atr_val <= 0:
                 print(f"[AMATS 파생 최적화] {atr_code} ATR 계산값이 유효하지 않아(NaN/0) 갱신을 건너뜁니다. (기존값 {self.futures_atr_14:.2f}pt 유지)")
                 return
@@ -980,23 +1036,30 @@ class ERAOrderManager:
                 return
             
             df = df.iloc[::-1].reset_index(drop=True) # 과거에서 최근 순으로 정렬
-            
-            # BB(20, 2)
-            df['sma20'] = df['close'].rolling(window=20).mean()
-            df['std20'] = df['close'].rolling(window=20).std()
-            df['bb_upper'] = df['sma20'] + 2 * df['std20']
-            df['bb_lower'] = df['sma20'] - 2 * df['std20']
-            df['bandwidth'] = (df['bb_upper'] - df['bb_lower']) / df['sma20']
+            _closes = df['close'].values
+
+            # BB(20, 2) — indicators.py 단일 경로.
+            # ★ 미완성 봉 취급: **포함**한다. 마지막 행(iloc[-1])이 진행 중인 당봉이고
+            #   BB 중심선·밴드폭·스퀴즈는 그 행 기준으로 읽는다(아래 last_row).
+            #   같은 함수 안의 MA200 은 반대로 **제외**(iloc[-2])다 — 의도된 차이이므로
+            #   `closed_upto` 로 통일하지 말 것.
+            _mid, _up, _lo = ind.bollinger_series(_closes, 20, sigma=2.0, ddof=1)
+            df['sma20'] = _mid
+            df['bb_upper'] = _up
+            df['bb_lower'] = _lo
+            df['bandwidth'] = ind.bandwidth_series(_up, _lo, ind.Series(_mid, "actual"))
             # Squeeze Limit (최근 100봉의 25% 분위수)
-            df['squeeze_limit'] = df['bandwidth'].rolling(window=100).quantile(0.25)
-            
+            df['squeeze_limit'] = ind.rolling_quantile(df['bandwidth'].values, 100, 0.25)
+
             # 방향필터용 장기 이평선 (2026-08-11). 완결된 직전 봉 기준으로 잡는다 —
             # 진행 중인 당봉의 종가는 진입 시점에 아직 확정되지 않았으므로 쓰면 미래참조다.
             # 백테스트(scratch/backtest_sar_bb_20260809.py의 ma_filter_period)와 같은 기준.
             self.futures_ma_filter_value = None
             self.futures_ma_filter_close = None
             if _ma_p > 0 and len(df) >= _ma_p + 1:
-                _ma_series = df['close'].rolling(window=_ma_p).mean()
+                # ★ 미완성 봉 취급: **제외**. iloc[-2] = 완결된 직전 봉.
+                #   위 BB(포함)와 기준이 다르다 — 의도된 차이다.
+                _ma_series = pd.Series(ind.moving_average_series(_closes, _ma_p))
                 _prev_ma = _ma_series.iloc[-2]
                 _prev_close = df['close'].iloc[-2]
                 if not pd.isna(_prev_ma):
@@ -1128,36 +1191,19 @@ class ERAOrderManager:
             r = getattr(self, 'futures_kf_r', 0.5)
             mult = getattr(self, 'futures_kf_mult', 1.0)
             
-            kf_prices = []
-            x = None
-            P = 1.0
-            for z in closes_short:
-                if x is None:
-                    x = z
-                else:
-                    P = P + q
-                    K = P / (P + r)
-                    x = x + K * (z - x)
-                    P = (1 - K) * P
-                kf_prices.append(x)
-                
-            kf_prices = np.array(kf_prices)
-            errors = closes_short - kf_prices
+            # ★ 미완성 봉 취급: **포함**. df.tail(40) 의 마지막 행이 진행 중인 당봉이며
+            #   칼만 평활가·std_error·타점 모두 그 행까지 반영한다.
+            #   따라서 `Window.closed_upto` 가 아니라 창 전체를 그대로 넘긴다.
+            _w_short = ind.Window(closes_short)
 
             # std_error 계산 구간에서 절댓값이 가장 큰 잔차 N개를 제외 — 개장 갭처럼 단발성으로
             # 튀는 봉 하나가 SL/TP/트레일링 문턱(전부 std_error 연동)을 왜곡하는 것을 완화.
-            # target/추세 판정에는 영향 없음(errors는 std_error 산출에만 쓰임, kf_price는 그대로).
+            # target/추세 판정에는 영향 없음(잔차는 std_error 산출에만 쓰임, kf_price는 그대로).
             # (2026-07-11: bqa/kalman_backtester.py로 전체기간·최근90일·최근30일 교차검증 후 trim=1 채택)
-            std_slice = errors[-20:]
             trim_n = getattr(self, "futures_std_trim_outliers", 0)
-            if trim_n > 0 and len(std_slice) > trim_n:
-                order = np.argsort(np.abs(std_slice))
-                std_slice = std_slice[order[:-trim_n]]
-            std_error = np.std(std_slice)
-            if pd.isna(std_error) or std_error <= 0:
-                std_error = 0.5
-                
-            kf_price = kf_prices[-1]
+            std_error, kf_price = ind.kalman_residual_std(
+                _w_short, q, r, std_window=20, trim=trim_n, fallback=0.5)
+
             band = std_error * mult
             
             # 단계 2. 15분봉 리샘플링 장기 칼만 추세 필터 계산
@@ -1171,21 +1217,12 @@ class ERAOrderManager:
                 if len(df_15m) >= 5:
                     closes_15m = df_15m['close'].values
                     # 장기 칼만 필터 파라미터 (q_long=0.001, r_long=1.0)
+                    # ★ 미완성 봉 취급: **포함**(위 5분봉 칼만과 동일 기준).
+                    #   진행 중인 15분봉이 리샘플 마지막 행으로 들어온다.
                     q_long = 0.001
                     r_long = 1.0
-                    kf_long = []
-                    x_l = None
-                    P_l = 1.0
-                    for z_l in closes_15m:
-                        if x_l is None:
-                            x_l = z_l
-                        else:
-                            P_l = P_l + q_long
-                            K_l = P_l / (P_l + r_long)
-                            x_l = x_l + K_l * (z_l - x_l)
-                            P_l = (1 - K_l) * P_l
-                        kf_long.append(x_l)
-                    
+                    kf_long = ind.kalman_path(ind.Window(closes_15m), q_long, r_long)
+
                     if len(kf_long) >= 2:
                         slope = kf_long[-1] - kf_long[-2]
                         if slope > 0.01:
@@ -1337,6 +1374,8 @@ class ERAOrderManager:
             # 계약수를 2.11배 과대 산정한다. margin_per_contract는 고정값 오버라이드로,
             # 기준가격이 갱신되면 어긋나므로 요율 방식을 권장한다.
             self.futures_margin_rate = float(futures_settings.get("margin_rate", 0.10))
+            # (2026-08-12) 선물 종목코드 수동 지정. 빈 값이면 기존 자동탐지/폴백 그대로.
+            self.futures_day_code_override = str(futures_settings.get("day_code_override", "") or "").strip()
             _mpc = futures_settings.get("margin_per_contract", None)
             self.futures_margin_per_contract = float(_mpc) if _mpc is not None else None
             # (2026-08-04) 최대 계약수 상한. 기존 하드코딩 15를 설정으로 옮긴 것으로,
@@ -1413,6 +1452,9 @@ class ERAOrderManager:
             self.sar_af_init = float(futures_settings.get("sar_af_init", 0.02))
             self.sar_af_step = float(futures_settings.get("sar_af_step", 0.02))
             self.sar_af_max  = float(futures_settings.get("sar_af_max", 0.20))
+            # (2026-08-13) "tick"(기본, 종전 동작) | "bar"(5분봉당 1회 전진)
+            _sm = str(futures_settings.get("sar_update_mode", "tick") or "tick").strip().lower()
+            self.futures_sar_update_mode = _sm if _sm in ("tick", "bar") else "tick"
             # 이평선 방향필터 기간(5분봉 개수). 0/미설정이면 비활성.
             self.futures_ma_filter_period = int(futures_settings.get("ma_filter_period", 0) or 0)
             self.bb_window   = int(futures_settings.get("bb_window", 20))
@@ -1562,6 +1604,7 @@ class ERAOrderManager:
         self.sar_value = 0.0
         self.sar_ep = 0.0
         self.sar_af = getattr(self, "sar_af_init", 0.02)
+        self._sar_last_bar_key = None   # (2026-08-13) bar 모드 봉 키도 함께 리셋
         self.sar_bull = True
         self._sar_state_restored = False
 
@@ -1642,6 +1685,58 @@ class ERAOrderManager:
             except Exception as e:
                 print(f"[ERA] 선물 청산가 복원 실패: {e}")
 
+    def _sar_tick(self, current_price, clamp):
+        """SAR 한 스텝을 indicators.SarState 로 진행하고 결과를 self 에 되쓴다.
+
+        ★ 라이브는 **틱 기반**이다 — EP를 봉 고저가가 아니라 current_price 로 갱신하고
+          AF도 틱마다 오른다. 그래서 on_bar(표준 정의)가 아니라 on_tick 을 쓴다.
+          봉 기반 전환은 별건이며 여기서 바꾸지 않는다.
+
+        방향 전환(sar_bull)과 청산 판정은 호출부가 그대로 관리한다 — 이 함수는
+        값 갱신만 책임진다. 클램프 적용 후 EP/AF 를 올리는 순서까지 SarState._advance
+        가 라이브와 동일하게 재현한다.
+        """
+        _st = ind.SarState(sar=self.sar_value, ep=self.sar_ep, af=self.sar_af,
+                           bull=self.sar_bull,
+                           af_init=getattr(self, "sar_af_init", 0.02),
+                           af_step=self.sar_af_step, af_max=self.sar_af_max)
+        _st.on_tick(current_price, clamp=clamp)
+        self.sar_value = _st.sar
+        self.sar_ep = _st.ep
+        self.sar_af = _st.af
+
+    def _sar_step(self, current_price, clamp):
+        """SAR 전진 — futures_sar_update_mode 에 따라 갱신 주기를 정한다.
+
+        "tick"(기본)  종전과 100% 동일. 호출될 때마다(=틱마다) 전진한다.
+        "bar"         5분봉 경계가 바뀔 때 한 번만 전진한다.
+
+        왜 필요한가 (2026-08-13):
+          라이브는 틱마다 SAR을 전진시키고 AF를 올린다. 같은 5분 동안 백테스터(봉 1회)는
+          1번, 라이브는 수십 번 전진하므로 트레일링이 비교할 수 없이 빨리 조여온다.
+          실측(최근60일, 합성틱): 봉단위 PF 1.64 / 평균이익 +23.98pt
+                                  틱단위 PF 0.70 / 평균이익  +5.62pt
+          승률은 비슷한데(54.6% vs 51.8%) 이익만 4분의 1로 잘린다.
+
+        청산 판정은 바꾸지 않는다. 틱마다 current_price 로 SAR 돌파를 보는 현행 방식은
+        백테스터 봉모드의 "봉 저가가 SAR 이하면 청산"과 사실상 같은 판정이다.
+        바꾸는 것은 SAR 값이 얼마나 자주 전진하느냐 하나뿐이다.
+        """
+        if getattr(self, "futures_sar_update_mode", "tick") != "bar":
+            self._sar_tick(current_price, clamp)
+            return
+
+        _now = datetime.now()
+        _key = (_now.date(), _now.hour, _now.minute // 5)
+        if self._sar_last_bar_key is None:
+            # 진입 직후 첫 호출 — 키만 잡고 전진하지 않는다. 백테스터도 진입한 봉에서는
+            # 이미 on_bar 를 지난 뒤라 다음 봉부터 전진한다. 그 순서를 맞춘다.
+            self._sar_last_bar_key = _key
+            return
+        if self._sar_last_bar_key != _key:
+            self._sar_last_bar_key = _key
+            self._sar_tick(current_price, clamp)
+
     def _ensure_sar_state(self, entry, is_long):
         """SAR 상태가 지금 포지션과 맞는지 확인하고, 아니면 진입가 기준으로 다시 세운다.
 
@@ -1671,6 +1766,7 @@ class ERAOrderManager:
         self.sar_value = (entry - atr) if is_long else (entry + atr)
         self.sar_ep = entry
         self.sar_af = getattr(self, "sar_af_init", 0.02)
+        self._sar_last_bar_key = None   # (2026-08-13) bar 모드 봉 키도 함께 리셋
         self.sar_bull = is_long
         msg = ("SAR 상태를 진입가 기준으로 재구성했습니다 (%s)." % why
                + chr(10) + "진입 %.2f → SAR %.2f, AF %.3f. 트레일링이 처음부터 다시 시작됩니다."
@@ -1976,6 +2072,16 @@ class ERAOrderManager:
             self.futures_last_short_exit_price = 0.0
             self.futures_last_short_exit_time = 0.0
             self.futures_day_consecutive_losses = 0
+            # [측정원장 훅 D] (2026-08-12) 카운터를 초기화하기 '전에' 전일 요약을 출력한다.
+            # 08:40 일일 리셋 시점이라 전 거래일 원장이 이미 완결되어 있다. 읽기 전용.
+            try:
+                _lg = self._ledger()
+                if _lg:
+                    _prev = (now - timedelta(days=1)).strftime("%Y%m%d")
+                    _lg.daily_summary(_prev, emit=(notifier.send_message if notifier else None))
+            except Exception:
+                pass
+
             self.futures_daily_loss = 0.0
             self.futures_daily_halted = False
             self.futures_day_trade_count = 0
@@ -2263,15 +2369,51 @@ class ERAOrderManager:
             self.real_day_code = ""
             self.real_night_code = ""
             
-            search_prefix = self.futures_prefix
-            if self.environment != "live":
-                search_prefix = "A01" if self.futures_prefix == "101" else "A05"
-            
+            # (2026-08-12) 실서버도 종목코드 접두사는 A01/A05다 — 실계좌에서 확인한
+            # 최근월물이 A0568000(2026년 8월물)이었다. 종전엔 실거래일 때 "105"로 걸러
+            # GetFutureList가 정상 응답해도 전부 탈락했고, 그래서 "응답 없음"으로 잘못
+            # 표시된 뒤 폴백이 존재하지 않는 105V9000을 지어냈다. 시세가 한 틱도 안 들어와
+            # ATR이 초기값 2.00pt에 머물렀다(2026-08-12 실측).
+            # 101/105는 지수·연결선물 데이터 코드이지 주문 가능한 월물 코드가 아니다.
+            search_prefix = "A01" if self.futures_prefix == "101" else "A05"
+
+            # 응답 자체가 없었는지, 왔는데 접두사가 안 맞았는지 구분해서 남긴다.
+            # 종전 메시지는 두 경우가 같아 원인 추적이 불가능했다.
+            _matched = []
             if future_list:
-                codes = [c for c in future_list.split(";") if c and c.startswith(search_prefix)]
-                if codes:
-                    self.real_day_code = codes[0]
-            
+                _pv = [c for c in future_list.split(";") if c]
+                _matched = [c for c in _pv if c.startswith(search_prefix)]
+                print(f" => [선물 종목목록] {len(_pv)}건 수신 | 접두사 {search_prefix} 일치 "
+                      f"{len(_matched)}건: {_matched}")
+            else:
+                print(" => [선물 종목목록] GetFutureList 빈 응답")
+
+
+            # (2026-08-12) 코드 수동 지정. GetFutureList가 무응답이면 폴백 2단계가 날짜로
+            # 코드를 지어내는데, 그 알고리즘은 만기월을 3/6/9/12 분기물로 가정한다.
+            # 미니 코스피200 선물은 월물이라(모의 실제 코드 A0568000 = 2026년 8월물) 8월에
+            # 9월물 코드가 생성돼 존재하지 않는 종목을 구독하게 된다.
+            # 영웅문에서 확인한 코드를 넣으면 자동탐지·폴백을 모두 건너뛴다.
+            _code_ov = str(getattr(self, "futures_day_code_override", "") or "").strip()
+            if _code_ov:
+                self.real_day_code = _code_ov
+                print(f" => [ERA 코드 수동지정] 설정값으로 최근월물 고정: {self.real_day_code}")
+
+            # (2026-08-13) 만기일을 계산해 고른다. 종전엔 codes[0]을 그대로 썼는데,
+            # 키움이 만기순으로 준다는 보장이 없고 만기 당일에도 그 월물을 계속 쥐고
+            # 있었다. 미니는 월물이라 매달 갈아타야 한다 — 이 선택이 곧 자동 롤오버다.
+            if not self.real_day_code and _matched:
+                picked = pick_front_month(_matched)
+                if picked:
+                    self.real_day_code = picked
+                    _parsed = _parse_futures_code(picked, datetime.now())
+                    _exp = _futures_expiry_date(*_parsed) if _parsed else None
+                    print(f" => [ERA 최근월물 자동선택] {picked}"
+                          + (f" ({_parsed[0]}년 {_parsed[1]}월물, 만기 {_exp.strftime('%Y-%m-%d')})"
+                             if _exp else ""))
+                else:
+                    print(f" => [ERA 최근월물 자동선택 실패] 만기 미도래 월물 없음 — 후보 {_matched}")
+
             # 폴백 1단계: GetFutureList가 실패했거나 비어있을 시 GetFutureCodeByIndex 시도
             if not self.real_day_code:
                 print(" => [ERA 폴백 1단계] GetFutureList 응답 없음. GetFutureCodeByIndex 조회 시도...")
@@ -2283,48 +2425,24 @@ class ERAOrderManager:
             # 폴백 2단계: API 조회가 모두 실패할 시 날짜 기반 동적 연산 알고리즘 가동
             if not self.real_day_code:
                 print(" => [ERA 폴백 2단계] 키움 API 최근월물 조회 실패. 날짜 기반 가상 알고리즘 가동...")
+                # (2026-08-13) 전면 교체. 종전 알고리즘은 두 군데가 틀려 존재하지 않는
+                # 코드를 만들어냈다(2026-08-12 실계좌에서 105V9000 생성 → 시세 0틱).
+                #   · 만기월을 3/6/9/12 분기물로 가정 — 미니 코스피200은 월물이다
+                #   · 실거래 연도문자를 V/W/X로 가정 — 실제 코드는 연도 끝자리 숫자다
+                #     (A0568000 = 2026년 8월물, 실계좌·모의 모두 동일)
+                # 이제 접두사가 양쪽 모두 A0x이므로 연도는 항상 끝자리 숫자를 쓴다.
+                # 만기(둘째 목요일)가 지났으면 다음 달로 넘긴다 — 자동선택과 같은 규칙.
                 now = datetime.now()
-                curr_year = now.year
-                curr_month = now.month
-                curr_day = now.day
-                
-                # 키움 연도 코드 매핑 (2026=V, 2027=W, 2028=X, 2029=Y, 2030=Z ...)
-                if self.environment != "live":
-                    year_char = str(curr_year % 10)
-                else:
-                    year_codes = {2026: "V", 2027: "W", 2028: "X", 2029: "Y", 2030: "Z"}
-                    year_char = year_codes.get(curr_year, "V")
-                
-                # 선물 만기월은 3, 6, 9, 12월. 둘째주 목요일이 만기일.
-                # 안전한 근사를 위해 현재 월을 기준으로 만기월 판단 (매월 10일 전후가 만기이므로, 11일 이후이면 다음 분기로 폴오버)
-                if curr_month <= 3:
-                    if curr_month == 3 and curr_day > 12:  # 3월 만기일(대략 12일경) 이후
-                        expiry_month_char = "6"
-                    else:
-                        expiry_month_char = "3"
-                elif curr_month <= 6:
-                    if curr_month == 6 and curr_day > 12:
-                        expiry_month_char = "9"
-                    else:
-                        expiry_month_char = "6"
-                elif curr_month <= 9:
-                    if curr_month == 9 and curr_day > 12:
-                        expiry_month_char = "C"
-                    else:
-                        expiry_month_char = "9"
-                else:
-                    if curr_month == 12 and curr_day > 12:
-                        # 12월 만기일 이후에는 다음 연도 3월물로 점프
-                        if self.environment != "live":
-                            year_char = str((curr_year + 1) % 10)
-                        else:
-                            year_char = year_codes.get(curr_year + 1, "W")
-                        expiry_month_char = "3"
-                    else:
-                        expiry_month_char = "C"
-                
-                self.real_day_code = f"{search_prefix}{year_char}{expiry_month_char}000"
-                print(f" => [ERA 폴백 2단계 성공] 알고리즘 생성 최근월물 적용: {self.real_day_code}")
+                y, m = now.year, now.month
+                if _futures_expiry_date(y, m).date() <= now.date():
+                    m += 1
+                    if m > 12:
+                        y, m = y + 1, 1
+                month_char = {v: k for k, v in _FUT_MONTH_CHARS.items()}[m]
+                self.real_day_code = f"{search_prefix}{y % 10}{month_char}000"
+                print(f" => [ERA 폴백 2단계] 날짜 기반 생성: {self.real_day_code} "
+                      f"({y}년 {m}월물, 만기 {_futures_expiry_date(y, m).strftime('%Y-%m-%d')})")
+                print("    ※ API 조회가 모두 실패해 추정한 코드다. 시세가 안 들어오면 이 코드를 의심할 것.")
             
             # 최종 야간 코드 설정 (야간 지수선물은 주간 최근월물 코드에서 앞 세 자리를 105로 교체)
             # 단, 이미 미니 선물(105)인 경우에는 별도의 야간 코드가 없으므로 동일하게 설정
@@ -3703,8 +3821,14 @@ class ERAOrderManager:
                     target_row = rows[0]
 
             if target_row:
-                prev_h, prev_l = target_row[1], target_row[2]
-                calc = prev_h - prev_l
+                # ★ 미완성 봉 취급: **제외**. rows 는 날짜 내림차순이므로 오름차순으로 뒤집고
+                #   배타적 인덱스를 넘긴다 — 오늘 행이 있으면 그만큼 뒤로 물린다(_j).
+                #   indicators 의 인덱스 규약(upto_exclusive)이 '오늘 배제'를 코드에 드러낸다.
+                _asc = rows[::-1]
+                _j = 1 if rows[0][0] == today_str else 0
+                calc = ind.prev_session_range([_r[1] for _r in _asc],
+                                              [_r[2] for _r in _asc],
+                                              len(rows) - _j)
                 if calc > 0:
                     self.futures_prev_range = calc
                     print(f"[ERA 선물] 전일 Range 로드 완료: {calc:.2f}pt (조회코드: {query_code}, 날짜: {target_row[0]})")
@@ -4364,6 +4488,15 @@ class ERAOrderManager:
                     # 미체결 재시도 구간에도 감시 공백이 생기지 않게 한다.
                     entry = pos.get('price', 0.0)
                 if entry > 0:
+                    # [측정원장 훅 C] (2026-08-12) MFE/MAE 갱신. 비교 2회뿐이고 아무것도
+                    # 되돌리지 않는다. 틱마다 도는 경로라 원장 내부에서도 예외를 조용히 삼킨다.
+                    try:
+                        _lg = self._ledger()
+                        if _lg:
+                            _lg.on_tick(current_price)
+                    except Exception:
+                        pass
+
                     strategy_type = getattr(self, "futures_strategy_type", "volatility_breakout")
                     is_kalman = (strategy_type == "kalman")
                     is_sar    = (strategy_type == "parabolic_sar")
@@ -4423,11 +4556,10 @@ class ERAOrderManager:
                             self._ensure_sar_state(entry, True)
                             # SAR 실시간 업데이트
                             if self.sar_bull:  # 상승장: SAR이 아래
-                                self.sar_value = self.sar_value + self.sar_af * (self.sar_ep - self.sar_value)
-                                self.sar_value = min(self.sar_value, self.futures_day_peak)
-                                if current_price > self.sar_ep:
-                                    self.sar_ep = current_price
-                                    self.sar_af = min(self.sar_af + self.sar_af_step, self.sar_af_max)
+                                # ★ 라이브 SAR은 **틱 기반**이다 — EP가 봉 고가가 아니라
+                                #   current_price로 갱신되고 AF도 틱마다 오른다.
+                                #   on_bar(표준)가 아니라 on_tick(현행 재현)을 쓴다.
+                                self._sar_step(current_price, self.futures_day_peak)
                                 # SAR 역전(청산) 체크
                                 if current_price <= self.sar_value or pnl_pt <= -sl_limit:
                                     self.sar_bull = False
@@ -4630,11 +4762,8 @@ class ERAOrderManager:
                             # 돌아와 있으면 이 아래 SHORT 청산 분기가 통째로 실행되지 않는다.
                             self._ensure_sar_state(entry, False)
                             if not self.sar_bull:  # 하락장: SAR이 위
-                                self.sar_value = self.sar_value - self.sar_af * (self.sar_value - self.sar_ep)
-                                self.sar_value = max(self.sar_value, self.futures_day_peak)
-                                if current_price < self.sar_ep:
-                                    self.sar_ep = current_price
-                                    self.sar_af = min(self.sar_af + self.sar_af_step, self.sar_af_max)
+                                # ★ LONG 쪽과 동일 — 틱 기반(on_tick). 클램프는 day_peak.
+                                self._sar_step(current_price, self.futures_day_peak)
                                 if current_price >= self.sar_value or pnl_pt <= -sl_limit:
                                     self.sar_bull = True
                                     realized_pnl = entry - current_price
@@ -4967,6 +5096,7 @@ class ERAOrderManager:
                                 self.sar_value = current_price - getattr(self, 'futures_atr_14', 5.0)
                                 self.sar_ep    = current_price
                                 self.sar_af    = self.sar_af_init
+                                self._sar_last_bar_key = None   # (2026-08-13) bar 모드 봉 키 리셋
                                 self.sar_bull  = True
                                 print(f"[주간선물(SAR)] 🚀 LONG 진입 SAR 초기화: SAR={self.sar_value:.2f} EP={self.sar_ep:.2f} AF={self.sar_af}")
                             self.futures_day_trade_count += 1
@@ -5035,6 +5165,7 @@ class ERAOrderManager:
                                 self.sar_value = current_price + getattr(self, 'futures_atr_14', 5.0)
                                 self.sar_ep    = current_price
                                 self.sar_af    = self.sar_af_init
+                                self._sar_last_bar_key = None   # (2026-08-13) bar 모드 봉 키 리셋
                                 self.sar_bull  = False
                                 print(f"[주간선물(SAR)] 🚀 SHORT 진입 SAR 초기화: SAR={self.sar_value:.2f} EP={self.sar_ep:.2f} AF={self.sar_af}")
                             self.futures_day_trade_count += 1
@@ -5459,6 +5590,24 @@ class ERAOrderManager:
         bal = getattr(self, "futures_available_balance", 0) or 0
         return float(bal) * pct
 
+    def _ledger(self):
+        """측정 원장(era/trade_ledger.py) 지연 초기화. 실패하면 None을 돌려주고
+        호출부는 아무것도 하지 않는다 — 기록은 매매를 막지 않는다. (2026-08-12)"""
+        try:
+            if getattr(self, "_trade_ledger", "unset") == "unset":
+                self._trade_ledger = None
+                from trade_ledger import TradeLedger
+                self._trade_ledger = TradeLedger(
+                    self.workspace_root,
+                    point_value_getter=lambda: 50000 if getattr(self, 'futures_prefix', '101') == '105' else 250000,
+                    emit=(notifier.send_message if notifier else None),
+                )
+            return self._trade_ledger
+        except Exception as _lg_err:
+            self._trade_ledger = None
+            print(f"[측정원장] 초기화 실패(기록 없이 매매 계속): {_lg_err}")
+            return None
+
     def _execute_futures_direct(self, signal_type, current_price, order_code, pos_key):
         """선물 주문 직접 집행 (주간/야간 공용 — DB 신호 우회)"""
         is_night = (pos_key == "KOSPI200_NIGHT")
@@ -5563,6 +5712,15 @@ class ERAOrderManager:
 
         session_label = "야간" if is_night else "주간"
         print(f"\n[{session_label}선물 주문] {label} | {current_price:.2f}pt | {qty}계약 | {order_code}")
+
+        # [측정원장 훅 A] (2026-08-12) 주문 '의도가'를 체결과 짝짓기 위해 기록한다.
+        # 읽기 전용이며 매매 로직에 관여하지 않는다. 실패해도 주문은 그대로 나간다.
+        try:
+            _lg = self._ledger()
+            if _lg:
+                _lg.on_order(self, signal_type, current_price, qty, order_code, pos_key)
+        except Exception:
+            pass
 
         # sOrdTp: 시장가 주문 시 반드시 "3" 지정 (시장가 매매 시 가격은 "0"으로 전송)
         res = self.kiwoom.dynamicCall(
@@ -6651,6 +6809,24 @@ class ERAOrderManager:
                     pos_key = "KOSPI200_NIGHT" if is_night_fill else "KOSPI200"
                     session_label = "야간" if is_night_fill else "주간"
                     print(f"[{session_label}선물 실체결 확정] {name}({code}) | {exec_price} | {exec_qty}계약 | {order_gubun}")
+
+                    # [측정원장 훅 B] (2026-08-12) 실체결가·수량·주문번호를 기록하고
+                    # 의도가와 대조해 슬리피지를 산출한다. 수수료 FID(938)는 선물 체결통보에서
+                    # 제공되는지 확인되지 않았으므로 방어적으로 읽고, 비면 원장이 실측 요율로
+                    # 추정한다(기록에 commission_src로 어느 쪽인지 남는다). 읽기 전용.
+                    try:
+                        _comm = None
+                        try:
+                            _c = self.kiwoom.dynamicCall("GetChejanData(int)", 938).strip()
+                            _comm = float(_c) if _c else None
+                        except Exception:
+                            _comm = None
+                        _lg = self._ledger()
+                        if _lg:
+                            _lg.on_fill(self, code, exec_price, exec_qty, order_gubun, order_no,
+                                        commission=_comm)
+                    except Exception:
+                        pass
                     if "매수" in order_gubun or "환매" in order_gubun:
                         if pos_key not in self.futures_positions:
                             self.futures_positions[pos_key] = {'type': 'LONG', 'qty': exec_qty, 'price': exec_price, 'code': code}
