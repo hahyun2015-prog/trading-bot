@@ -16,7 +16,6 @@ import json
 import io
 import pandas as pd
 import numpy as np
-import ta
 from datetime import datetime
 
 # Prevent encoding crashes in CP949 environment (Windows console)
@@ -28,7 +27,26 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 workspace_root = os.path.abspath(os.path.join(current_dir, ".."))
 sys.path.append(workspace_root)
 
-RESULTS_FILE = os.path.join(workspace_root, "config", "active_strategy.json")
+# 지표 계산 단일 소스 (마이그레이션 4번, 2026-08-12). 이전에는 `ta` 패키지를 썼다.
+# 동작 무변경이 목표이므로 ta의 비표준 시맨틱을 그대로 재현하는 ta_* 변형을 쓴다:
+#   - 볼린저: ta는 모표준편차(ddof=0). 라이브(era_order_manager)의 ddof=1과 다르다.
+#   - RSI:    ta는 Wilder RSI가 아니다(0 시드 EWM). wilder_rsi와 최대 26.15 차이.
+#   - ATR:    ta는 워밍업 구간을 NaN이 아니라 0.0으로 채운다(dropna에 안 걸린다).
+# 이 차이들은 이번에 고치지 않는다 — 발견 목록 N1/N2/N8 참조.
+import indicators as I
+
+# (2026-08-12) 결과 저장 경로 — 기본을 안전한 scratch/ 로 바꿨다.
+# 이전 기본값은 config/active_strategy.json 이었다. 이 파일은 era_order_manager.py(1402행)가
+# 기동 시 읽어 주간선물 파라미터를 오버라이드하는 라이브 설정이고, 아래 저장 블록은 병합이
+# 아니라 통째 덮어쓰기다. 그래서 이 백테스터를 한 번 실행해 보기만 해도 approved_at 과
+# best_k(0.2) 가 소리 없이 유실됐다. approved_at 이 사라지면 ERA 는 파일 전체를 무시하고
+# config.json 값으로 되돌아가는데, best_k 는 config.json 에 없어 코드 기본값 0.5 가 된다.
+#   기본          : scratch/enhanced_backtest_result.json
+#   EBT_OUT 환경변수 / --out : 임의 경로 지정
+#   --write-live  : 라이브 설정에 직접 쓰기 (명시적으로 요구해야만 가능)
+LIVE_RESULTS_FILE = os.path.join(workspace_root, "config", "active_strategy.json")
+DEFAULT_RESULTS_FILE = os.path.join(workspace_root, "scratch", "enhanced_backtest_result.json")
+RESULTS_FILE = os.environ.get("EBT_OUT") or DEFAULT_RESULTS_FILE
 
 
 def load_futures_data(db_path):
@@ -50,28 +68,32 @@ def load_futures_data(db_path):
 
 def compute_indicators(df):
     """볼린저밴드, RSI, ATR 등 핵심 지표 계산"""
+    _closes = df['close'].to_numpy(dtype=float)
+    _highs = df['high'].to_numpy(dtype=float)
+    _lows = df['low'].to_numpy(dtype=float)
+
     # 볼린저밴드 (20, 2)
-    bb = ta.volatility.BollingerBands(close=df['close'], window=20, window_dev=2)
-    df['bb_m'] = bb.bollinger_mavg()
-    df['bb_h'] = bb.bollinger_hband()
-    df['bb_l'] = bb.bollinger_lband()
+    _bb_m, _bb_h, _bb_l = I.bollinger_series(_closes, 20, 2.0, ddof=0)  # ddof=0 = ta 시맨틱
+    df['bb_m'] = _bb_m
+    df['bb_h'] = _bb_h
+    df['bb_l'] = _bb_l
     df['bb_width'] = (df['bb_h'] - df['bb_l']) / df['bb_m']  # 밴드 폭 (스퀴즈 판별용)
 
     # RSI (14)
-    df['rsi'] = ta.momentum.RSIIndicator(close=df['close'], window=14).rsi()
+    df['rsi'] = I.ta_rsi_series(_closes, 14)
 
     # ATR (14)
-    df['atr'] = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14).average_true_range()
+    df['atr'] = I.ta_atr_series(_highs, _lows, _closes, 14)
 
     # MACD
-    macd_ind = ta.trend.MACD(close=df['close'], window_slow=26, window_fast=12, window_sign=9)
-    df['macd'] = macd_ind.macd()
-    df['macd_signal'] = macd_ind.macd_signal()
-    df['macd_diff'] = macd_ind.macd_diff()
+    _macd, _macd_sig, _macd_diff = I.ta_macd_series(_closes, window_slow=26, window_fast=12, window_sign=9)
+    df['macd'] = _macd
+    df['macd_signal'] = _macd_sig
+    df['macd_diff'] = _macd_diff
 
     # EMA (10, 34) — 마하세븐 눌림목 스캘핑
-    df['ema_10'] = ta.trend.EMAIndicator(close=df['close'], window=10).ema_indicator()
-    df['ema_34'] = ta.trend.EMAIndicator(close=df['close'], window=34).ema_indicator()
+    df['ema_10'] = I.ta_ema_series(_closes, 10)
+    df['ema_34'] = I.ta_ema_series(_closes, 34)
 
     # 스퀴즈 상태 감지 (bb_width가 최근 100봉 최저의 20% 이내일 때 = 수축 중)
     df['bb_width_min_100'] = df['bb_width'].rolling(window=100, min_periods=20).min()
@@ -523,4 +545,22 @@ def run_comprehensive_backtest():
 
 
 if __name__ == "__main__":
+    import argparse
+
+    _ap = argparse.ArgumentParser(description="고도화 백테스터 (A/B/C 전략 비교)")
+    _ap.add_argument("--out", metavar="PATH",
+                     help="결과 JSON 저장 경로 (기본: scratch/enhanced_backtest_result.json)")
+    _ap.add_argument("--write-live", action="store_true",
+                     help="결과를 config/active_strategy.json(ERA 가 읽는 라이브 주간선물 설정)에 "
+                          "직접 쓴다. 통째 덮어쓰기라 approved_at 이 사라지고, 그러면 ERA 는 이 "
+                          "파일을 무시한다. 승인 절차를 거친 경우에만 사용할 것.")
+    _args = _ap.parse_args()
+
+    if _args.out:
+        RESULTS_FILE = _args.out
+    elif _args.write_live:
+        RESULTS_FILE = LIVE_RESULTS_FILE
+        print("[경고] --write-live 지정 — 라이브 설정을 덮어씁니다: %s" % RESULTS_FILE)
+        print("[경고] 이 저장은 approved_at 을 남기지 않으므로 ERA 는 결과를 적용하지 않습니다.")
+
     run_comprehensive_backtest()

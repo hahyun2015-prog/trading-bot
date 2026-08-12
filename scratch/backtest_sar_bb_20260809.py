@@ -6,12 +6,18 @@
 realistic_gap_fill은 2026-08-08에 발견한 갭관통 유령체결 버그를 처음부터 방지하기 위해
 기본 True로 둔다.
 """
-import sys
+import sys, os
 sys.path.insert(0, "c:\\Antigravity\\AI_T_Agent\\bqa")
 import json
 import numpy as np
 import pandas as pd
 from kalman_backtester import load_futures_data
+
+# [2026-08-12 지표 단일화] 지표 '계산'만 indicators.py 단일 소스로 교체한다.
+# 동작 무변경 리팩터링 — 전략 로직·비용 모델·진입 조건·세션 필터는 손대지 않았다.
+# 이 백테스터는 back-adjust를 쓰지 않으므로 모든 시계열이 실제 가격 공간(actual)이다.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import indicators as I
 
 INIT_CAPITAL = 50_000_000
 
@@ -36,6 +42,13 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                            reentry_pullback_mult=0.5, reentry_breakout_mult=0.2,
                            sar_af_init=0.02, sar_af_step=0.02, sar_af_max=0.20,
                            sar_sl_mult=1.0,
+                           # [2026-08-12] 라이브 정합용 틱 단위 SAR.
+                           #   False(기본) = 기존 봉 단위(on_bar) — 동작 100% 동일, 골든 대조로 검증됨.
+                           #   True        = era_order_manager.py의 _sar_tick(on_tick)과 같은 cadence.
+                           # 라이브는 틱마다 SAR을 전진시키고 AF를 올린다. 5분봉 1회 갱신인 이 백테스터와
+                           # 회전율이 16~18배 어긋나 있어(백테 1.4건/일 vs 라이브 22건/일) 백테스트로
+                           # 라이브를 예측할 수 없었다. 그 격차를 측정하기 위한 옵션이다.
+                           sar_tick_mode=False, sar_ticks_per_bar=24,
                            bb_window=20, bb_sigma=2.0, bb_trail_std_mult=1.5, bb_trail_exit_mult=0.5,
                            squeeze_window=100, squeeze_quantile=0.25, use_squeeze_filter=True,
                            entry_target_mode='kalman_band', breakout_k=0.2,
@@ -61,38 +74,19 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
 
     daily = df.groupby('date_day').agg(high=('high', 'max'), low=('low', 'min'), close=('close', 'last')).reset_index()
     daily['prev_close'] = daily['close'].shift(1)
-    tr = np.maximum(daily['high'] - daily['low'],
-                     np.maximum((daily['high'] - daily['prev_close']).abs(),
-                                (daily['low'] - daily['prev_close']).abs())).fillna(daily['high'] - daily['low'])
-    kf_atr_path = np.empty(len(tr))
-    kf_atr, P_atr, Q_atr, R_atr = None, 1.0, 0.002, 0.2
-    for j, tr_val in enumerate(tr.values):
-        if kf_atr is None:
-            kf_atr = tr_val
-        else:
-            P_atr = P_atr + Q_atr
-            K_atr = P_atr / (P_atr + R_atr)
-            kf_atr = kf_atr + K_atr * (tr_val - kf_atr)
-            P_atr = (1 - K_atr) * P_atr
-        kf_atr_path[j] = kf_atr
-    daily['range'] = daily['high'] - daily['low']
+    # [2026-08-12] 일봉 TR(오버나잇 갭 포함) + 칼만 평활 → indicators로 이관.
+    # I.true_range의 NaN 채움(첫 행 prev_close 없음 → H-L)은 종전 .fillna(H-L)와 같다.
+    tr = I.true_range(daily['high'], daily['low'], daily['prev_close'])
+    kf_atr_path = I.kalman_atr(tr, q=0.002, r=0.2)
+    daily['range'] = I.intraday_range(daily['high'], daily['low'])
 
     # [2026-08-11] 일중 ATR. 기존 atr14는 일봉 TR(=오버나잇 갭 포함) 기반인데, 이 전략은
     # 매일 15:35에 전량 청산해 갭을 감수하지 않으므로 손절폭 산출에 쓰기엔 horizon이 맞지
     # 않는다. 갭을 뺀 일중 레인지(H-L)에 같은 칼만 평활을 적용한 계열을 따로 만든다.
     # atr_cutoff 게이트는 계속 기존 atr14를 쓴다(용도가 다름 — 국면 필터).
     # 미래참조 방지: atr_map과 완전히 동일하게 '전일까지'(kf_rng_path[i-1])만 참조한다.
-    kf_rng_path = np.empty(len(daily))
-    kf_r_, P_r, Q_r, R_r = None, 1.0, 0.002, 0.2
-    for j, rng_val in enumerate(daily['range'].values):
-        if kf_r_ is None:
-            kf_r_ = rng_val
-        else:
-            P_r = P_r + Q_r
-            K_r = P_r / (P_r + R_r)
-            kf_r_ = kf_r_ + K_r * (rng_val - kf_r_)
-            P_r = (1 - K_r) * P_r
-        kf_rng_path[j] = kf_r_
+    # [2026-08-12] 갭을 뺀 일중 레인지에 같은 칼만 평활(q=0.002, r=0.2) — indicators로 이관.
+    kf_rng_path = I.kalman_atr(daily['range'].values, q=0.002, r=0.2)
 
     atr_map, prev_range_map, intraday_atr_map = {}, {}, {}
     prev_close_map = {}
@@ -114,17 +108,17 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
     bucket60 = (df.index.astype('datetime64[ns]').astype(np.int64) // 10**9 // (trend_bar_minutes * 60))
 
     # Bollinger(20,2) 롤링 - BB 청산 타깃 + SAR 스퀴즈 필터 공용
-    bb_mid = pd.Series(closes).rolling(bb_window).mean().values
-    bb_std = pd.Series(closes).rolling(bb_window).std(ddof=1).values
-    bb_upper = bb_mid + bb_sigma * bb_std
-    bb_lower = bb_mid - bb_sigma * bb_std
-    bandwidth = (bb_upper - bb_lower) / bb_mid
-    squeeze_limit = pd.Series(bandwidth).rolling(squeeze_window).quantile(squeeze_quantile).values
+    # [2026-08-12] 볼린저/밴드폭/스퀴즈 분위수 → indicators로 이관(ddof=1 그대로).
+    # 밴드폭 분모는 실제 가격 공간이어야 한다. 이 파일은 back-adjust를 쓰지 않으므로
+    # closes가 곧 실제 가격이고, 중심선에 "actual" 태그를 붙여 넘기면 된다.
+    bb_mid, bb_upper, bb_lower = I.bollinger_series(closes, bb_window, bb_sigma, ddof=1)
+    bandwidth = I.bandwidth_series(bb_upper, bb_lower, I.Series(bb_mid, "actual"))
+    squeeze_limit = I.rolling_quantile(bandwidth, squeeze_window, squeeze_quantile)
 
     # [2026-08-11] 장기 이평선 방향 필터.
     # 종가가 이평선 위면 LONG만, 아래면 SHORT만 허용한다. 역방향 진입을 원천 차단해
     # 추세를 거스르는 거래를 없애려는 것. None이면 비활성(기존 동작과 100% 동일).
-    ma_line = (pd.Series(closes).rolling(ma_filter_period).mean().values
+    ma_line = (I.moving_average_series(closes, ma_filter_period)      # [2026-08-12] indicators 이관
                if ma_filter_period else None)
 
     # 이평선 기울기(pt/봉). 직전 봉까지만 쓰므로 인과적이다.
@@ -146,6 +140,18 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
             v = min(v, sl_hard_cap_pt)
         return v
 
+    # [2026-08-12] 봉 하나를 O→H→L→C 경로의 합성 틱으로 편다. sar_tick_mode 전용.
+    # 리플레이 하네스(scratch/replay/replay_harness.py --tick-order OHLC --ticks-per-bar)와
+    # 같은 규약이다. 시가 자신은 제외하고 각 구간 끝점(H·L·C)이 정확히 포함된다.
+    def _tick_path(o_, h_, l_, c_):
+        per = max(1, int(sar_ticks_per_bar) // 3)
+        out = []
+        for a_, b_ in ((o_, h_), (h_, l_), (l_, c_)):
+            step_ = (b_ - a_) / per
+            for k_ in range(1, per + 1):
+                out.append(a_ + step_ * k_)
+        return out
+
     cap = float(INIT_CAPITAL)
     equity, pnls, wins = [cap], [], 0
     pos, entry_price, peak_price = 0, 0.0, 0.0
@@ -158,7 +164,12 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
     prev_close_px = 0.0
     consec_losses = 0
     daily_loss_pt = 0.0
-    sar_value, sar_ep, sar_af, sar_bull = 0.0, 0.0, sar_af_init, True
+    # [2026-08-12] 인라인 SAR 4개 변수 → indicators.SarState 한 개로 교체.
+    # 갱신 순서(SAR 전진 → peak_price 클램프 → EP/AF 갱신)는 종전과 완전히 같다.
+    # 주의: 이 백테스터는 EP 갱신 기준으로 고가/저가가 아니라 '종가'를 쓴다(비표준).
+    # 그 동작을 그대로 보존하려고 on_bar에 high=low=c_close를 넘긴다. 봉마다 1회 호출.
+    sar = I.SarState(sar=0.0, ep=0.0, af=sar_af_init, bull=True,
+                     af_init=sar_af_init, af_step=sar_af_step, af_max=sar_af_max)
 
     def reentry_ok(direction, price):
         exit_price = last_long_exit if direction == 1 else last_short_exit
@@ -205,28 +216,12 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
 
         enough_data = i >= kf_window
         if enough_data:
-            window_closes = closes[i - kf_window:i]
-            x, P = None, 1.0
-            kf_path = np.empty(len(window_closes))
-            for j, z in enumerate(window_closes):
-                if x is None:
-                    x = z
-                else:
-                    P = P + Q
-                    K = P / (P + R)
-                    x = x + K * (z - x)
-                    P = (1 - K) * P
-                kf_path[j] = x
-            kf_price = kf_path[-1]
-            errs = window_closes - kf_path
-            std_slice = errs[-std_window:]
-            if trim_std_outliers > 0 and len(std_slice) > trim_std_outliers:
-                order = np.argsort(np.abs(std_slice))
-                std_slice = std_slice[order[:-trim_std_outliers]]
-            std_error = np.std(std_slice)
-            if not np.isfinite(std_error) or std_error <= 0:
-                std_error = 0.5
-            band = std_error * mult
+            # [2026-08-12] 칼만 평활 + 잔차 표준편차 → indicators로 이관.
+            # 창을 먼저 잘라서 넘기므로(closed_upto는 끝점 배타적) 당봉 종가 closes[i]가
+            # 구조적으로 창에 들어갈 수 없다. 잘리는 구간은 종전 closes[i-kf_window:i]와 동일.
+            _win = I.Window.closed_upto(closes, i, kf_window)
+            std_error, kf_price = I.kalman_residual_std(
+                _win, Q, R, std_window=std_window, trim=trim_std_outliers, fallback=0.5)
             if entry_target_mode == 'breakout':
                 # 앵커: 타점의 중심을 어디에 두는가.
                 #   open       시초가 — 갭이 타점을 통째로 밀어 올린다(현행)
@@ -249,10 +244,9 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                 # 실거래(era_order_manager.py:4065)가 SAR에 실제로 쓰던 타점.
                 # 시초가에서 전일 Range의 K배만큼 떨어진 고정 가격이라, 칼만 밴드와 달리
                 # 장중에 움직이지 않는다. std_error는 필터용으로만 계속 계산한다.
-                target_long = _anchor + _w * breakout_k
-                target_short = _anchor - _w * breakout_k
+                target_long, target_short = I.breakout_targets(_anchor, _w, breakout_k)
             else:
-                target_long, target_short = kf_price + band, kf_price - band
+                target_long, target_short = I.kalman_band_targets(kf_price, std_error, mult)
 
             lb_start = max(0, i - 300)
             wb, wc = bucket60[lb_start:i], closes[lb_start:i]
@@ -262,17 +256,8 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                 uniq_b, first_idx = np.unique(rev_b, return_index=True)
                 long_closes = rev_c[first_idx]
                 if len(long_closes) >= 5:
-                    xl, Pl = None, 1.0
-                    kf_long_path = np.empty(len(long_closes))
-                    for j, zl in enumerate(long_closes):
-                        if xl is None:
-                            xl = zl
-                        else:
-                            Pl = Pl + trend_q
-                            Kl = Pl / (Pl + trend_r)
-                            xl = xl + Kl * (zl - xl)
-                            Pl = (1 - Kl) * Pl
-                        kf_long_path[j] = xl
+                    # [2026-08-12] 장기추세 칼만 → indicators로 이관(경로 전체가 필요해 kalman_path).
+                    kf_long_path = I.kalman_path(I.Window(long_closes), trend_q, trend_r)
                     slope = kf_long_path[-1] - kf_long_path[-2]
                     trend = "UP" if slope > trend_slope_threshold else ("DOWN" if slope < -trend_slope_threshold else "NEUTRAL")
 
@@ -282,24 +267,38 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
         if pos != 0:
             exit_price, is_force = None, False
             if pos == 1:
+                _prev_peak = peak_price   # [2026-08-12] sar_tick_mode 전용: 이 봉을 반영하기 '전'의 피크
                 peak_price = max(peak_price, c_high)
                 pnl_pt = c_close - entry_price
                 ts_fire = (time_stop_enabled and entry_time is not None and
                            (ts - entry_time).total_seconds() >= time_stop_minutes * 60 and
                            (peak_price - entry_price) < time_stop_mfe_pt)
                 if strategy == 'sar':
-                    if sar_bull:
-                        sar_value = min(sar_value + sar_af * (sar_ep - sar_value), peak_price)
-                        if c_close > sar_ep:
-                            sar_ep = c_close
-                            sar_af = min(sar_af + sar_af_step, sar_af_max)
+                    if sar.bull:
                         sl_limit = _sl_limit(sar_sl_mult)   # [2026-08-11] 일중ATR/절대캡 반영
-                        if force_close or vol_force_close:
-                            exit_price, is_force = c_close, True
-                        elif c_low <= sar_value or pnl_pt <= -sl_limit:
-                            exit_price = min(c_close, max(sar_value, c_low))
-                        elif ts_fire:
-                            exit_price = c_close
+                        if sar_tick_mode:
+                            # [2026-08-12] 라이브(_sar_tick) cadence — 봉 안을 틱으로 걸으며
+                            # 매 틱 SAR 전진·AF 상승·청산 판정. 청산가는 그 틱 가격(라이브 동일).
+                            if force_close or vol_force_close:
+                                exit_price, is_force = c_close, True
+                            else:
+                                _pk = _prev_peak
+                                for _p in _tick_path(c_open, c_high, c_low, c_close):
+                                    _pk = max(_pk, _p)
+                                    sar.on_tick(_p, clamp=_pk)
+                                    if _p <= sar.sar or (_p - entry_price) <= -sl_limit:
+                                        exit_price = _p
+                                        break
+                                if exit_price is None and ts_fire:
+                                    exit_price = c_close
+                        else:
+                            sar.on_bar(c_close, c_close, clamp=peak_price)   # [2026-08-12] SarState
+                            if force_close or vol_force_close:
+                                exit_price, is_force = c_close, True
+                            elif c_low <= sar.sar or pnl_pt <= -sl_limit:
+                                exit_price = min(c_close, max(sar.sar, c_low))
+                            elif ts_fire:
+                                exit_price = c_close
                     else:
                         sl_limit = _sl_limit(sar_sl_mult)   # [2026-08-11] 일중ATR/절대캡 반영
                         if force_close or vol_force_close:
@@ -325,24 +324,37 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                     elif (max_pnl_pt >= bb_trail_std_mult * std_error) and (c_low <= peak_price - bb_trail_exit_mult * std_error):
                         exit_price = min(c_close, max(peak_price - bb_trail_exit_mult * std_error, c_low))
             else:
+                _prev_peak = peak_price   # [2026-08-12] sar_tick_mode 전용: 이 봉을 반영하기 '전'의 피크
                 peak_price = min(peak_price, c_low)
                 pnl_pt = entry_price - c_close
                 ts_fire = (time_stop_enabled and entry_time is not None and
                            (ts - entry_time).total_seconds() >= time_stop_minutes * 60 and
                            (entry_price - peak_price) < time_stop_mfe_pt)
                 if strategy == 'sar':
-                    if not sar_bull:
-                        sar_value = max(sar_value - sar_af * (sar_value - sar_ep), peak_price)
-                        if c_close < sar_ep:
-                            sar_ep = c_close
-                            sar_af = min(sar_af + sar_af_step, sar_af_max)
+                    if not sar.bull:
                         sl_limit = _sl_limit(sar_sl_mult)   # [2026-08-11] 일중ATR/절대캡 반영
-                        if force_close or vol_force_close:
-                            exit_price, is_force = c_close, True
-                        elif c_high >= sar_value or pnl_pt <= -sl_limit:
-                            exit_price = max(c_close, min(sar_value, c_high))
-                        elif ts_fire:
-                            exit_price = c_close
+                        if sar_tick_mode:
+                            # [2026-08-12] LONG 쪽과 동일 — 라이브(_sar_tick) cadence.
+                            if force_close or vol_force_close:
+                                exit_price, is_force = c_close, True
+                            else:
+                                _pk = _prev_peak
+                                for _p in _tick_path(c_open, c_high, c_low, c_close):
+                                    _pk = min(_pk, _p)
+                                    sar.on_tick(_p, clamp=_pk)
+                                    if _p >= sar.sar or (entry_price - _p) <= -sl_limit:
+                                        exit_price = _p
+                                        break
+                                if exit_price is None and ts_fire:
+                                    exit_price = c_close
+                        else:
+                            sar.on_bar(c_close, c_close, clamp=peak_price)   # [2026-08-12] SarState
+                            if force_close or vol_force_close:
+                                exit_price, is_force = c_close, True
+                            elif c_high >= sar.sar or pnl_pt <= -sl_limit:
+                                exit_price = max(c_close, min(sar.sar, c_high))
+                            elif ts_fire:
+                                exit_price = c_close
                     else:
                         sl_limit = _sl_limit(sar_sl_mult)   # [2026-08-11] 일중ATR/절대캡 반영
                         if force_close or vol_force_close:
@@ -374,9 +386,9 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                 if is_force:
                     exit_reason = '강제청산'
                 elif strategy == 'sar':
-                    if pos == 1 and sar_bull and c_low <= sar_value:
+                    if pos == 1 and sar.bull and c_low <= sar.sar:
                         exit_reason = 'SAR역전'
-                    elif pos == -1 and (not sar_bull) and c_high >= sar_value:
+                    elif pos == -1 and (not sar.bull) and c_high >= sar.sar:
                         exit_reason = 'SAR역전'
                     elif pnl_pt <= -sl_limit:
                         exit_reason = '손절'
@@ -470,8 +482,9 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                 pos, entry_price, peak_price = _dir, fill, fill
                 entry_time = dt_index[i]
                 if strategy == 'sar':
-                    sar_value = fill - atr14 * sar_sl_mult * _dir
-                    sar_ep, sar_af, sar_bull = fill, sar_af_init, _dir > 0
+                    # [2026-08-12] flip: sar = fill ∓ atr, ep = fill, af = af_init, bull = _dir>0.
+                    # 종전 'fill - atr14*sar_sl_mult*_dir'과 부호까지 동일하다.
+                    sar.flip(fill, atr14 * sar_sl_mult, _dir > 0)
         elif c_low <= target_short:
             if ma_line is not None and i >= 1 and not np.isnan(ma_line[i - 1]):
                 _below = closes[i - 1] <= ma_line[i - 1]
@@ -500,8 +513,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                 pos, entry_price, peak_price = _dir, fill, fill
                 entry_time = dt_index[i]
                 if strategy == 'sar':
-                    sar_value = fill - atr14 * sar_sl_mult * _dir
-                    sar_ep, sar_af, sar_bull = fill, sar_af_init, _dir > 0
+                    sar.flip(fill, atr14 * sar_sl_mult, _dir > 0)   # [2026-08-12] LONG쪽과 동일
 
     total = len(pnls)
     if total == 0:

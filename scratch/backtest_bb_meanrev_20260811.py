@@ -24,53 +24,24 @@ import sys, os, sqlite3
 import numpy as np
 import pandas as pd
 
+# [2026-08-12 지표 단일화] 자체 구현 지표를 indicators.py로 교체.
+# 교체 대상은 '계산'뿐이며 전략 로직·비용 모델·진입 조건은 건드리지 않는다.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import indicators as I
+
 DB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "futures_data.db")
 INIT_CAPITAL = 50_000_000
 
 
 # ── 지표 (전부 순수 함수, 당봉 제외 규약은 호출부에서 [i-1]로 지킨다) ──────────
+# [2026-08-12] wilder_adx / rsi 자체 구현을 indicators.py로 이관.
+# 기존 함수명을 유지해 호출부를 바꾸지 않는다(동작 무변경 리팩터링).
 def wilder_adx(high, low, close, window=14):
-    n = len(close)
-    tr = np.zeros(n); pdm = np.zeros(n); ndm = np.zeros(n)
-    tr[0] = high[0] - low[0]
-    for i in range(1, n):
-        tr[i] = max(high[i]-low[i], abs(high[i]-close[i-1]), abs(low[i]-close[i-1]))
-        up, dn = high[i]-high[i-1], low[i-1]-low[i]
-        pdm[i] = up if (up > dn and up > 0) else 0.0
-        ndm[i] = dn if (dn > up and dn > 0) else 0.0
-    def rma(x):
-        o = np.full(n, np.nan); s = np.nansum(x[1:window+1])
-        if n <= window: return o
-        o[window] = s / window
-        for i in range(window+1, n):
-            o[i] = (o[i-1]*(window-1) + x[i]) / window
-        return o
-    atr_, pd_, nd_ = rma(tr), rma(pdm), rma(ndm)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        pdi = 100*pd_/atr_; ndi = 100*nd_/atr_
-        dx = 100*np.abs(pdi-ndi)/(pdi+ndi)
-    adx = np.full(n, np.nan)
-    valid = np.where(~np.isnan(dx))[0]
-    if len(valid) > window:
-        st = valid[0]+window
-        if st < n:
-            adx[st] = np.nanmean(dx[valid[0]:st])
-            for i in range(st+1, n):
-                adx[i] = (adx[i-1]*(window-1) + dx[i]) / window
-    return adx
+    return I.wilder_adx(high, low, close, window)
 
 
 def rsi(close, window=14):
-    n = len(close); d = np.diff(close, prepend=close[0])
-    g = np.where(d > 0, d, 0.0); l = np.where(d < 0, -d, 0.0)
-    ag = np.full(n, np.nan); al = np.full(n, np.nan)
-    if n <= window: return np.full(n, np.nan)
-    ag[window] = g[1:window+1].mean(); al[window] = l[1:window+1].mean()
-    for i in range(window+1, n):
-        ag[i] = (ag[i-1]*(window-1)+g[i])/window
-        al[i] = (al[i-1]*(window-1)+l[i])/window
-    with np.errstate(divide='ignore', invalid='ignore'):
-        return 100 - 100/(1 + ag/al)
+    return I.wilder_rsi(I.Window(np.asarray(close, dtype=float)), window)
 
 
 def load(code="10500000", session_filter=True):
@@ -82,7 +53,8 @@ def load(code="10500000", session_filter=True):
     df = df.dropna(subset=['dt']).set_index('dt')
     df['date_day'] = df['date'].str[:8]
     if session_filter:
-        df = df.between_time('09:00', '15:35')
+        # [2026-08-12] indicators.filter_session 위임 (FEED_B와 같은 세션 범위)
+        df = I.filter_session(df, *I.FEED_B.session)
     return df
 
 
@@ -108,29 +80,24 @@ def run_bb_meanrev(df,
     l = df['low'].values.astype(float);  c = df['close'].values.astype(float)
     dk = df['date_day'].values; ts = df.index
 
-    mid = pd.Series(c).rolling(bb_window).mean().values
-    sd  = pd.Series(c).rolling(bb_window).std(ddof=1).values
-    up, lo = mid + bb_sigma*sd, mid - bb_sigma*sd
-    with np.errstate(divide='ignore', invalid='ignore'):
-        bw = (up - lo) / mid
-        pctb = (c - lo) / (up - lo)
-    bw_hi = pd.Series(bw).rolling(bw_window).quantile(bw_hi_quantile).values
-    bw_sq = (pd.Series(bw).rolling(bw_window).quantile(squeeze_block_quantile).values
+    # [2026-08-12] 볼린저·밴드폭·분위수·%B를 indicators.py로 위임.
+    # 밴드폭 분모는 실제 가격 공간(Series space="actual") — back-adjust 미사용이므로 그대로.
+    mid, up, lo = I.bollinger_series(c, bb_window, bb_sigma, ddof=1)
+    bw = I.bandwidth_series(up, lo, I.Series(mid, "actual"))
+    pctb = I.percent_b_series(c, up, lo)
+    bw_hi = I.rolling_quantile(bw, bw_window, bw_hi_quantile)
+    bw_sq = (I.rolling_quantile(bw, bw_window, squeeze_block_quantile)
              if squeeze_block_quantile is not None else None)
     adx = wilder_adx(h, l, c, adx_window) if regime == 'adx' else None
-    ma  = pd.Series(c).rolling(ma_period).mean().values if regime == 'ma_slope' else None
+    ma  = I.moving_average_series(c, ma_period) if regime == 'ma_slope' else None
     rs  = rsi(c, rsi_window) if aux == 'rsi' else None
 
     # 일별 ATR (전일까지) — 손절폭용
     dd = df.groupby('date_day').agg(hh=('high','max'), ll=('low','min'), cc=('close','last')).reset_index()
     dd['pc'] = dd.cc.shift(1)
-    tr = np.maximum(dd.hh-dd.ll, np.maximum((dd.hh-dd.pc).abs(), (dd.ll-dd.pc).abs())).fillna(dd.hh-dd.ll)
-    x, P, path = None, 1.0, []
-    for v in tr.values:
-        if x is None: x = v
-        else:
-            P += 0.002; K = P/(P+0.2); x = x + K*(v-x); P = (1-K)*P
-        path.append(x)
+    # [2026-08-12] TR·칼만ATR을 indicators.py로 위임 (수식 동일)
+    tr = pd.Series(I.true_range(dd.hh, dd.ll, dd.pc), index=dd.index)
+    path = list(I.kalman_atr(tr.values))
     amap = {k: (float(path[i-1]) if i > 0 and path[i-1] > 0 else 2.0) for i, k in enumerate(dd.date_day)}
 
     cap = float(INIT_CAPITAL); equity = [cap]; pnls = []; wins = 0

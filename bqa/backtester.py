@@ -3,11 +3,17 @@ import os
 import sys
 import pandas as pd
 import numpy as np
-import ta
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 workspace_root = os.path.abspath(os.path.join(current_dir, ".."))
 sys.path.append(workspace_root)
+
+# 지표 계산 단일 소스 (마이그레이션 4번, 2026-08-12). 이전에는 `ta` 패키지를 썼다.
+# 동작 무변경이 목표이므로 ta의 비표준 시맨틱을 그대로 재현하는 ta_* 변형을 쓴다:
+#   - 볼린저: ta는 모표준편차(ddof=0). 라이브(era_order_manager)의 ddof=1과 다르다.
+#   - RSI:    ta는 Wilder RSI가 아니다(0 시드 EWM). wilder_rsi와 최대 26.15 차이.
+# 이 차이는 이번에 고치지 않는다 — 발견 목록 N1/N2 참조.
+import indicators as I
 
 def load_futures_data(db_path):
     conn = sqlite3.connect(db_path)
@@ -36,12 +42,13 @@ def run_futures_backtest():
     print(f"데이터 로드 완료: {len(df)}개 캔들 ({df.index[0]} ~ {df.index[-1]})\n")
     
     # 지표 계산
-    indicator_bb = ta.volatility.BollingerBands(close=df['close'], window=20, window_dev=2)
-    df['bb_m'] = indicator_bb.bollinger_mavg()
-    df['bb_h'] = indicator_bb.bollinger_hband()
-    df['bb_l'] = indicator_bb.bollinger_lband()
-    
-    df['rsi'] = ta.momentum.RSIIndicator(close=df['close'], window=14).rsi()
+    _closes = df['close'].to_numpy(dtype=float)
+    _bb_m, _bb_h, _bb_l = I.bollinger_series(_closes, 20, 2.0, ddof=0)  # ddof=0 = ta 시맨틱
+    df['bb_m'] = _bb_m
+    df['bb_h'] = _bb_h
+    df['bb_l'] = _bb_l
+
+    df['rsi'] = I.ta_rsi_series(_closes, 14)
     df.dropna(inplace=True)
     
     df['rsi_min_5'] = df['rsi'].rolling(window=5).min()

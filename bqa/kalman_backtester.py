@@ -5,6 +5,80 @@ import os
 import sys
 import argparse
 
+# [2026-08-12 지표 단일화 C단계] 지표 '계산'만 indicators.py 단일 소스로 교체한다.
+# 동작 무변경 리팩터링 — 전략 로직·비용 모델·진입/청산 조건·세션 필터는 한 줄도 손대지 않았다.
+# 이 백테스터는 back-adjust를 쓰지 않으므로 모든 시계열이 실제 가격 공간(actual)이다.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import indicators as I
+
+
+class _GapFillUnset:
+    """realistic_gap_fill 미지정 감시용 센티널 (2026-08-12).
+
+    기본값이 그냥 False면 "봉이 목표가를 갭으로 관통해도 목표가에 체결"하는 유령체결이
+    조용히 켜진다. 2026-08-10 감사(scratch/audit_gapfill_20260810.py)에서 이 때문에
+    승률 81%가 통째로 허수였음이 드러났는데도, 명시하지 않고 부르면 같은 일이 반복된다.
+    실제로 2026-08-12 진단에서 또 밟았다.
+
+    그래서 "미지정"과 "명시적 False"를 구분한다. 동작은 기존과 100% 동일(False)하되,
+    미지정이면 경고를 남겨 호출자가 반드시 의식적으로 고르게 한다.
+    환경변수 BT_STRICT_GAPFILL=1 이면 경고 대신 예외를 던진다(CI/회귀용).
+    """
+
+    __slots__ = ()
+
+    def __bool__(self):
+        return False
+
+    def __repr__(self):
+        return "<realistic_gap_fill 미지정>"
+
+
+_GAPFILL_UNSET = _GapFillUnset()
+_gapfill_warned = set()
+
+
+def _resolve_gap_fill(value, func_name):
+    """미지정이면 경고(또는 예외) 후 기존 기본값 False를 돌려준다."""
+    if not isinstance(value, _GapFillUnset):
+        return bool(value)
+    msg = (
+        "[백테스터 경고] %s(realistic_gap_fill=...) 를 지정하지 않았습니다. "
+        "기존 기본값 False로 진행합니다 — 봉이 목표가를 갭으로 관통해도 목표가에 "
+        "체결된 것으로 처리하는 낙관적 가정입니다(유령체결). 실체결 대조에서 "
+        "PF 11.37 vs 0.63 의 괴리가 확인됐습니다. True/False를 명시하세요."
+        % func_name
+    )
+    if os.environ.get("BT_STRICT_GAPFILL") == "1":
+        raise ValueError(msg)
+    if func_name not in _gapfill_warned:
+        _gapfill_warned.add(func_name)
+        print(msg, file=sys.stderr)
+    return False
+
+
+def _daily_kf_atr(df):
+    """일별 집계 + 일봉 TR(오버나잇 갭 포함) + 칼만 평활(Q=0.002, R=0.2) 경로.
+
+    [2026-08-12 C단계] run_production_rolling_k / run_chandelier_live_replica /
+    run_kalman_night_replica / run_kalman_live_replica_oc 네 곳에 바이트 단위로
+    동일하게 복제돼 있던 블록의 1소스. 계산 자체는 indicators.true_range +
+    indicators.kalman_atr에 위임한다.
+
+    반환: (daily DataFrame['date_day','high','low','close','range'], kf_atr_path, day_list)
+
+    주의: atr_map 인덱스 규약(주간 i-1 / 야간 i)은 **호출부에 남긴다.**
+    두 규약의 차이는 의도된 것이므로 여기서 통일하지 않는다.
+    """
+    daily = df.groupby('date_day').agg(high=('high', 'max'), low=('low', 'min'),
+                                       close=('close', 'last')).reset_index()
+    daily['prev_close'] = daily['close'].shift(1)
+    tr = I.true_range(daily['high'].values, daily['low'].values, daily['prev_close'].values)
+    kf_atr_path = I.kalman_atr(tr, q=0.002, r=0.2)
+    daily['range'] = daily['high'] - daily['low']
+    return daily, kf_atr_path, daily['date_day'].tolist()
+
+
 class KalmanFilter1D:
     def __init__(self, Q=0.0001, R=0.5):
         self.Q = Q
@@ -139,8 +213,8 @@ def run_production_rolling_k(df):
                 if pr <= 0: continue
                 
                 day_open_val = day_candles.iloc[0]['open']
-                tgt_l_val = day_open_val + pr * cand_k
-                tgt_s_val = day_open_val - pr * cand_k
+                # [2026-08-12 C단계] 변동성 돌파 타점 → indicators.breakout_targets.
+                tgt_l_val, tgt_s_val = I.breakout_targets(day_open_val, pr, cand_k)
                 
                 pos_val = 0
                 entry_val = 0.0
@@ -211,8 +285,8 @@ def run_production_rolling_k(df):
         if day_candles.empty: continue
         
         day_open = day_candles.iloc[0]['open']
-        tgt_l = day_open + pr * K
-        tgt_s = day_open - pr * K
+        # [2026-08-12 C단계] 변동성 돌파 타점 → indicators.breakout_targets.
+        tgt_l, tgt_s = I.breakout_targets(day_open, pr, K)
         
         pos = 0
         entry_price = 0.0
@@ -438,10 +512,11 @@ def run_kalman_live_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=2.0, atr_c
                              force_close_hour=8, force_close_minute=45, force_close_window_min=10,
                              trend_ts_trigger_mult=None, trend_ts_callback_mult=None,
                              notrend_ts_trigger_mult=None, notrend_ts_callback_mult=None,
-                             gap_guard_mult=None, realistic_gap_fill=False,
+                             gap_guard_mult=None, realistic_gap_fill=_GAPFILL_UNSET,
                              reset_kf_daily=False, trim_std_outliers=0,
                              entry_start_hour=9, entry_start_minute=0,
-                             trend_tp_sigma_mult=None):
+                             trend_tp_sigma_mult=None,
+                             return_trades=False):
     """
     era_order_manager.py의 실전 주간선물 칼만 전략(update_kalman_targets / _process_day_tick)을
     최대한 동일하게 재현한 백테스트. (2026-07-01 기준 최종 라이브 로직과 일치화됨)
@@ -548,6 +623,8 @@ def run_kalman_live_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=2.0, atr_c
         목표가(기본 4*std_error)에 도달하기엔 부족했을 가능성이 있어, 목표가 자체를 늘리는
         이 방식을 별도로 검증한다.
     """
+    realistic_gap_fill = _resolve_gap_fill(realistic_gap_fill, "run_kalman_live_replica")
+
     n = len(df)
     if n < kf_window + 10:
         return None
@@ -561,25 +638,9 @@ def run_kalman_live_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=2.0, atr_c
 
     # --- 일별 ATR 사전 계산: 전일까지의 데이터만 사용, era_order_manager.py의 update_futures_dynamic_sl_tp와
     #     동일한 1차원 칼만필터(Q=0.002, R=0.2) 기반 ATR 산출 (단순 rolling(14).mean()이 아님 — 라이브와 동일하게 맞춤) ---
-    daily = df.groupby('date_day').agg(high=('high', 'max'), low=('low', 'min'), close=('close', 'last')).reset_index()
-    daily['prev_close'] = daily['close'].shift(1)
-    tr = np.maximum(daily['high'] - daily['low'],
-                     np.maximum((daily['high'] - daily['prev_close']).abs(),
-                                (daily['low'] - daily['prev_close']).abs())).fillna(daily['high'] - daily['low'])
-    kf_atr_path = np.empty(len(tr))
-    kf_atr, P_atr, Q_atr, R_atr = None, 1.0, 0.002, 0.2
-    for j, tr_val in enumerate(tr.values):
-        if kf_atr is None:
-            kf_atr = tr_val
-        else:
-            P_atr = P_atr + Q_atr
-            K_atr = P_atr / (P_atr + R_atr)
-            kf_atr = kf_atr + K_atr * (tr_val - kf_atr)
-            P_atr = (1 - K_atr) * P_atr
-        kf_atr_path[j] = kf_atr
-    daily['range'] = daily['high'] - daily['low']
+    # [2026-08-12 C단계] TR+칼만 계산은 _daily_kf_atr(→ indicators.true_range/kalman_atr)로 이관.
+    daily, kf_atr_path, day_list = _daily_kf_atr(df)
     atr_map, prev_range_map = {}, {}
-    day_list = daily['date_day'].tolist()
     for i, dkey in enumerate(day_list):
         if i == 0:
             atr_map[dkey] = 2.0
@@ -587,7 +648,8 @@ def run_kalman_live_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=2.0, atr_c
         else:
             v = kf_atr_path[i - 1]
             atr_map[dkey] = float(v) if pd.notna(v) and v > 0 else 2.0
-            prev_range_map[dkey] = float(daily['range'].iloc[i - 1])
+            # [2026-08-12 C단계] daily['range'].iloc[i-1] == prev_session_range(..., upto_exclusive=i)
+            prev_range_map[dkey] = I.prev_session_range(daily['high'].values, daily['low'].values, i)
 
     # --- 장기 추세필터용 N분 버킷 ID (epoch 시간 기준 정수 버킷) ---
     # (2026-07-09: era_order_manager.py의 update_kalman_targets()가 실제로는 15분봉으로
@@ -620,6 +682,8 @@ def run_kalman_live_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=2.0, atr_c
     contracts = max(1, min(max_contracts, int(safe_budget // margin_per))) if margin_per > 0 else 1
 
     pos, entry_price, peak_price = 0, 0.0, 0.0
+    entry_time = None
+    trade_log = []
     day_high, day_low, cur_day = -np.inf, np.inf, None
     day_start_idx = 0
     last_long_exit, last_short_exit = 0.0, 0.0
@@ -679,30 +743,14 @@ def run_kalman_live_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=2.0, atr_c
             window_start = i - kf_window
             enough_data = i >= kf_window
         if enough_data:
-            window_closes = closes[window_start:i]
-            x, P = None, 1.0
-            kf_path = np.empty(len(window_closes))
-            for j, z in enumerate(window_closes):
-                if x is None:
-                    x = z
-                else:
-                    P = P + Q
-                    K = P / (P + R)
-                    x = x + K * (z - x)
-                    P = (1 - K) * P
-                kf_path[j] = x
-            kf_price = kf_path[-1]
-            errs = window_closes - kf_path
-            std_slice = errs[-std_window:]
-            if trim_std_outliers > 0 and len(std_slice) > trim_std_outliers:
-                order = np.argsort(np.abs(std_slice))
-                std_slice = std_slice[order[:-trim_std_outliers]]
-            std_error = np.std(std_slice)
-            if not np.isfinite(std_error) or std_error <= 0:
-                std_error = 0.5
-            band = std_error * mult
-            target_long, target_short = kf_price + band, kf_price - band
-            tp_long, tp_short = kf_price + tp_sigma_mult * std_error, kf_price - tp_sigma_mult * std_error
+            # [2026-08-12 C단계] 창 칼만 + 잔차 std → indicators로 이관.
+            # Window.closed_upto(closes, i, size)는 closes[i-size:i] = closes[window_start:i]와
+            # 동일(배타적 인덱스). enough_data 가드가 이미 window_start>=0을 보장하므로 None은 나오지 않는다.
+            w = I.Window.closed_upto(closes, i, i - window_start)
+            std_error, kf_price = I.kalman_residual_std(
+                w, Q, R, std_window=std_window, trim=trim_std_outliers, fallback=0.5)
+            target_long, target_short = I.kalman_band_targets(kf_price, std_error, mult)
+            tp_long, tp_short = I.kalman_band_targets(kf_price, std_error, tp_sigma_mult)
 
             lb_start = max(0, i - 300)
             wb, wc = bucket60[lb_start:i], closes[lb_start:i]
@@ -712,17 +760,9 @@ def run_kalman_live_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=2.0, atr_c
                 _, first_idx = np.unique(rev_b, return_index=True)
                 long_closes = rev_c[first_idx]
                 if len(long_closes) >= 5:
-                    xl, Pl = None, 1.0
-                    kf_long_path = np.empty(len(long_closes))
-                    for j, zl in enumerate(long_closes):
-                        if xl is None:
-                            xl = zl
-                        else:
-                            Pl = Pl + trend_q
-                            Kl = Pl / (Pl + trend_r)
-                            xl = xl + Kl * (zl - xl)
-                            Pl = (1 - Kl) * Pl
-                        kf_long_path[j] = xl
+                    # [2026-08-12 C단계] 장기추세 칼만 → indicators.kalman_path.
+                    # 기울기 계산에 경로 마지막 두 점이 필요하므로 residual_std가 아니라 kalman_path.
+                    kf_long_path = I.kalman_path(I.Window(long_closes), trend_q, trend_r)
                     slope = kf_long_path[-1] - kf_long_path[-2]
                     trend = "UP" if slope > 0.01 else ("DOWN" if slope < -0.01 else "NEUTRAL")
 
@@ -834,6 +874,15 @@ def run_kalman_live_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=2.0, atr_c
                     last_long_exit = exit_price
                 else:
                     last_short_exit = exit_price
+                if return_trades:
+                    trade_log.append({
+                        'entry_time': entry_time, 'exit_time': dt_index[i],
+                        'direction': 'LONG' if pos == 1 else 'SHORT',
+                        'entry_price': entry_price, 'exit_price': exit_price,
+                        'pnl_pt': raw_pnl - exit_slip, 'is_force': is_force, 'is_sl': is_sl,
+                        'reason': 'SL' if is_sl else ('FORCE' if is_force else 'TP_TRAIL'),
+                        'contracts': contracts, 'gain_krw': gain,
+                    })
                 pos, entry_price, peak_price = 0, 0.0, 0.0
             continue
 
@@ -857,6 +906,7 @@ def run_kalman_live_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=2.0, atr_c
             elif not enable_reentry_filter or reentry_ok(1, target_long):
                 fill = (max(c_open, target_long) + SLIP_ENTRY) if realistic_gap_fill else (target_long + SLIP_ENTRY)
                 pos, entry_price, peak_price = 1, fill, fill
+                entry_time = dt_index[i]
         elif c_low <= target_short:
             open_gap = max(target_short - c_open, 0.0)
             if gap_guard_mult is not None and open_gap > gap_guard_mult * std_error:
@@ -866,6 +916,7 @@ def run_kalman_live_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=2.0, atr_c
             elif not enable_reentry_filter or reentry_ok(-1, target_short):
                 fill = (min(c_open, target_short) - SLIP_ENTRY) if realistic_gap_fill else (target_short - SLIP_ENTRY)
                 pos, entry_price, peak_price = -1, fill, fill
+                entry_time = dt_index[i]
 
     total = len(pnls)
     if total == 0:
@@ -888,9 +939,12 @@ def run_kalman_live_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=2.0, atr_c
     avg_loss_pt = (sum(losses_list) / len(losses_list) / denom) if losses_list else 0.0
     loss_win_ratio = (abs(avg_loss_pt) / avg_win_pt) if avg_win_pt > 0 else None
 
-    return {'trades': total, 'win_rate': win_rate, 'profit_pct': profit_pct, 'mdd': max_mdd, 'pf': pf,
-            'contracts': contracts, 'avg_win_pt': avg_win_pt, 'avg_loss_pt': avg_loss_pt,
-            'loss_win_ratio': loss_win_ratio}
+    result = {'trades': total, 'win_rate': win_rate, 'profit_pct': profit_pct, 'mdd': max_mdd, 'pf': pf,
+              'contracts': contracts, 'avg_win_pt': avg_win_pt, 'avg_loss_pt': avg_loss_pt,
+              'loss_win_ratio': loss_win_ratio}
+    if return_trades:
+        result['trade_log'] = trade_log
+    return result
 
 
 def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
@@ -921,7 +975,8 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                                  margin_per_contract=None, margin_rate=None,
                                  signal_only_on_5min=False,
                                  time_stop_enabled=False, time_stop_minutes=10.0, time_stop_mfe_pt=4.0,
-                                 realistic_gap_fill=False, gap_guard_mult=None):
+                                 realistic_gap_fill=_GAPFILL_UNSET, gap_guard_mult=None,
+                                 ma_filter_period=None, ma_filter_invert=False):
     """
     era_order_manager.py의 실전 주간선물 "샹들리에 청산"(2026-07-15 도입, futures_strategy_type=
     "chandelier")을 재현한 백테스트. run_kalman_live_replica와 진입측(칼만 타점/장기추세필터/
@@ -1005,6 +1060,8 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
         이익권에 못 가는" 정체 트레이드를 조기 정리). profit_lock_enabled와 독립적으로
         동작하며, 두 기능의 MFE 계산은 각각 별도로 이뤄진다.
     """
+    realistic_gap_fill = _resolve_gap_fill(realistic_gap_fill, "run_chandelier_live_replica")
+
     n = len(df)
     if n < kf_window + 10:
         return None
@@ -1016,25 +1073,17 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
     day_keys = df['date_day'].values
     dt_index = df.index
 
-    daily = df.groupby('date_day').agg(high=('high', 'max'), low=('low', 'min'), close=('close', 'last')).reset_index()
-    daily['prev_close'] = daily['close'].shift(1)
-    tr = np.maximum(daily['high'] - daily['low'],
-                     np.maximum((daily['high'] - daily['prev_close']).abs(),
-                                (daily['low'] - daily['prev_close']).abs())).fillna(daily['high'] - daily['low'])
-    kf_atr_path = np.empty(len(tr))
-    kf_atr, P_atr, Q_atr, R_atr = None, 1.0, 0.002, 0.2
-    for j, tr_val in enumerate(tr.values):
-        if kf_atr is None:
-            kf_atr = tr_val
-        else:
-            P_atr = P_atr + Q_atr
-            K_atr = P_atr / (P_atr + R_atr)
-            kf_atr = kf_atr + K_atr * (tr_val - kf_atr)
-            P_atr = (1 - K_atr) * P_atr
-        kf_atr_path[j] = kf_atr
-    daily['range'] = daily['high'] - daily['low']
+    # (2026-08-13) 장기 이평선 방향 필터 — era_order_manager.py 4939~4952행 이식.
+    #   종가가 이평선 위면 LONG만, 아래면 SHORT만 허용한다.
+    #   라이브에서는 이 필터가 is_chandelier 게이트 없이 주간선물 진입 경로 전체에 걸리는데,
+    #   이 재현 함수엔 구현이 없어 "샹들리에 + MA200" 조합을 백테스트할 수 없었다.
+    #   판정식은 scratch/backtest_sar_bb_20260809.py 구현과 동일하게 맞췄다.
+    #   None(기본)이면 비활성 — 기존 동작과 100% 동일하다.
+    ma_line = I.moving_average_series(closes, ma_filter_period) if ma_filter_period else None
+
+    # [2026-08-12 C단계] TR+칼만 계산은 _daily_kf_atr(→ indicators.true_range/kalman_atr)로 이관.
+    daily, kf_atr_path, day_list = _daily_kf_atr(df)
     atr_map, prev_range_map = {}, {}
-    day_list = daily['date_day'].tolist()
     for i, dkey in enumerate(day_list):
         if i == 0:
             atr_map[dkey] = 2.0
@@ -1042,7 +1091,8 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
         else:
             v = kf_atr_path[i - 1]
             atr_map[dkey] = float(v) if pd.notna(v) and v > 0 else 2.0
-            prev_range_map[dkey] = float(daily['range'].iloc[i - 1])
+            # [2026-08-12 C단계] daily['range'].iloc[i-1] == prev_session_range(..., upto_exclusive=i)
+            prev_range_map[dkey] = I.prev_session_range(daily['high'].values, daily['low'].values, i)
 
     bucket60 = (df.index.astype('datetime64[ns]').astype(np.int64) // 10**9 // (trend_bar_minutes * 60))
 
@@ -1149,29 +1199,13 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
         # 수행해, 전략은 그대로 두고 체결 정밀도만 올린다.
         _recalc = enough_data and (not signal_only_on_5min or minute % 5 == 0 or target_long == float('inf'))
         if _recalc:
-            window_closes = closes[window_start:i]
-            x, P = None, 1.0
-            kf_path = np.empty(len(window_closes))
-            for j, z in enumerate(window_closes):
-                if x is None:
-                    x = z
-                else:
-                    P = P + Q
-                    K = P / (P + R)
-                    x = x + K * (z - x)
-                    P = (1 - K) * P
-                kf_path[j] = x
-            kf_price = kf_path[-1]
-            errs = window_closes - kf_path
-            std_slice = errs[-std_window:]
-            if trim_std_outliers > 0 and len(std_slice) > trim_std_outliers:
-                order = np.argsort(np.abs(std_slice))
-                std_slice = std_slice[order[:-trim_std_outliers]]
-            std_error = np.std(std_slice)
-            if not np.isfinite(std_error) or std_error <= 0:
-                std_error = 0.5
-            band = std_error * mult
-            target_long, target_short = kf_price + band, kf_price - band
+            # [2026-08-12 C단계] 창 칼만 + 잔차 std → indicators로 이관.
+            # closed_upto(closes, i, kf_window) == closes[i-kf_window:i]. enough_data(i>=kf_window)가
+            # 이미 참이므로 None이 반환되지 않는다(_recalc는 enough_data를 AND로 포함).
+            w = I.Window.closed_upto(closes, i, kf_window)
+            std_error, kf_price = I.kalman_residual_std(
+                w, Q, R, std_window=std_window, trim=trim_std_outliers, fallback=0.5)
+            target_long, target_short = I.kalman_band_targets(kf_price, std_error, mult)
 
             lb_start = max(0, i - 300)
             wb, wc = bucket60[lb_start:i], closes[lb_start:i]
@@ -1188,17 +1222,9 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                     if np.count_nonzero(wb == uniq_b[-1]) < bars_per_bucket:
                         long_closes = long_closes[:-1]
                 if len(long_closes) >= 5:
-                    xl, Pl = None, 1.0
-                    kf_long_path = np.empty(len(long_closes))
-                    for j, zl in enumerate(long_closes):
-                        if xl is None:
-                            xl = zl
-                        else:
-                            Pl = Pl + trend_q
-                            Kl = Pl / (Pl + trend_r)
-                            xl = xl + Kl * (zl - xl)
-                            Pl = (1 - Kl) * Pl
-                        kf_long_path[j] = xl
+                    # [2026-08-12 C단계] 장기추세 칼만 → indicators.kalman_path.
+                    # 기울기 계산에 경로 마지막 두 점이 필요하므로 residual_std가 아니라 kalman_path.
+                    kf_long_path = I.kalman_path(I.Window(long_closes), trend_q, trend_r)
                     slope = kf_long_path[-1] - kf_long_path[-2]
                     _thr = trend_slope_threshold
                     trend = "UP" if slope > _thr else ("DOWN" if slope < -_thr else "NEUTRAL")
@@ -1215,20 +1241,28 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
 
             if pos == 1:
                 peak_price = max(peak_price, c_high)
+                # (2026-08-12) 하드손절을 profit_lock 종속에서 분리.
+                #   기존: hard_stop 분기가 `if profit_lock_enabled:` 안에 중첩돼 있어,
+                #   profit_lock_enabled=False 이면 hard_stop_enabled=True 를 켜도 아무 일도
+                #   일어나지 않았다(라이브 config가 정확히 그 조합이라 손절 캡이 무력화 상태였다).
+                #   아래는 profit_lock 이 켜진 경우의 분기 순서를 그대로 보존하므로
+                #   profit_lock_enabled=True 결과와 hard_stop_enabled=False 결과는 모두 불변이다.
+                #   era_order_manager.py 는 같은 중첩 구조지만 이번 범위 밖(무수정).
                 eff_dist, pl_floor = dist, None
-                if profit_lock_enabled:
-                    mfe = peak_price - entry_price
-                    if profit_lock_be_move_trigger_pt is not None and mfe >= profit_lock_be_move_trigger_pt:
-                        pl_floor = entry_price + profit_lock_be_stage_buffer_pt
-                    elif hard_stop_enabled:
-                        # (2026-08-04) 하드 초기손절 — 본전이동 도달 '이전' 구간 전용.
-                        # era_order_manager.py의 _apply_profit_lock과 동일한 분기 구조.
-                        _hs = hard_stop_pt if (hard_stop_pt and hard_stop_pt > 0) else hard_stop_se_mult * entry_std_error
-                        if _hs and _hs > 0:
-                            pl_floor = entry_price - _hs
-                    if mfe >= profit_lock_trigger_pt:
-                        eff_dist = min(eff_dist, profit_lock_mult * atr14)
-                        pl_floor = entry_price + profit_lock_be_buffer_pt
+                mfe = peak_price - entry_price
+                _be_moved = (profit_lock_enabled
+                             and profit_lock_be_move_trigger_pt is not None
+                             and mfe >= profit_lock_be_move_trigger_pt)
+                if _be_moved:
+                    pl_floor = entry_price + profit_lock_be_stage_buffer_pt
+                elif hard_stop_enabled:
+                    # (2026-08-04) 하드 초기손절 — 본전이동 도달 '이전' 구간 전용.
+                    _hs = hard_stop_pt if (hard_stop_pt and hard_stop_pt > 0) else hard_stop_se_mult * entry_std_error
+                    if _hs and _hs > 0:
+                        pl_floor = entry_price - _hs
+                if profit_lock_enabled and mfe >= profit_lock_trigger_pt:
+                    eff_dist = min(eff_dist, profit_lock_mult * atr14)
+                    pl_floor = entry_price + profit_lock_be_buffer_pt
                 stop_price = peak_price - eff_dist
                 if pl_floor is not None:
                     stop_price = max(stop_price, pl_floor)
@@ -1244,18 +1278,27 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                     exit_price = c_close
             else:
                 peak_price = min(peak_price, c_low)
+                # (2026-08-12) 하드손절을 profit_lock 종속에서 분리.
+                #   기존: hard_stop 분기가 `if profit_lock_enabled:` 안에 중첩돼 있어,
+                #   profit_lock_enabled=False 이면 hard_stop_enabled=True 를 켜도 아무 일도
+                #   일어나지 않았다(라이브 config가 정확히 그 조합이라 손절 캡이 무력화 상태였다).
+                #   아래는 profit_lock 이 켜진 경우의 분기 순서를 그대로 보존하므로
+                #   profit_lock_enabled=True 결과와 hard_stop_enabled=False 결과는 모두 불변이다.
+                #   era_order_manager.py 는 같은 중첩 구조지만 이번 범위 밖(무수정).
                 eff_dist, pl_floor = dist, None
-                if profit_lock_enabled:
-                    mfe = entry_price - peak_price
-                    if profit_lock_be_move_trigger_pt is not None and mfe >= profit_lock_be_move_trigger_pt:
-                        pl_floor = entry_price - profit_lock_be_stage_buffer_pt
-                    elif hard_stop_enabled:
-                        _hs = hard_stop_pt if (hard_stop_pt and hard_stop_pt > 0) else hard_stop_se_mult * entry_std_error
-                        if _hs and _hs > 0:
-                            pl_floor = entry_price + _hs
-                    if mfe >= profit_lock_trigger_pt:
-                        eff_dist = min(eff_dist, profit_lock_mult * atr14)
-                        pl_floor = entry_price - profit_lock_be_buffer_pt
+                mfe = entry_price - peak_price
+                _be_moved = (profit_lock_enabled
+                             and profit_lock_be_move_trigger_pt is not None
+                             and mfe >= profit_lock_be_move_trigger_pt)
+                if _be_moved:
+                    pl_floor = entry_price - profit_lock_be_stage_buffer_pt
+                elif hard_stop_enabled:
+                    _hs = hard_stop_pt if (hard_stop_pt and hard_stop_pt > 0) else hard_stop_se_mult * entry_std_error
+                    if _hs and _hs > 0:
+                        pl_floor = entry_price + _hs
+                if profit_lock_enabled and mfe >= profit_lock_trigger_pt:
+                    eff_dist = min(eff_dist, profit_lock_mult * atr14)
+                    pl_floor = entry_price - profit_lock_be_buffer_pt
                 stop_price = peak_price + eff_dist
                 if pl_floor is not None:
                     stop_price = min(stop_price, pl_floor)
@@ -1312,9 +1355,23 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
         if std_error < min_std_error_entry:
             continue
 
+        # 직전 봉 종가와 직전 봉 이평선으로 판정한다. 당봉 종가를 쓰면 진입 시점에
+        # 아직 모르는 값을 참조하는 셈이라 미래참조가 된다.
+        _ma_long_ok = _ma_short_ok = True
+        if ma_line is not None:
+            if i >= 1 and not np.isnan(ma_line[i - 1]):
+                _above = closes[i - 1] >= ma_line[i - 1]
+                _below = closes[i - 1] <= ma_line[i - 1]
+                _ma_long_ok = ((not _above) == bool(ma_filter_invert))
+                _ma_short_ok = ((not _below) == bool(ma_filter_invert))
+            else:
+                _ma_long_ok = _ma_short_ok = False   # 워밍업 구간은 양방향 금지(SAR판과 동일)
+
         if c_high >= target_long:
             open_gap = max(c_open - target_long, 0.0)  # 봉 시가가 target을 이미 넘어선 갭 크기
-            if gap_guard_mult is not None and open_gap > gap_guard_mult * std_error:
+            if not _ma_long_ok:
+                pass  # 직전 봉 종가가 이평선 아래 -> LONG 금지
+            elif gap_guard_mult is not None and open_gap > gap_guard_mult * std_error:
                 pass  # 갭으로 target을 너무 크게 넘어선 진입은 건너뜀
             elif not disable_trend_filter and trend == "DOWN":
                 continue
@@ -1333,7 +1390,9 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                 contracts_log.append(pos_contracts)
         elif c_low <= target_short:
             open_gap = max(target_short - c_open, 0.0)
-            if gap_guard_mult is not None and open_gap > gap_guard_mult * std_error:
+            if not _ma_short_ok:
+                pass  # 직전 봉 종가가 이평선 위 -> SHORT 금지
+            elif gap_guard_mult is not None and open_gap > gap_guard_mult * std_error:
                 pass
             elif not disable_trend_filter and trend == "UP":
                 continue
@@ -1377,7 +1436,21 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
     final_contracts = contracts_log[-1] if contracts_log else contracts
     avg_contracts = (sum(contracts_log) / len(contracts_log)) if contracts_log else contracts
 
+    # (2026-08-12) pt 기준 지표 추가 — profit_pct / mdd 는 계약수가 사실상 고정인데 자본만
+    # 불어나는 구조라 왜곡된다. 실제로 전체기간 mdd 0.58% 가 분기별 mdd(1.2~5.1%)보다
+    # 작게 나오는 모순이 관측됐다(자본이 커질수록 같은 낙폭의 비율이 작아지기 때문).
+    # 자본 규모와 무관한 "1계약당 누적 pt"와 그 최대낙폭을 함께 낸다. 기존 키는 그대로 둔다.
+    total_pnl_pt = sum(pt_equiv)
+    _cum = _peak = _mdd_pt = 0.0
+    for _v in pt_equiv:
+        _cum += _v
+        if _cum > _peak:
+            _peak = _cum
+        if _peak - _cum > _mdd_pt:
+            _mdd_pt = _peak - _cum
+
     result = {'trades': total, 'win_rate': win_rate, 'profit_pct': profit_pct, 'mdd': max_mdd, 'pf': pf,
+              'total_pnl_pt': total_pnl_pt, 'mdd_pt': _mdd_pt,
               'contracts': contracts, 'avg_win_pt': avg_win_pt, 'avg_loss_pt': avg_loss_pt,
               'loss_win_ratio': loss_win_ratio, 'worst_loss_pt': worst_loss_pt,
               'final_capital': cap, 'final_contracts': final_contracts, 'avg_contracts': avg_contracts,
@@ -1393,7 +1466,8 @@ def run_kalman_night_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=5.0, atr_
                               enable_reentry_filter=True, slip_fee_pt=0.05, commission_rate=0.000065,
                               hard_cap=15.0,
                               slip_entry_pt=None, slip_exit_sl_pt=None,
-                              slip_exit_normal_pt=None, slip_exit_force_pt=None):
+                              slip_exit_normal_pt=None, slip_exit_force_pt=None,
+                              return_trades=False):
     """
     era_order_manager.py의 야간선물 칼만 전략(_process_night_tick, 18:00 진입 -> 익일 04:45 청산)을
     run_kalman_live_replica()와 동일한 방식(5분봉 고가/저가 터치 근사)으로 재현한 백테스트.
@@ -1418,32 +1492,18 @@ def run_kalman_night_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=5.0, atr_
     day_keys = df['date_day'].values
     dt_index = df.index
 
-    daily = df.groupby('date_day').agg(high=('high', 'max'), low=('low', 'min'), close=('close', 'last')).reset_index()
-    daily['prev_close'] = daily['close'].shift(1)
-    tr = np.maximum(daily['high'] - daily['low'],
-                     np.maximum((daily['high'] - daily['prev_close']).abs(),
-                                (daily['low'] - daily['prev_close']).abs())).fillna(daily['high'] - daily['low'])
-    kf_atr_path = np.empty(len(tr))
-    kf_atr, P_atr, Q_atr, R_atr = None, 1.0, 0.002, 0.2
-    for j, tr_val in enumerate(tr.values):
-        if kf_atr is None:
-            kf_atr = tr_val
-        else:
-            P_atr = P_atr + Q_atr
-            K_atr = P_atr / (P_atr + R_atr)
-            kf_atr = kf_atr + K_atr * (tr_val - kf_atr)
-            P_atr = (1 - K_atr) * P_atr
-        kf_atr_path[j] = kf_atr
-    daily['range'] = daily['high'] - daily['low']
-    day_list = daily['date_day'].tolist()
+    # [2026-08-12 C단계] TR+칼만 계산은 _daily_kf_atr(→ indicators.true_range/kalman_atr)로 이관.
+    daily, kf_atr_path, day_list = _daily_kf_atr(df)
 
     # 야간은 그날 저녁(18:00)에 시작 -> 그날 자체의 ATR/Range가 이미 확정되어 있으므로 인덱스를
     # -1 시프트하지 않고 당일(i) 값을 그대로 사용 (주간 atr_map/prev_range_map은 i-1을 씀)
+    # [2026-08-12 C단계] 이 인덱스 차이는 **의도된 것이므로 그대로 보존**한다. 주간과 통일하면 동작 변경.
     night_atr_map, night_prev_range_map = {}, {}
     for i, dkey in enumerate(day_list):
         v = kf_atr_path[i]
         night_atr_map[dkey] = float(v) if pd.notna(v) and v > 0 else 2.0
-        night_prev_range_map[dkey] = float(daily['range'].iloc[i])
+        # daily['range'].iloc[i] == prev_session_range(..., upto_exclusive=i+1) — 주간(i)보다 한 칸 앞
+        night_prev_range_map[dkey] = I.prev_session_range(daily['high'].values, daily['low'].values, i + 1)
 
     # 직전 거래일 매핑 (자정을 넘긴 00:00~04:59 구간을 "전날 저녁에 시작한 야간 세션"으로 묶기 위함)
     prev_trading_day = {day_list[i]: (day_list[i - 1] if i > 0 else None) for i in range(len(day_list))}
@@ -1474,6 +1534,8 @@ def run_kalman_night_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=5.0, atr_
     contracts = max(1, min(max_contracts, int(safe_budget // margin_per))) if margin_per > 0 else 1
 
     pos, entry_price, peak_price = 0, 0.0, 0.0
+    entry_time = None
+    trade_log = []
     cur_night_key = None
     last_long_exit, last_short_exit = 0.0, 0.0
     target_long, target_short = np.inf, -np.inf
@@ -1517,26 +1579,15 @@ def run_kalman_night_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=5.0, atr_
 
         # --- 칼만 타점/추세 재추정 (직전 i-1까지의 데이터로, 매 새 봉마다 갱신) ---
         if i >= kf_window:
-            window_closes = closes[i - kf_window:i]
-            x, P = None, 1.0
-            kf_path = np.empty(kf_window)
-            for j, z in enumerate(window_closes):
-                if x is None:
-                    x = z
-                else:
-                    P = P + Q
-                    K = P / (P + R)
-                    x = x + K * (z - x)
-                    P = (1 - K) * P
-                kf_path[j] = x
-            kf_price = kf_path[-1]
-            errs = window_closes - kf_path
-            std_error = np.std(errs[-std_window:])
-            if not np.isfinite(std_error) or std_error <= 0:
-                std_error = 0.5
-            band = std_error * mult
-            target_long, target_short = kf_price + band, kf_price - band
-            tp_long, tp_short = kf_price + 3.0 * std_error, kf_price - 3.0 * std_error
+            # [2026-08-12 C단계] 창 칼만 + 잔차 std → indicators로 이관.
+            # closed_upto(closes, i, kf_window) == closes[i-kf_window:i]. i>=kf_window 가드가
+            # closed_upto의 start<0 조건과 정확히 같으므로 이 분기에서 None은 나오지 않는다.
+            # 이 두 함수(야간/oc)에는 trim_std_outliers 인자가 없다 → trim=0 (발견 목록 2번, 이번엔 유지).
+            w = I.Window.closed_upto(closes, i, kf_window)
+            std_error, kf_price = I.kalman_residual_std(
+                w, Q, R, std_window=std_window, trim=0, fallback=0.5)
+            target_long, target_short = I.kalman_band_targets(kf_price, std_error, mult)
+            tp_long, tp_short = I.kalman_band_targets(kf_price, std_error, 3.0)
 
             lb_start = max(0, i - 300)
             wb, wc = bucket60[lb_start:i], closes[lb_start:i]
@@ -1546,17 +1597,9 @@ def run_kalman_night_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=5.0, atr_
                 _, first_idx = np.unique(rev_b, return_index=True)
                 long_closes = rev_c[first_idx]
                 if len(long_closes) >= 5:
-                    xl, Pl = None, 1.0
-                    kf_long_path = np.empty(len(long_closes))
-                    for j, zl in enumerate(long_closes):
-                        if xl is None:
-                            xl = zl
-                        else:
-                            Pl = Pl + trend_q
-                            Kl = Pl / (Pl + trend_r)
-                            xl = xl + Kl * (zl - xl)
-                            Pl = (1 - Kl) * Pl
-                        kf_long_path[j] = xl
+                    # [2026-08-12 C단계] 장기추세 칼만 → indicators.kalman_path.
+                    # 기울기 계산에 경로 마지막 두 점이 필요하므로 residual_std가 아니라 kalman_path.
+                    kf_long_path = I.kalman_path(I.Window(long_closes), trend_q, trend_r)
                     slope = kf_long_path[-1] - kf_long_path[-2]
                     trend = "UP" if slope > 0.01 else ("DOWN" if slope < -0.01 else "NEUTRAL")
 
@@ -1612,6 +1655,15 @@ def run_kalman_night_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=5.0, atr_
                     last_long_exit = exit_price
                 else:
                     last_short_exit = exit_price
+                if return_trades:
+                    trade_log.append({
+                        'entry_time': entry_time, 'exit_time': dt_index[i],
+                        'direction': 'LONG' if pos == 1 else 'SHORT',
+                        'entry_price': entry_price, 'exit_price': exit_price,
+                        'pnl_pt': raw_pnl - exit_slip, 'is_force': is_force, 'is_sl': is_sl,
+                        'reason': 'SL' if is_sl else ('FORCE' if is_force else 'TP_TRAIL'),
+                        'contracts': contracts, 'gain_krw': gain,
+                    })
                 pos, entry_price, peak_price = 0, 0.0, 0.0
             continue
 
@@ -1628,11 +1680,13 @@ def run_kalman_night_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=5.0, atr_
                 continue
             if not enable_reentry_filter or reentry_ok(1, target_long):
                 pos, entry_price, peak_price = 1, target_long + SLIP_ENTRY, target_long + SLIP_ENTRY
+                entry_time = dt_index[i]
         elif c_low <= target_short:
             if trend == "UP":
                 continue
             if not enable_reentry_filter or reentry_ok(-1, target_short):
                 pos, entry_price, peak_price = -1, target_short - SLIP_ENTRY, target_short - SLIP_ENTRY
+                entry_time = dt_index[i]
 
     total = len(pnls)
     if total == 0:
@@ -1647,7 +1701,10 @@ def run_kalman_night_replica(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=5.0, atr_
     loss_sum = abs(sum(p for p in pnls if p < 0))
     pf = gain_sum / loss_sum if loss_sum > 0 else 999.0
 
-    return {'trades': total, 'win_rate': win_rate, 'profit_pct': profit_pct, 'mdd': max_mdd, 'pf': pf, 'contracts': contracts}
+    result = {'trades': total, 'win_rate': win_rate, 'profit_pct': profit_pct, 'mdd': max_mdd, 'pf': pf, 'contracts': contracts}
+    if return_trades:
+        result['trade_log'] = trade_log
+    return result
 
 
 def run_kalman_live_replica_oc(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=3.4, atr_cutoff=0.5,
@@ -1656,7 +1713,8 @@ def run_kalman_live_replica_oc(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=3.4, at
                                 enable_reentry_filter=True, slip_fee_pt=0.05, commission_rate=0.000065,
                                 hard_cap=15.0,
                                 slip_entry_pt=None, slip_exit_sl_pt=None,
-                                slip_exit_normal_pt=None, slip_exit_force_pt=None):
+                                slip_exit_normal_pt=None, slip_exit_force_pt=None,
+                                return_trades=False):
     """
     run_kalman_live_replica와 전략/리스크 규칙은 동일하지만, 5분봉의 고가·저가(틱 근사, "터치"로 간주)를
     쓰지 않고 각 5분봉의 "시가"와 "종가" 두 지점만 실제 틱처럼 순서대로 관찰한다고 가정합니다.
@@ -1674,25 +1732,9 @@ def run_kalman_live_replica_oc(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=3.4, at
     day_keys = df['date_day'].values
     dt_index = df.index
 
-    daily = df.groupby('date_day').agg(high=('high', 'max'), low=('low', 'min'), close=('close', 'last')).reset_index()
-    daily['prev_close'] = daily['close'].shift(1)
-    tr = np.maximum(daily['high'] - daily['low'],
-                     np.maximum((daily['high'] - daily['prev_close']).abs(),
-                                (daily['low'] - daily['prev_close']).abs())).fillna(daily['high'] - daily['low'])
-    kf_atr_path = np.empty(len(tr))
-    kf_atr, P_atr, Q_atr, R_atr = None, 1.0, 0.002, 0.2
-    for j, tr_val in enumerate(tr.values):
-        if kf_atr is None:
-            kf_atr = tr_val
-        else:
-            P_atr = P_atr + Q_atr
-            K_atr = P_atr / (P_atr + R_atr)
-            kf_atr = kf_atr + K_atr * (tr_val - kf_atr)
-            P_atr = (1 - K_atr) * P_atr
-        kf_atr_path[j] = kf_atr
-    daily['range'] = daily['high'] - daily['low']
+    # [2026-08-12 C단계] TR+칼만 계산은 _daily_kf_atr(→ indicators.true_range/kalman_atr)로 이관.
+    daily, kf_atr_path, day_list = _daily_kf_atr(df)
     atr_map, prev_range_map = {}, {}
-    day_list = daily['date_day'].tolist()
     for i, dkey in enumerate(day_list):
         if i == 0:
             atr_map[dkey] = 2.0
@@ -1700,7 +1742,8 @@ def run_kalman_live_replica_oc(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=3.4, at
         else:
             v = kf_atr_path[i - 1]
             atr_map[dkey] = float(v) if pd.notna(v) and v > 0 else 2.0
-            prev_range_map[dkey] = float(daily['range'].iloc[i - 1])
+            # [2026-08-12 C단계] daily['range'].iloc[i-1] == prev_session_range(..., upto_exclusive=i)
+            prev_range_map[dkey] = I.prev_session_range(daily['high'].values, daily['low'].values, i)
 
     bucket60 = (df.index.astype('datetime64[ns]').astype(np.int64) // 10**9 // 3600)
 
@@ -1727,6 +1770,8 @@ def run_kalman_live_replica_oc(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=3.4, at
     contracts = max(1, min(max_contracts, int(safe_budget // margin_per))) if margin_per > 0 else 1
 
     pos, entry_price, peak_price = 0, 0.0, 0.0
+    entry_time = None
+    trade_log = []
     day_high, day_low, cur_day = -np.inf, np.inf, None
     last_long_exit, last_short_exit = 0.0, 0.0
     target_long, target_short = np.inf, -np.inf
@@ -1770,26 +1815,15 @@ def run_kalman_live_replica_oc(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=3.4, at
         vol_force_close = (hour == 15 and 35 <= minute <= 45)
 
         if i >= kf_window:
-            window_closes = closes[i - kf_window:i]
-            x, P = None, 1.0
-            kf_path = np.empty(kf_window)
-            for j, z in enumerate(window_closes):
-                if x is None:
-                    x = z
-                else:
-                    P = P + Q
-                    K = P / (P + R)
-                    x = x + K * (z - x)
-                    P = (1 - K) * P
-                kf_path[j] = x
-            kf_price = kf_path[-1]
-            errs = window_closes - kf_path
-            std_error = np.std(errs[-std_window:])
-            if not np.isfinite(std_error) or std_error <= 0:
-                std_error = 0.5
-            band = std_error * mult
-            target_long, target_short = kf_price + band, kf_price - band
-            tp_long, tp_short = kf_price + 3.0 * std_error, kf_price - 3.0 * std_error
+            # [2026-08-12 C단계] 창 칼만 + 잔차 std → indicators로 이관.
+            # closed_upto(closes, i, kf_window) == closes[i-kf_window:i]. i>=kf_window 가드가
+            # closed_upto의 start<0 조건과 정확히 같으므로 이 분기에서 None은 나오지 않는다.
+            # 이 두 함수(야간/oc)에는 trim_std_outliers 인자가 없다 → trim=0 (발견 목록 2번, 이번엔 유지).
+            w = I.Window.closed_upto(closes, i, kf_window)
+            std_error, kf_price = I.kalman_residual_std(
+                w, Q, R, std_window=std_window, trim=0, fallback=0.5)
+            target_long, target_short = I.kalman_band_targets(kf_price, std_error, mult)
+            tp_long, tp_short = I.kalman_band_targets(kf_price, std_error, 3.0)
 
             lb_start = max(0, i - 300)
             wb, wc = bucket60[lb_start:i], closes[lb_start:i]
@@ -1799,17 +1833,9 @@ def run_kalman_live_replica_oc(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=3.4, at
                 _, first_idx = np.unique(rev_b, return_index=True)
                 long_closes = rev_c[first_idx]
                 if len(long_closes) >= 5:
-                    xl, Pl = None, 1.0
-                    kf_long_path = np.empty(len(long_closes))
-                    for j, zl in enumerate(long_closes):
-                        if xl is None:
-                            xl = zl
-                        else:
-                            Pl = Pl + trend_q
-                            Kl = Pl / (Pl + trend_r)
-                            xl = xl + Kl * (zl - xl)
-                            Pl = (1 - Kl) * Pl
-                        kf_long_path[j] = xl
+                    # [2026-08-12 C단계] 장기추세 칼만 → indicators.kalman_path.
+                    # 기울기 계산에 경로 마지막 두 점이 필요하므로 residual_std가 아니라 kalman_path.
+                    kf_long_path = I.kalman_path(I.Window(long_closes), trend_q, trend_r)
                     slope = kf_long_path[-1] - kf_long_path[-2]
                     trend = "UP" if slope > 0.01 else ("DOWN" if slope < -0.01 else "NEUTRAL")
 
@@ -1857,6 +1883,15 @@ def run_kalman_live_replica_oc(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=3.4, at
                         last_long_exit = exit_price
                     else:
                         last_short_exit = exit_price
+                    if return_trades:
+                        trade_log.append({
+                            'entry_time': entry_time, 'exit_time': dt_index[i],
+                            'direction': 'LONG' if pos == 1 else 'SHORT',
+                            'entry_price': entry_price, 'exit_price': exit_price,
+                            'pnl_pt': raw_pnl - exit_slip, 'is_force': is_force, 'is_sl': is_sl,
+                            'reason': 'SL' if is_sl else ('FORCE' if is_force else 'TP_TRAIL'),
+                            'contracts': contracts, 'gain_krw': gain,
+                        })
                     pos, entry_price, peak_price = 0, 0.0, 0.0
                 continue
 
@@ -1867,11 +1902,13 @@ def run_kalman_live_replica_oc(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=3.4, at
                     continue
                 if not enable_reentry_filter or reentry_ok(1, price):
                     pos, entry_price, peak_price = 1, price, price
+                    entry_time = dt_index[i]
             elif price <= target_short:
                 if trend == "UP":
                     continue
                 if not enable_reentry_filter or reentry_ok(-1, price):
                     pos, entry_price, peak_price = -1, price, price
+                    entry_time = dt_index[i]
 
     total = len(pnls)
     if total == 0:
@@ -1886,7 +1923,10 @@ def run_kalman_live_replica_oc(df, Q=0.0001, R=0.5, mult=1.0, kf_sl_mult=3.4, at
     loss_sum = abs(sum(p for p in pnls if p < 0))
     pf = gain_sum / loss_sum if loss_sum > 0 else 999.0
 
-    return {'trades': total, 'win_rate': win_rate, 'profit_pct': profit_pct, 'mdd': max_mdd, 'pf': pf, 'contracts': contracts}
+    result = {'trades': total, 'win_rate': win_rate, 'profit_pct': profit_pct, 'mdd': max_mdd, 'pf': pf, 'contracts': contracts}
+    if return_trades:
+        result['trade_log'] = trade_log
+    return result
 
 
 if __name__ == '__main__':
