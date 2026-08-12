@@ -3,11 +3,11 @@ rem chcp 65001 (Disabled to prevent CMD UTF-8 parser bug)
 title AMATS ERA Auto-Reconnect
 color 0C
 
-rem ì´ ìŠ¤í¬ë¦½íŠ¸ëŠ” ì‘ì—… ìŠ¤ì¼€ì¤„ëŸ¬ì— RunLevel=Highestë¡œ ë“±ë¡ëœ "AMATS ERA Reconnect" íƒœìŠ¤í¬ë¥¼
-rem í†µí•´ì„œë§Œ ì‹¤í–‰ë˜ë„ë¡ ë°”ë€Œì—ˆìŒ(era_order_manager.py/tca_controller.py/reconnect_kiwoom.bat
-rem ëª¨ë‘ schtasks /runìœ¼ë¡œ í˜¸ì¶œ). ë”°ë¼ì„œ í•­ìƒ ì´ë¯¸ ê´€ë¦¬ì ê¶Œí•œìœ¼ë¡œ ì‹¤í–‰ë˜ë©°, ê³¼ê±°ì˜ UAC
-rem ìì²´ìŠ¹ê²©(-Verb RunAs) ë¡œì§ì€ í™”ë©´ì ê¹€/RDPëŠê¹€ ë“± ë¬´ì¸ í™˜ê²½ì—ì„œ ë™ì˜ë¥¼ ë°›ì„ ì¸í„°ë™í‹°ë¸Œ
-rem ë°ìŠ¤í¬í†±ì´ ì—†ì–´ pauseì—ì„œ ì˜ì›íˆ ë©ˆì¶”ëŠ” ë¬¸ì œê°€ ìˆì–´ ì œê±°í•¨.
+rem ÀÌ ½ºÅ©¸³Æ®´Â ÀÛ¾÷ ½ºÄÉÁÙ·¯¿¡ RunLevel=Highest·Î µî·ÏµÈ "AMATS ERA Reconnect" ÅÂ½ºÅ©¸¦
+rem ÅëÇØ¼­¸¸ ½ÇÇàµÇµµ·Ï ¹Ù²î¾úÀ½(era_order_manager.py/tca_controller.py/reconnect_kiwoom.bat
+rem ¸ğµÎ schtasks /runÀ¸·Î È£Ãâ). µû¶ó¼­ Ç×»ó ÀÌ¹Ì °ü¸®ÀÚ ±ÇÇÑÀ¸·Î ½ÇÇàµÇ¸ç, °ú°ÅÀÇ UAC
+rem ÀÚÃ¼½Â°İ(-Verb RunAs) ·ÎÁ÷Àº È­¸éÀá±è/RDP²÷±è µî ¹«ÀÎ È¯°æ¿¡¼­ µ¿ÀÇ¸¦ ¹ŞÀ» ÀÎÅÍ·¢Æ¼ºê
+rem µ¥½ºÅ©ÅéÀÌ ¾ø¾î pause¿¡¼­ ¿µ¿øÈ÷ ¸ØÃß´Â ¹®Á¦°¡ ÀÖ¾î Á¦°ÅÇÔ.
 pushd "%CD%"
 CD /D "%~dp0"
 
@@ -16,9 +16,23 @@ echo     AMATS ERA Auto-Reconnecting System
 echo ===================================================
 echo.
 
-:: AMATS Watchdog(2ë¶„ ì£¼ê¸° ìƒì¡´ê°ì‹œ)ê°€ ì•„ë˜ 60ì´ˆ ëŒ€ê¸° êµ¬ê°„ ì¤‘ ERAê°€ ì£½ì–´ìˆëŠ” ê±¸ ë³´ê³ 
-:: ë¼ì–´ë“¤ì–´ í‚¤ì›€ ì„¸ì…˜ì´ ì•ˆ ë¹„ì›Œì§„ ì±„ë¡œ ë„ˆë¬´ ì¼ì° ì¬ê¸°ë™ì‹œí‚¤ì§€ ëª»í•˜ë„ë¡ ì¼ì‹œ ì°¨ë‹¨
-echo %date% %time% > "%~dp0..\system_stopped.flag"
+:: AMATS Watchdog(2ºĞ ÁÖ±â »ıÁ¸°¨½Ã)°¡ ¾Æ·¡ 60ÃÊ ´ë±â ±¸°£ Áß ERA°¡ Á×¾îÀÖ´Â °É º¸°í
+:: ³¢¾îµé¾î Å°¿ò ¼¼¼ÇÀÌ ¾È ºñ¿öÁø Ã¤·Î ³Ê¹« ÀÏÂï Àç±âµ¿½ÃÅ°Áö ¸øÇÏµµ·Ï ÀÏ½Ã Â÷´Ü
+rem (2026-08-13) »ç¿ëÀÚ°¡ ¼¼¿î Á¤Áö´Â Àı´ë µ¤¾î¾²Áö ¾Ê´Â´Ù.
+rem   2026-08-12 »ç°í: ÀÌ ½ºÅ©¸³Æ®°¡ ³¡¿¡¼­ system_stopped.flag ¸¦ ¹«Á¶°Ç Áö¿ö
+rem   »ç¿ëÀÚÀÇ Á¤Áö ÀÇ»ç°¡ Áö¿öÁö°í ½ÇÁÖ¹®ÀÌ ³ª°¬´Ù. ¸ÕÀú È®ÀÎÇÏ°í ¹°·¯³­´Ù.
+if exist "%~dp0..\system_stopped.flag" (
+    echo [STOP] system_stopped.flag °¡ ÀÖ½À´Ï´Ù. Àç±âµ¿ÇÏÁö ¾Ê°í Á¾·áÇÕ´Ï´Ù.
+    exit /b 0
+)
+if exist "%~dp0..\emergency_kill.flag" (
+    echo [STOP] emergency_kill.flag °¡ ÀÖ½À´Ï´Ù. Àç±âµ¿ÇÏÁö ¾Ê°í Á¾·áÇÕ´Ï´Ù.
+    exit /b 0
+)
+
+rem ÀÚÃ¼ ¾ïÁ¦ ¸¶Ä¿ - 60ÃÊ ´ë±â Áß ¿öÄ¡µ¶ÀÌ °ãÃÄ µµ´Â °ÍÀ» ¸·´Â´Ù.
+rem   »ç¿ëÀÚ Á¤Áö ÇÃ·¡±×¿Í ¹°¸®ÀûÀ¸·Î ´Ù¸¥ ÆÄÀÏÀÌ¶ó ¼­·Î¸¦ Áö¿ìÁö ¾Ê´Â´Ù.
+echo %date% %time% > "%~dp0..\reconnect_in_progress.flag"
 
 echo [1/3] Terminating existing ERA and Kiwoom processes...
 
@@ -36,14 +50,14 @@ if exist "%~dp0era.pid" (
 echo Terminating ERA/TCA python processes...
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process -Filter \"name='python.exe'\" | Where-Object { $_.CommandLine -like '*leader_order_manager.py*' -or $_.CommandLine -like '*tca_controller.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >nul 2>&1
 
-:: 2b. ì¢…ë£Œ í™•ì¸ (2026-08-08 ë„ì…) â€” ìœ„ taskkill/Stop-ProcessëŠ” >nul 2>&1ë¡œ ì‹¤íŒ¨ë¥¼ ê°€ë¦¬ë¯€ë¡œ,
-:: ê¶Œí•œ ë¶€ì¡± ë“±ìœ¼ë¡œ ì¡°ìš©íˆ ì‹¤íŒ¨í•´ë„ ê·¸ëŒ€ë¡œ ì§„í–‰í•´ì™”ë‹¤. ê·¸ ê²°ê³¼ ì˜› í”„ë¡œì„¸ìŠ¤ê°€ í¬íŠ¸ 9991ì„
-:: ê³„ì† ì¥” ì±„ 60ì´ˆ ë’¤ ì¬ê¸°ë™ì´ ì¶©ëŒí•´ì„œ ì£½ëŠ” ì‚¬ê³ ê°€ ì‹¤ì œë¡œ ìˆì—ˆë‹¤(ì´ ë°°ì¹˜ë¥¼ ê´€ë¦¬ì ê¶Œí•œ
-:: ì—†ì´ ì§ì ‘ ì‹¤í–‰í–ˆì„ ë•Œ ì¬í˜„ â€” ì •ìƒ ê²½ë¡œì¸ schtasks/TCA íŠ¸ë¦¬ê±°ëŠ” ê¶Œí•œì„ ìƒì†ë°›ì•„ ëŒ€ë¶€ë¶„
-:: ë¬¸ì œì—†ì§€ë§Œ, ì‹¤íŒ¨ë¥¼ ê°ì§€ ëª» í•˜ëŠ” êµ¬ì¡° ìì²´ê°€ ìœ„í—˜í•˜ë¯€ë¡œ ëª…ì‹œì ìœ¼ë¡œ í™•ì¸í•œë‹¤).
-:: tasklistë¡œ PID ì¡´ì¬ë§Œ í™•ì¸í•œë‹¤ â€” Get-CimInstanceì˜ CommandLine í•„í„°ëŠ” ê´€ë¦¬ì ê¶Œí•œ
-:: í”„ë¡œì„¸ìŠ¤ë¥¼ ë¹„ê´€ë¦¬ì ì„¸ì…˜ì—ì„œ ì¡°íšŒí•  ë•Œ ë¹ˆ ê°’ì„ ë°˜í™˜í•´(2026-08-08 ì§ì ‘ ì¬í˜„ í™•ì¸)
-:: ë°”ë¡œ ì´ ì‹œë‚˜ë¦¬ì˜¤ì—ì„œ ì˜¤íƒ(ê±°ì§“ ì„±ê³µ)ì„ ë‚¸ë‹¤.
+:: 2b. Á¾·á È®ÀÎ (2026-08-08 µµÀÔ) - À§ taskkill/Stop-Process´Â >nul 2>&1·Î ½ÇÆĞ¸¦ °¡¸®¹Ç·Î,
+:: ±ÇÇÑ ºÎÁ· µîÀ¸·Î Á¶¿ëÈ÷ ½ÇÆĞÇØµµ ±×´ë·Î ÁøÇàÇØ¿Ô´Ù. ±× °á°ú ¿¾ ÇÁ·Î¼¼½º°¡ Æ÷Æ® 9991À»
+:: °è¼Ó Áå Ã¤ 60ÃÊ µÚ Àç±âµ¿ÀÌ Ãæµ¹ÇØ¼­ Á×´Â »ç°í°¡ ½ÇÁ¦·Î ÀÖ¾ú´Ù(ÀÌ ¹èÄ¡¸¦ °ü¸®ÀÚ ±ÇÇÑ
+:: ¾øÀÌ Á÷Á¢ ½ÇÇàÇßÀ» ¶§ ÀçÇö - Á¤»ó °æ·ÎÀÎ schtasks/TCA Æ®¸®°Å´Â ±ÇÇÑÀ» »ó¼Ó¹Ş¾Æ ´ëºÎºĞ
+:: ¹®Á¦¾øÁö¸¸, ½ÇÆĞ¸¦ °¨Áö ¸ø ÇÏ´Â ±¸Á¶ ÀÚÃ¼°¡ À§ÇèÇÏ¹Ç·Î ¸í½ÃÀûÀ¸·Î È®ÀÎÇÑ´Ù).
+:: tasklist·Î PID Á¸Àç¸¸ È®ÀÎÇÑ´Ù - Get-CimInstanceÀÇ CommandLine ÇÊÅÍ´Â °ü¸®ÀÚ ±ÇÇÑ
+:: ÇÁ·Î¼¼½º¸¦ ºñ°ü¸®ÀÚ ¼¼¼Ç¿¡¼­ Á¶È¸ÇÒ ¶§ ºó °ªÀ» ¹İÈ¯ÇØ(2026-08-08 Á÷Á¢ ÀçÇö È®ÀÎ)
+:: ¹Ù·Î ÀÌ ½Ã³ª¸®¿À¿¡¼­ ¿ÀÅ½(°ÅÁş ¼º°ø)À» ³½´Ù.
 if not defined ERA_PID goto eraKillOk
 set "KILL_RETRY=0"
 :checkEraKilled
@@ -56,11 +70,11 @@ goto checkEraKilled
 
 :eraKillFailed
 echo.
-echo [FATAL] ê¸°ì¡´ ERA í”„ë¡œì„¸ìŠ¤ë¥¼ ì¢…ë£Œí•˜ì§€ ëª»í–ˆìŠµë‹ˆë‹¤ (ê¶Œí•œ ë¶€ì¡± ì¶”ì • â€” ì´ ë°°ì¹˜ê°€
-echo         ê´€ë¦¬ì ê¶Œí•œ ì—†ì´ ì‹¤í–‰ë˜ë©´ ì˜› í”„ë¡œì„¸ìŠ¤ì— ëŒ€í•œ taskkillì´ ì¡°ìš©íˆ ì‹¤íŒ¨í•©ë‹ˆë‹¤).
-echo         í¬íŠ¸ ì¶©ëŒë¡œ ì¬ê¸°ë™ì´ ì‹¤íŒ¨í•˜ëŠ” ê²ƒë³´ë‹¤ ì•ˆì „í•˜ë‹ˆ, ì—¬ê¸°ì„œ ì¤‘ë‹¨í•©ë‹ˆë‹¤.
-"%~dp0..\venv32\Scripts\python.exe" -c "import sys; sys.path.insert(0, r'%~dp0..'); import notifier, time; notifier.send_message('ğŸš¨ <b>[ERA ì¬ì—°ë™ ì‹¤íŒ¨]</b> ê¸°ì¡´ í”„ë¡œì„¸ìŠ¤ ì¢…ë£Œ ì‹¤íŒ¨(ê¶Œí•œ ë¶€ì¡± ì¶”ì •)ë¡œ ì¬ê¸°ë™ì„ ì¤‘ë‹¨í–ˆìŠµë‹ˆë‹¤. ê´€ë¦¬ì ê¶Œí•œìœ¼ë¡œ ë‹¤ì‹œ ì‹œë„í•´ì£¼ì„¸ìš”.'); time.sleep(2)" >nul 2>&1
-if exist "%~dp0..\system_stopped.flag" del /f /q "%~dp0..\system_stopped.flag" >nul 2>&1
+echo [FATAL] ±âÁ¸ ERA ÇÁ·Î¼¼½º¸¦ Á¾·áÇÏÁö ¸øÇß½À´Ï´Ù (±ÇÇÑ ºÎÁ· ÃßÁ¤ - ÀÌ ¹èÄ¡°¡
+echo         °ü¸®ÀÚ ±ÇÇÑ ¾øÀÌ ½ÇÇàµÇ¸é ¿¾ ÇÁ·Î¼¼½º¿¡ ´ëÇÑ taskkillÀÌ Á¶¿ëÈ÷ ½ÇÆĞÇÕ´Ï´Ù).
+echo         Æ÷Æ® Ãæµ¹·Î Àç±âµ¿ÀÌ ½ÇÆĞÇÏ´Â °Íº¸´Ù ¾ÈÀüÇÏ´Ï, ¿©±â¼­ Áß´ÜÇÕ´Ï´Ù.
+"%~dp0..\venv32\Scripts\python.exe" -c "import sys; sys.path.insert(0, r'%~dp0..'); import notifier, time; notifier.send_message('[!] <b>[ERA Àç¿¬µ¿ ½ÇÆĞ]</b> ±âÁ¸ ÇÁ·Î¼¼½º Á¾·á ½ÇÆĞ(±ÇÇÑ ºÎÁ· ÃßÁ¤)·Î Àç±âµ¿À» Áß´ÜÇß½À´Ï´Ù. °ü¸®ÀÚ ±ÇÇÑÀ¸·Î ´Ù½Ã ½ÃµµÇØÁÖ¼¼¿ä.'); time.sleep(2)" >nul 2>&1
+if exist "%~dp0..\reconnect_in_progress.flag" del /f /q "%~dp0..\reconnect_in_progress.flag" >nul 2>&1
 timeout /t 3 >nul
 exit /b 1
 
@@ -79,13 +93,13 @@ ping 127.0.0.1 -n 61 >nul 2>&1
 
 echo.
 echo [3/3] Restarting ERA Trading Engine...
-rem "auto" ì¸ìë¡œ run_era.batì˜ UAC ì¬í™•ì¸ì„ ê±´ë„ˆë›´ë‹¤ - ì´ ë°°ì¹˜ ìì²´ê°€ ì´ë¯¸ ê´€ë¦¬ì ê¶Œí•œ
-rem ìŠ¤ì¼€ì¤„ ì‘ì—…ìœ¼ë¡œ ì‹¤í–‰ ì¤‘ì¸ë°, startë¡œ ë„ìš´ ìì‹ì´ ê·¸ ê¶Œí•œì„ ìƒì† ëª» ë°›ì•„ ë§¤ë²ˆ UAC
-rem ì¬ìŠ¹ê²©ì„ ì‹œë„í•˜ë‹¤ ë¬´ì¸ í™˜ê²½ì´ë¼ ì¡°ìš©íˆ ì‹¤íŒ¨í•˜ëŠ” ë¬¸ì œê°€ ìˆì—ˆìŒ (2026-07-09 ì‹¤ì¸¡ í™•ì¸)
+rem "auto" ÀÎÀÚ·Î run_era.batÀÇ UAC ÀçÈ®ÀÎÀ» °Ç³Ê¶Ú´Ù - ÀÌ ¹èÄ¡ ÀÚÃ¼°¡ ÀÌ¹Ì °ü¸®ÀÚ ±ÇÇÑ
+rem ½ºÄÉÁÙ ÀÛ¾÷À¸·Î ½ÇÇà ÁßÀÎµ¥, start·Î ¶ç¿î ÀÚ½ÄÀÌ ±× ±ÇÇÑÀ» »ó¼Ó ¸ø ¹Ş¾Æ ¸Å¹ø UAC
+rem Àç½Â°İÀ» ½ÃµµÇÏ´Ù ¹«ÀÎ È¯°æÀÌ¶ó Á¶¿ëÈ÷ ½ÇÆĞÇÏ´Â ¹®Á¦°¡ ÀÖ¾úÀ½ (2026-07-09 ½ÇÃø È®ÀÎ)
 start "" "%~dp0..\run_era.bat" auto
 
-:: ì¬ê¸°ë™ì„ ì‹œì‘í–ˆìœ¼ë‹ˆ ì›Œì¹˜ë… ì°¨ë‹¨ í•´ì œ (ERA ìì²´ê°€ ë˜ëŠ” ë‹¤ìŒ watchdog ì£¼ê¸°ê°€ ì •ìƒ ê°ì‹œí•˜ê²Œ í•¨)
-if exist "%~dp0..\system_stopped.flag" del /f /q "%~dp0..\system_stopped.flag" >nul 2>&1
+:: Àç±âµ¿À» ½ÃÀÛÇßÀ¸´Ï ¿öÄ¡µ¶ Â÷´Ü ÇØÁ¦ (ERA ÀÚÃ¼°¡ ¶Ç´Â ´ÙÀ½ watchdog ÁÖ±â°¡ Á¤»ó °¨½ÃÇÏ°Ô ÇÔ)
+if exist "%~dp0..\reconnect_in_progress.flag" del /f /q "%~dp0..\reconnect_in_progress.flag" >nul 2>&1
 
 :: Re-enable Windows Task Scheduler task to ensure auto-start on next boot
 echo Re-enabling Windows Task Scheduler AutoStart...

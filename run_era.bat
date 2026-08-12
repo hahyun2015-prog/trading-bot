@@ -1,16 +1,16 @@
 @echo off
 cls
 
-:: ê´€ë¦¬ìž ê¶Œí•œ ìžë™ ìŠ¹ê²© (UAC) ì›ì²œ í™•ë³´ (net sessionì„ ì´ìš©í•œ ì•ˆì „í•˜ê³  ì‹ ë¢°í•  ìˆ˜ ìžˆëŠ” ë°©ì‹)
-:: auto_reconnect_era.bat(RunLevel=Highest ìŠ¤ì¼€ì¤„ ìž‘ì—…, í•­ìƒ ì´ë¯¸ ê´€ë¦¬ìž ê¶Œí•œ)ì´ "auto" ì¸ìžë¡œ
-:: í˜¸ì¶œí•˜ëŠ” ê²½ë¡œëŠ” UAC ìž¬í™•ì¸ì„ ê±´ë„ˆë›´ë‹¤. startë¡œ ë„ìš´ ìžì‹ì´ ë¶€ëª¨ì˜ ê´€ë¦¬ìž ê¶Œí•œì„ ì™„ì „ížˆ
-:: ìƒì†í•˜ì§€ ëª»í•´ fltmcê°€ ì‹¤íŒ¨í•˜ê³ , ë§¤ë²ˆ UAC ìž¬ìŠ¹ê²©(-Verb RunAs)ì„ ì‹œë„í•˜ë‹¤ ë¬´ì¸ í™˜ê²½ì´ë¼
-:: ë™ì˜ë¥¼ ë°›ì„ ì¸í„°ëž™í‹°ë¸Œ ë°ìŠ¤í¬í†±ì´ ì—†ì–´ ì¡°ìš©ížˆ ì‹¤íŒ¨í•˜ë©° pythonì´ ì•„ì˜ˆ ì‹œìž‘ì„ ëª»í•˜ëŠ”
-:: ë¬¸ì œê°€ ìžˆì—ˆìŒ (2026-07-09 ì‹¤ì¸¡ í™•ì¸).
+:: °ü¸®ÀÚ ±ÇÇÑ ÀÚµ¿ ½Â°Ý (UAC) ¿øÃµ È®º¸ (net sessionÀ» ÀÌ¿ëÇÑ ¾ÈÀüÇÏ°í ½Å·ÚÇÒ ¼ö ÀÖ´Â ¹æ½Ä)
+:: auto_reconnect_era.bat(RunLevel=Highest ½ºÄÉÁÙ ÀÛ¾÷, Ç×»ó ÀÌ¹Ì °ü¸®ÀÚ ±ÇÇÑ)ÀÌ "auto" ÀÎÀÚ·Î
+:: È£ÃâÇÏ´Â °æ·Î´Â UAC ÀçÈ®ÀÎÀ» °Ç³Ê¶Ú´Ù. start·Î ¶ç¿î ÀÚ½ÄÀÌ ºÎ¸ðÀÇ °ü¸®ÀÚ ±ÇÇÑÀ» ¿ÏÀüÈ÷
+:: »ó¼ÓÇÏÁö ¸øÇØ fltmc°¡ ½ÇÆÐÇÏ°í, ¸Å¹ø UAC Àç½Â°Ý(-Verb RunAs)À» ½ÃµµÇÏ´Ù ¹«ÀÎ È¯°æÀÌ¶ó
+:: µ¿ÀÇ¸¦ ¹ÞÀ» ÀÎÅÍ·¢Æ¼ºê µ¥½ºÅ©ÅéÀÌ ¾ø¾î Á¶¿ëÈ÷ ½ÇÆÐÇÏ¸ç pythonÀÌ ¾Æ¿¹ ½ÃÀÛÀ» ¸øÇÏ´Â
+:: ¹®Á¦°¡ ÀÖ¾úÀ½ (2026-07-09 ½ÇÃø È®ÀÎ).
 if "%~1"=="auto" goto gotAdmin
 fltmc >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [*] ê´€ë¦¬ìž ê¶Œí•œì„ ìš”ì²­ ì¤‘ìž…ë‹ˆë‹¤... (UAC ìŠ¹ì¸ í•„ìš”)
+    echo [*] °ü¸®ÀÚ ±ÇÇÑÀ» ¿äÃ» ÁßÀÔ´Ï´Ù... ^(UAC ½ÂÀÎ ÇÊ¿ä^)
     goto UACPrompt
 ) else ( goto gotAdmin )
 
@@ -36,7 +36,7 @@ if %errorlevel% neq 0 (
 
 title AMATS ERA Order Manager
 echo ==========================================================
-echo   AMATS [ ERA ] Order & Risk Management Engine (Admin)
+echo   AMATS [ ERA ] Order ^& Risk Management Engine (Admin)
 echo ==========================================================
 echo   Kiwoom OpenAPI - 32bit Python Virtual Environment
 echo ----------------------------------------------------------
@@ -72,10 +72,10 @@ if %errorlevel% equ 0 (
 )
 echo.
 
-:: ê¸°ë™ ì „ êµ¬ë¬¸ ìžê°€ê²€ì‚¬ â€” ë””ìŠ¤í¬ ì†ìƒ/íŽ¸ì§‘ ì‚¬ê³ ë¡œ íŒŒì¼ì´ ê¹¨ì§„ ì±„ ê¸°ë™í•˜ë©´
-:: ìŠ¤ì¼€ì¤„ ìž‘ì—… ê²½ë¡œì—ì„œëŠ” ì½˜ì†”ì´ ìˆ¨ê²¨ì ¸ IndentationErrorê°€ ëˆˆì— ë„ì§€ ì•Šê³ , ì‹œìŠ¤í…œì´
-:: ì¡°ìš©ížˆ ì£½ì€ ìƒíƒœë¡œ ìž¥ì„ í†µì§¸ë¡œ ë‚ ë¦°ë‹¤ (2026-07-31 ì‹¤ì¸¡: í´ë¼ìš°ë“œ ë™ê¸°í™”ê°€
-:: era_order_manager.pyë¥¼ ë®ì–´ì¨ ê¸°ë™ ì‹¤íŒ¨, ì›ì¸ íŒŒì•…ê¹Œì§€ ìž¥ì¤‘ ìˆ˜ ì‹œê°„ ì†Œìš”).
+:: ±âµ¿ Àü ±¸¹® ÀÚ°¡°Ë»ç - µð½ºÅ© ¼Õ»ó/ÆíÁý »ç°í·Î ÆÄÀÏÀÌ ±úÁø Ã¤ ±âµ¿ÇÏ¸é
+:: ½ºÄÉÁÙ ÀÛ¾÷ °æ·Î¿¡¼­´Â ÄÜ¼ÖÀÌ ¼û°ÜÁ® IndentationError°¡ ´«¿¡ ¶çÁö ¾Ê°í, ½Ã½ºÅÛÀÌ
+:: Á¶¿ëÈ÷ Á×Àº »óÅÂ·Î ÀåÀ» ÅëÂ°·Î ³¯¸°´Ù (2026-07-31 ½ÇÃø: Å¬¶ó¿ìµå µ¿±âÈ­°¡
+:: era_order_manager.py¸¦ µ¤¾î½á ±âµ¿ ½ÇÆÐ, ¿øÀÎ ÆÄ¾Ç±îÁö ÀåÁß ¼ö ½Ã°£ ¼Ò¿ä).
 echo [CHECK] Verifying Python syntax before launch...
 "venv32\Scripts\python.exe" -m py_compile "era\era_order_manager.py" "era\leader_order_manager.py"
 if %errorlevel% neq 0 (
@@ -83,7 +83,11 @@ if %errorlevel% neq 0 (
     echo ==========================================================
     echo  [FATAL] Python syntax check FAILED - aborting startup.
     echo  era\era_order_manager.py or leader_order_manager.py is broken.
-    echo  Restore from git:  git checkout -- era\era_order_manager.py
+    echo  Restore from the timestamped .bak next to the file, e.g.
+    echo    copy /Y "era\era_order_manager.py.bak_before_indicators_live_20260812_203829" "era\era_order_manager.py"
+    echo  Do NOT use "git checkout -- era\era_order_manager.py" - the live file is
+    echo  intentionally ahead of git HEAD ^(measurement-ledger hooks + indicator
+    echo  single-sourcing^) and that command would silently discard both.
     echo ==========================================================
     echo.
     if "%1"=="auto" exit /b 1
@@ -91,6 +95,31 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 echo [OK] Syntax check passed.
+echo.
+
+:: ===== [2026-08-12] indicators.py import self-check =====
+:: WHY: era\era_order_manager.py does "import indicators as ind" at module top level
+::      (line 20). py_compile above only COMPILES - it never executes imports - so a
+::      missing/broken root indicators.py sails past it, prints "[OK] Syntax check
+::      passed", and then dies with ModuleNotFoundError. Under the scheduled-task path
+::      (era\auto_reconnect_era.bat) the console is hidden, so that failure is silent
+::      and the engine is simply absent for the session. Same silent-death class as the
+::      2026-07-31 incident. This check executes the import for real and stops here.
+echo [CHECK] Verifying indicators.py import...
+"venv32\Scripts\python.exe" -c "import sys, os; sys.path.insert(0, os.getcwd()); import indicators; print('[OK] indicators.py import OK -> ' + indicators.__file__)"
+if %errorlevel% neq 0 (
+    echo.
+    echo ==========================================================
+    echo  [FATAL] indicators.py import FAILED - aborting startup.
+    echo  era\era_order_manager.py cannot run without the root indicators.py module.
+    echo  Expected at: %CD%\indicators.py
+    echo  It is tracked in git - restore with:  git checkout -- indicators.py
+    echo ==========================================================
+    echo.
+    if "%1"=="auto" exit /b 1
+    pause
+    exit /b 1
+)
 echo.
 
 echo [OK] Starting ERA Order Manager...

@@ -2,8 +2,15 @@
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-:: ì‚¬ìš©ìžê°€ stop_system.batìœ¼ë¡œ ì˜ë„ì ìœ¼ë¡œ ì¢…ë£Œí–ˆê±°ë‚˜, í‚¤ì›€ ìž¬ì—°ê²° ì‹œí€€ìŠ¤ê°€ ì§„í–‰ ì¤‘ì´ë©´ ê°ì‹œë¥¼ ê±´ë„ˆëœ€
+:: »ç¿ëÀÚ°¡ stop_system.batÀ¸·Î ÀÇµµÀûÀ¸·Î Á¾·áÇß°Å³ª, Å°¿ò Àç¿¬°á ½ÃÄö½º°¡ ÁøÇà ÁßÀÌ¸é °¨½Ã¸¦ °Ç³Ê¶Ü
 if exist "system_stopped.flag" exit /b 0
+rem (2026-08-13) ±ä±ÞÁ¤Áö ÇÃ·¡±×µµ Á¸ÁßÇÑ´Ù. Á¾Àü¿¡´Â system_stopped.flag ¸¸ ºÁ¼­,
+rem   emergency_kill.flag ·Î ¸ØÃá »óÅÂ¸¦ "ERA down" À¸·Î ¿ÀÆÇÇØ µÇ»ì¸± ¼ö ÀÖ¾ú´Ù.
+if exist "emergency_kill.flag" exit /b 0
+rem ÀçÁ¢¼Ó ½ÃÄö½º°¡ µµ´Â Áß¿¡´Â °¨½Ã¸¦ ½®´Ù. Á¾Àü¿¡´Â auto_reconnect_era.bat ÀÌ
+rem   ÀÌ ¸ñÀûÀ¸·Î system_stopped.flag ¸¦ Á÷Á¢ ¸¸µé¾ú´Ù°¡ ³¡¿¡¼­ Áö¿ü´Âµ¥, ±× »èÁ¦°¡
+rem   »ç¿ëÀÚ°¡ ¸¸µç Á¤Áö ÇÃ·¡±×±îÁö ÇÔ²² Áö¿ö¹ö¸®´Â »ç°í °æ·Î¿´´Ù. ¸¶Ä¿¸¦ ºÐ¸®ÇÑ´Ù.
+if exist "reconnect_in_progress.flag" exit /b 0
 
 if not exist "%~dp0venv32\Scripts\python.exe" exit /b 1
 set "PY=%~dp0venv32\Scripts\python.exe"
@@ -11,14 +18,14 @@ set "PY=%~dp0venv32\Scripts\python.exe"
 call :check_alive "era\era.pid" ERA_ALIVE
 call :check_alive "tca\tca.pid" TCA_ALIVE
 
-:: ìž¬ì‹œìž‘ ì¿¨ë‹¤ìš´: ì§ì „ ìž¬ì‹œìž‘ í›„ 2íšŒ(4ë¶„)ëŠ” ìž¬ì‹œìž‘ì„ ê±´ë„ˆëœ€ (ì—°ì† í¬ëž˜ì‹œâ†’ì›Œì¹˜ë… ìž¬ê¸°ë™ ì•…ìˆœí™˜ ë°©ì§€)
+:: Àç½ÃÀÛ Äð´Ù¿î: Á÷Àü Àç½ÃÀÛ ÈÄ 2È¸(4ºÐ)´Â Àç½ÃÀÛÀ» °Ç³Ê¶Ü (¿¬¼Ó Å©·¡½Ã->¿öÄ¡µ¶ Àç±âµ¿ ¾Ç¼øÈ¯ ¹æÁö)
 call :apply_cooldown "watchdog_cooldown_era.tmp" ERA_ALIVE
 call :apply_cooldown "watchdog_cooldown_tca.tmp" TCA_ALIVE
 
 if "%ERA_ALIVE%"=="0" (
     echo [%date% %time%] ERA down - restarting >> "%~dp0watchdog.log"
     (echo 2) > "%~dp0watchdog_cooldown_era.tmp"
-    rem era_order_manager.py ì§ì ‘ ì‹¤í–‰ì€ ë¦¬ë”ì¢…ëª© í•„í„°ë¥¼ ìš°íšŒí•˜ë¯€ë¡œ, ê²€ì¦ëœ ì˜ˆì•½ ìž‘ì—…ì„ íŠ¸ë¦¬ê±°í•œë‹¤
+    rem era_order_manager.py Á÷Á¢ ½ÇÇàÀº ¸®´õÁ¾¸ñ ÇÊÅÍ¸¦ ¿ìÈ¸ÇÏ¹Ç·Î, °ËÁõµÈ ¿¹¾à ÀÛ¾÷À» Æ®¸®°ÅÇÑ´Ù
     schtasks /run /tn "AMATS ERA Reconnect" >nul 2>&1
 )
 if "%TCA_ALIVE%"=="0" (
@@ -27,9 +34,9 @@ if "%TCA_ALIVE%"=="0" (
     start "AMATS | TCA" "%PY%" "%~dp0tca\tca_controller.py"
 )
 
-:: KIS ì•¼ê°„ì„ ë¬¼ ìˆ˜ì§‘ê¸°ëŠ” ì„¸ì…˜ ì°½(í‰ì¼ 17:55~ë‹¤ìŒë‚  05:15)ì—ë§Œ ì‚´ì•„ìžˆì–´ì•¼ í•˜ë¯€ë¡œ,
-:: ê·¸ ì°½ ì•ˆì—ì„œë§Œ ìƒì¡´ì„ í™•ì¸í•˜ê³  ì£½ì–´ìžˆìœ¼ë©´ ìž¬ê¸°ë™í•œë‹¤ (2026-08-07 ìž¬ë¶€íŒ…ìœ¼ë¡œ
-:: ìˆ˜ì§‘ê¸°ê°€ ì£½ì—ˆëŠ”ë° ì„¸ì…˜ ë„ì¤‘ ì•„ë¬´ë„ ë˜ì‚´ë¦¬ì§€ ì•Šì€ ì‚¬ê³  ì´í›„ ì¶”ê°€).
+:: KIS ¾ß°£¼±¹° ¼öÁý±â´Â ¼¼¼Ç Ã¢(ÆòÀÏ 17:55~´ÙÀ½³¯ 05:15)¿¡¸¸ »ì¾ÆÀÖ¾î¾ß ÇÏ¹Ç·Î,
+:: ±× Ã¢ ¾È¿¡¼­¸¸ »ýÁ¸À» È®ÀÎÇÏ°í Á×¾îÀÖÀ¸¸é Àç±âµ¿ÇÑ´Ù (2026-08-07 ÀçºÎÆÃÀ¸·Î
+:: ¼öÁý±â°¡ Á×¾ú´Âµ¥ ¼¼¼Ç µµÁß ¾Æ¹«µµ µÇ»ì¸®Áö ¾ÊÀº »ç°í ÀÌÈÄ Ãß°¡).
 call :check_window KIS_WINDOW
 if "%KIS_WINDOW%"=="1" (
     call :check_alive "kis\night_collector.pid" KIS_ALIVE
@@ -43,8 +50,8 @@ if "%KIS_WINDOW%"=="1" if "%KIS_ALIVE%"=="0" (
 exit /b 0
 
 :check_alive
-:: %1 = pid íŒŒì¼ ê²½ë¡œ, %2 = ê²°ê³¼ë¥¼ ë‹´ì„ ë³€ìˆ˜ëª…. íŒŒì¼ì´ ì—†ê±°ë‚˜ ë¹„ì–´ìžˆê±°ë‚˜, ê·¸ PIDë¡œ
-:: ì‚´ì•„ìžˆëŠ” python í”„ë¡œì„¸ìŠ¤ë¥¼ ëª» ì°¾ìœ¼ë©´ 0(ì£½ìŒ), ì°¾ìœ¼ë©´ 1(ìƒì¡´)ë¡œ ì„¤ì •.
+:: %1 = pid ÆÄÀÏ °æ·Î, %2 = °á°ú¸¦ ´ãÀ» º¯¼ö¸í. ÆÄÀÏÀÌ ¾ø°Å³ª ºñ¾îÀÖ°Å³ª, ±× PID·Î
+:: »ì¾ÆÀÖ´Â python ÇÁ·Î¼¼½º¸¦ ¸ø Ã£À¸¸é 0(Á×À½), Ã£À¸¸é 1(»ýÁ¸)·Î ¼³Á¤.
 set "%~2=0"
 if not exist %1 exit /b 0
 set "_PID="
@@ -55,8 +62,8 @@ if %errorlevel%==0 set "%~2=1"
 exit /b 0
 
 :apply_cooldown
-:: %1 = ì¿¨ë‹¤ìš´ íŒŒì¼, %2 = ìƒì¡´ ë³€ìˆ˜ëª…. íŒŒì¼ì´ ìžˆìœ¼ë©´ ì¹´ìš´íŠ¸ë¥¼ 1 ê°ì†Œì‹œí‚¤ê³ 
-:: ì¹´ìš´íŠ¸ê°€ ë‚¨ì•„ìžˆëŠ” ë™ì•ˆì—” í•´ë‹¹ í”„ë¡œì„¸ìŠ¤ë¥¼ ì‚´ì•„ìžˆëŠ” ê²ƒìœ¼ë¡œ ì²˜ë¦¬(ìž¬ì‹œìž‘ ê±´ë„ˆëœ€).
+:: %1 = Äð´Ù¿î ÆÄÀÏ, %2 = »ýÁ¸ º¯¼ö¸í. ÆÄÀÏÀÌ ÀÖÀ¸¸é Ä«¿îÆ®¸¦ 1 °¨¼Ò½ÃÅ°°í
+:: Ä«¿îÆ®°¡ ³²¾ÆÀÖ´Â µ¿¾È¿£ ÇØ´ç ÇÁ·Î¼¼½º¸¦ »ì¾ÆÀÖ´Â °ÍÀ¸·Î Ã³¸®(Àç½ÃÀÛ °Ç³Ê¶Ü).
 if not exist %1 exit /b 0
 set "_CD="
 for /f "usebackq delims=" %%i in (%1) do set "_CD=%%i"
@@ -71,8 +78,8 @@ if !_CD! gtr 0 (
 exit /b 0
 
 :check_window
-:: %1 = ê²°ê³¼ë¥¼ ë‹´ì„ ë³€ìˆ˜ëª…. ì§€ê¸ˆì´ KIS ì•¼ê°„ì„ ë¬¼ ì„¸ì…˜ ì°½(í‰ì¼ 17:55~ë‹¤ìŒë‚  05:15,
-:: "AMATS KIS Night Collector Start/Stop" ì˜ˆì•½ ìž‘ì—…ì˜ ìš”ì¼ ì„¤ì •ê³¼ ë™ì¼)ì¸ì§€ í™•ì¸.
+:: %1 = °á°ú¸¦ ´ãÀ» º¯¼ö¸í. Áö±ÝÀÌ KIS ¾ß°£¼±¹° ¼¼¼Ç Ã¢(ÆòÀÏ 17:55~´ÙÀ½³¯ 05:15,
+:: "AMATS KIS Night Collector Start/Stop" ¿¹¾à ÀÛ¾÷ÀÇ ¿äÀÏ ¼³Á¤°ú µ¿ÀÏ)ÀÎÁö È®ÀÎ.
 set "%~1=0"
 "%PY%" -c "import datetime,sys; n=datetime.datetime.now(); wd=n.weekday(); t=n.time(); ok=(wd in (0,1,2,3,4) and t>=datetime.time(17,55)) or (wd in (1,2,3,4,5) and t<datetime.time(5,15)); sys.exit(0 if ok else 1)" >nul 2>&1
 if %errorlevel%==0 set "%~1=1"

@@ -297,6 +297,31 @@ class TCAController:
             except Exception as e:
                 print(f"[TCA Send Message Error] {e}")
 
+    def _set_system_stopped(self, stopped):
+        """워치독 정지 플래그를 켜고 끈다.
+
+        (2026-08-13) 종전에는 !시스템종료도 !긴급정지도 ERA만 죽이고 이 플래그를
+        만들지 않았다. watchdog_check.bat은 첫 줄에서 이 파일이 있으면 감시를
+        건너뛰는데(`if exist "system_stopped.flag" exit /b 0`), 파일이 없으니
+        2분 뒤 "ERA down"으로 판단해 되살렸다. 실계좌에서 사용자가 정지시킨 뒤에도
+        주문이 체결되는 사고가 실제로 났다(2026-08-12 10:22 체결 확인).
+
+        정지 명령이 실제로 정지가 되도록, 프로세스를 죽이기 전에 플래그부터 만든다.
+        순서가 중요하다 — 죽인 뒤에 만들면 그 사이 워치독 주기가 끼어들 수 있다."""
+        path = os.path.join(workspace_root, "system_stopped.flag")
+        try:
+            if stopped:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(datetime.now().isoformat())
+                print(f"[TCA] 워치독 정지 플래그 생성: {path}")
+            elif os.path.exists(path):
+                os.remove(path)
+                print(f"[TCA] 워치독 정지 플래그 해제: {path}")
+            return True
+        except Exception as e:
+            print(f"[TCA] 정지 플래그 처리 실패: {e}")
+            return False
+
     def _kill_era_process(self):
         """PID 파일을 이용해 ERA 프로세스를 종료하고, PID 파일이 유실/불일치해도
         cmdline 광범위 스캔으로 잔존 프로세스를 잡아내는 폴백을 항상 병행한다."""
@@ -932,6 +957,9 @@ class TCAController:
                 self.send_message("⏳ AMATS 통합 주문/리스크 엔진을 구동합니다...")
                 # Kiwoom 버전 업데이트(opstarter) 충돌 방지: KOA Studio 선제 종료
                 subprocess.run("taskkill /f /im KOA_STARTER.exe 2>nul", shell=True)
+                # 정지 명령으로 걸어 둔 워치독 차단을 해제한다. 이걸 안 지우면 ERA는
+                # 떠도 워치독 감시가 계속 꺼진 채라, 이후 죽어도 아무도 못 살린다.
+                self._set_system_stopped(False)
                 # 기존 ERA 프로세스가 좀비로 남아있을 경우 정리
                 self._kill_era_process()
                 # config.json의 venv32 경로에서 32비트 Python 실행
@@ -971,8 +999,13 @@ class TCAController:
 
         elif cmd_text == "!주식종료" or cmd_text == "!선물종료" or cmd_text == "!시스템종료":
             self.send_message("⏳ AMATS 통합 트레이딩 엔진 종료 중..." + self._open_positions_warning())
+            # 죽이기 전에 플래그부터 — 그래야 워치독이 부활시키지 않는다.
+            flagged = self._set_system_stopped(True)
             if self._kill_era_process():
-                self.send_message("✅ AMATS 통합 트레이딩 엔진이 정상 종료되었습니다.")
+                self.send_message("✅ AMATS 통합 트레이딩 엔진이 정상 종료되었습니다."
+                                  + ("\n🔒 워치독 자동 재기동을 차단했습니다. 다시 켜려면 <code>!시스템시작</code>."
+                                     if flagged else
+                                     "\n⚠️ 워치독 차단 플래그 생성에 실패했습니다 — 2분 뒤 자동 재기동될 수 있습니다."))
             else:
                 self.send_message("⚠️ ERA PID 파일을 찾을 수 없습니다. ERA가 실행 중이지 않거나 이미 종료되었습니다.")
 
@@ -1141,6 +1174,9 @@ class TCAController:
 
         elif cmd_text == "긴급정지" or cmd_text == "!긴급정지":
             self.send_message("🚨 <b>긴급 정지 시퀀스 가동!</b> 🚨\n\n1. ERA 주문 엔진에 긴급정지 플래그 전송 중...")
+
+            # 청산 후 ERA가 스스로 종료하므로, 워치독이 되살리지 못하게 먼저 막는다.
+            self._set_system_stopped(True)
 
             # emergency_kill.flag 생성 (로컬 + 원격 모두)
             flag_targets = [workspace_root]
@@ -1988,8 +2024,14 @@ if __name__ == "__main__":
     # 뜻이므로, AMATS Watchdog가 "의도적 종료 상태"로 오인해 감시를 계속 건너뛰지 않도록 해제
     try:
         _stopped_flag = os.path.join(workspace_root, "system_stopped.flag")
+        # [2026-08-12 AMATS-STOP-GUARD] 삭제를 비활성화했다.
+        # 원래 의도는 "TCA가 떴으면 재가동 의사로 보고 감시 재개"였으나,
+        # 워치독이 TCA도 감시하므로 "플래그 생성 -> TCA 사망 -> 워치독이 TCA 부활
+        # -> TCA가 플래그 삭제 -> ERA까지 부활"의 데드락이 된다.
+        # 2026-08-12 실계좌에서 실제로 발생했고, 중지 후 10:22에 실거래가 체결됐다.
+        # 되돌리는 법: 아래 os.remove 줄의 주석(#)을 떼거나 .bak_before_stopguard_20260812_104332 복원.
         if os.path.exists(_stopped_flag):
-            os.remove(_stopped_flag)
+            pass  # os.remove(_stopped_flag)
     except Exception:
         pass
 
