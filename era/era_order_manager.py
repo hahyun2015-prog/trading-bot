@@ -1452,6 +1452,11 @@ class ERAOrderManager:
             self.sar_af_init = float(futures_settings.get("sar_af_init", 0.02))
             self.sar_af_step = float(futures_settings.get("sar_af_step", 0.02))
             self.sar_af_max  = float(futures_settings.get("sar_af_max", 0.20))
+            # (2026-08-14) 진입 시 SAR 시작거리(ATR 배수). 종전엔 ATR×1.0 하드코딩이라
+            # 진입 직후부터 SAR이 바짝 붙어 정상적인 되돌림에도 역전 청산이 났다
+            # (2026-08-13 실거래: 손절선 70pt인데 -19.42pt에서 SAR 역전으로 청산).
+            # 1.0이면 종전과 완전히 동일하다.
+            self.futures_sar_init_mult = float(futures_settings.get("sar_init_mult", 1.0))
             # (2026-08-13) "tick"(기본, 종전 동작) | "bar"(5분봉당 1회 전진)
             _sm = str(futures_settings.get("sar_update_mode", "tick") or "tick").strip().lower()
             self.futures_sar_update_mode = _sm if _sm in ("tick", "bar") else "tick"
@@ -1752,18 +1757,24 @@ class ERAOrderManager:
         아무것도 안 하면 LONG은 손절선이 0이라 영원히 청산되지 않는다.
         """
         atr = getattr(self, "futures_atr_14", 5.0) or 5.0
+        # (2026-08-14) 시작거리 배수. 이격 판정 문턱도 함께 키운다 — 배수만 올리면
+        # 초기화 직후 이격이 mult×ATR이라 문턱(3×ATR)에 걸려 재구성이 반복된다.
+        # mult=1.0에서 문턱 3.0으로 종전과 같다.
+        _m = float(getattr(self, "futures_sar_init_mult", 1.0) or 1.0)
+        _far = atr * (_m + 2.0)
         need = False
         why = ""
         if self.sar_value <= 0:
             need, why = True, "sar_value=0"
         elif self.sar_bull != is_long:
             need, why = True, "방향 불일치(sar_bull=%s, 포지션=%s)" % (self.sar_bull, "LONG" if is_long else "SHORT")
-        elif abs(self.sar_value - entry) > atr * 3:
-            need, why = True, "진입가와 %.1fpt 이격(ATR %.1f의 3배 초과)" % (abs(self.sar_value - entry), atr)
+        elif abs(self.sar_value - entry) > _far:
+            need, why = True, "진입가와 %.1fpt 이격(ATR %.1f의 %.1f배 초과)" % (
+                abs(self.sar_value - entry), atr, _m + 2.0)
         if not need:
             return
 
-        self.sar_value = (entry - atr) if is_long else (entry + atr)
+        self.sar_value = (entry - atr * _m) if is_long else (entry + atr * _m)
         self.sar_ep = entry
         self.sar_af = getattr(self, "sar_af_init", 0.02)
         self._sar_last_bar_key = None   # (2026-08-13) bar 모드 봉 키도 함께 리셋
@@ -5093,7 +5104,8 @@ class ERAOrderManager:
                                 self.futures_day_entry_tp_price += (trend_tp_mult - self.futures_kf_tp_sigma_mult) * self.futures_day_entry_std_error
                             # Parabolic SAR 진입 초기화
                             if getattr(self, "futures_strategy_type", "") == "parabolic_sar":
-                                self.sar_value = current_price - getattr(self, 'futures_atr_14', 5.0)
+                                self.sar_value = current_price - getattr(self, 'futures_atr_14', 5.0) \
+                                                 * float(getattr(self, 'futures_sar_init_mult', 1.0) or 1.0)
                                 self.sar_ep    = current_price
                                 self.sar_af    = self.sar_af_init
                                 self._sar_last_bar_key = None   # (2026-08-13) bar 모드 봉 키 리셋
@@ -5162,7 +5174,8 @@ class ERAOrderManager:
                                 self.futures_day_entry_tp_price -= (trend_tp_mult - self.futures_kf_tp_sigma_mult) * self.futures_day_entry_std_error
                             # Parabolic SAR 진입 초기화
                             if getattr(self, "futures_strategy_type", "") == "parabolic_sar":
-                                self.sar_value = current_price + getattr(self, 'futures_atr_14', 5.0)
+                                self.sar_value = current_price + getattr(self, 'futures_atr_14', 5.0) \
+                                                 * float(getattr(self, 'futures_sar_init_mult', 1.0) or 1.0)
                                 self.sar_ep    = current_price
                                 self.sar_af    = self.sar_af_init
                                 self._sar_last_bar_key = None   # (2026-08-13) bar 모드 봉 키 리셋
