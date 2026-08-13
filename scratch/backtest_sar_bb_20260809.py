@@ -182,6 +182,12 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
     cap = float(INIT_CAPITAL)
     equity, pnls, wins = [cap], [], 0
     pos, entry_price, peak_price = 0, 0.0, 0.0
+    # [2026-08-14] MFE/MAE 계측용. 전략 로직·손익 계산에 일절 관여하지 않고
+    # return_trades=True일 때 trade_log에만 기록한다(청산 효율 분석용).
+    # peak_price는 유리방향 극값(SAR clamp에 이미 쓰임)이라 그대로 MFE에 해당하고,
+    # trough_price는 그 반대인 불리방향 극값이다. 되돌리려면 trough_price/entry_idx 관련
+    # 줄과 trade_log의 mfe_pt/mae_pt/bars_held/sl_limit_pt 항목을 삭제.
+    trough_price, entry_idx = 0.0, -1
     entry_time = None
     entry_std_error = 0.5      # [2026-08-14] 진입 시점 std_error 스냅샷 (동적 캡 전용)
     entry_atr14 = 2.0          # [2026-08-14] 진입 시점 atr14 스냅샷 (진단 전용)
@@ -298,6 +304,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
             if pos == 1:
                 _prev_peak = peak_price   # [2026-08-12] sar_tick_mode 전용: 이 봉을 반영하기 '전'의 피크
                 peak_price = max(peak_price, c_high)
+                trough_price = min(trough_price, c_low)   # [2026-08-14] MAE 계측 전용
                 pnl_pt = c_close - entry_price
                 ts_fire = (time_stop_enabled and entry_time is not None and
                            (ts - entry_time).total_seconds() >= time_stop_minutes * 60 and
@@ -355,6 +362,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
             else:
                 _prev_peak = peak_price   # [2026-08-12] sar_tick_mode 전용: 이 봉을 반영하기 '전'의 피크
                 peak_price = min(peak_price, c_low)
+                trough_price = max(trough_price, c_high)   # [2026-08-14] MAE 계측 전용
                 pnl_pt = entry_price - c_close
                 ts_fire = (time_stop_enabled and entry_time is not None and
                            (ts - entry_time).total_seconds() >= time_stop_minutes * 60 and
@@ -463,7 +471,15 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                                        # [2026-08-14] 진단용 — 캡이 무엇에 걸리는지 사후 분석하려면
                                        # 진입 시점의 두 변동성 지표가 필요하다. 손익 계산엔 안 쓰인다.
                                        'entry_std_error': float(entry_std_error),
-                                       'entry_atr14': float(entry_atr14)})
+                                       'entry_atr14': float(entry_atr14),
+                                       # [2026-08-14] 청산 효율 분석용 계측. 손익 계산엔 안 쓰인다.
+                                       # mfe/mae는 슬리피지 미차감 원가격 기준(진입가 = 슬리피지 반영 fill).
+                                       'mfe_pt': float((peak_price - entry_price) if pos == 1
+                                                       else (entry_price - peak_price)),
+                                       'mae_pt': float((entry_price - trough_price) if pos == 1
+                                                       else (trough_price - entry_price)),
+                                       'bars_held': int(i - entry_idx),
+                                       'sl_limit_pt': float(sl_limit)})
                 pos, entry_price, peak_price = 0, 0.0, 0.0
             continue
 
@@ -513,6 +529,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                 _dir = -1 if reverse_entry else 1
                 fill = _lvl + SLIP_ENTRY * _dir      # 사면 비싸게, 팔면 싸게
                 pos, entry_price, peak_price = _dir, fill, fill
+                trough_price, entry_idx = fill, i   # [2026-08-14] MFE/MAE 계측 전용
                 entry_std_error = std_error   # [2026-08-14] 동적 캡용 진입 스냅샷
                 entry_atr14 = atr14           # [2026-08-14] 진단용 진입 스냅샷
                 entry_time = dt_index[i]
@@ -547,6 +564,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                 _dir = 1 if reverse_entry else -1
                 fill = _lvl + SLIP_ENTRY * _dir
                 pos, entry_price, peak_price = _dir, fill, fill
+                trough_price, entry_idx = fill, i   # [2026-08-14] MFE/MAE 계측 전용
                 entry_std_error = std_error   # [2026-08-14] 동적 캡용 진입 스냅샷
                 entry_atr14 = atr14           # [2026-08-14] 진단용 진입 스냅샷
                 entry_time = dt_index[i]

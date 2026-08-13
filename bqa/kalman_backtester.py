@@ -976,7 +976,9 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                                  signal_only_on_5min=False,
                                  time_stop_enabled=False, time_stop_minutes=10.0, time_stop_mfe_pt=4.0,
                                  realistic_gap_fill=_GAPFILL_UNSET, gap_guard_mult=None,
-                                 ma_filter_period=None, ma_filter_invert=False):
+                                 ma_filter_period=None, ma_filter_invert=False,
+                                 atr_pctile=None, atr_pctile_days=60,
+                                 std_pctile=None, std_pctile_bars=780):
     """
     era_order_manager.py의 실전 주간선물 "샹들리에 청산"(2026-07-15 도입, futures_strategy_type=
     "chandelier")을 재현한 백테스트. run_kalman_live_replica와 진입측(칼만 타점/장기추세필터/
@@ -1093,6 +1095,22 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
             atr_map[dkey] = float(v) if pd.notna(v) and v > 0 else 2.0
             # [2026-08-12 C단계] daily['range'].iloc[i-1] == prev_session_range(..., upto_exclusive=i)
             prev_range_map[dkey] = I.prev_session_range(daily['high'].values, daily['low'].values, i)
+
+    # (2026-08-13) 상대(분위수) 변동성 게이트 — 절대문턱 atr_cutoff / min_std_error_entry 의 대체안.
+    #   ATR이 20개월간 5.1 -> 92.5pt로 18배 오르는 추세라 절대값 문턱은 시간이 지나면
+    #   '항상 통과' 또는 '항상 차단' 중 하나로 붕괴한다. 최근 N일 분포 내 위치로 판정하면
+    #   수준 변화에 불변이 된다. 미래참조 없음(당일 ATR은 전일까지의 kf_atr_path[i-1] 값이고,
+    #   비교 창도 그 시점까지의 값만 쓴다).
+    #   둘 다 None(기본)이면 아래 게이트가 아예 실행되지 않아 기존 동작과 100% 동일하다.
+    atr_thr_map = {}
+    if atr_pctile is not None:
+        _av = [float(v) if pd.notna(v) and v > 0 else 2.0 for v in kf_atr_path]
+        _w = max(5, int(atr_pctile_days))
+        for i, dkey in enumerate(day_list):
+            hist = _av[max(0, i - _w):i]          # 당일 사용 ATR(=index i-1)까지 포함, 미래 없음
+            atr_thr_map[dkey] = float(np.quantile(hist, atr_pctile)) if len(hist) >= 10 else -1e18
+    _std_hist = np.full(n, np.nan) if std_pctile is not None else None
+    _std_w = max(20, int(std_pctile_bars))
 
     bucket60 = (df.index.astype('datetime64[ns]').astype(np.int64) // 10**9 // (trend_bar_minutes * 60))
 
@@ -1229,6 +1247,9 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
                     _thr = trend_slope_threshold
                     trend = "UP" if slope > _thr else ("DOWN" if slope < -_thr else "NEUTRAL")
 
+        if _std_hist is not None:
+            _std_hist[i] = std_error
+
         c_open, c_high, c_low, c_close = opens[i], highs[i], lows[i], closes[i]
 
         if pos != 0:
@@ -1354,6 +1375,15 @@ def run_chandelier_live_replica(df, Q=0.0001, R=0.5, mult=1.0, atr_cutoff=0.5,
             continue
         if std_error < min_std_error_entry:
             continue
+        # (2026-08-13) 상대 변동성 게이트. None이면 이 두 분기는 실행되지 않는다.
+        if atr_pctile is not None and atr14 < atr_thr_map.get(day_key, -1e18):
+            continue
+        if std_pctile is not None:
+            _lo = max(0, i - _std_w)
+            _h = _std_hist[_lo:i]
+            _h = _h[~np.isnan(_h)]
+            if len(_h) >= 20 and std_error < float(np.quantile(_h, std_pctile)):
+                continue
 
         # 직전 봉 종가와 직전 봉 이평선으로 판정한다. 당봉 종가를 쓰면 진입 시점에
         # 아직 모르는 값을 참조하는 셈이라 미래참조가 된다.
