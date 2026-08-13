@@ -42,6 +42,19 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                            reentry_pullback_mult=0.5, reentry_breakout_mult=0.2,
                            sar_af_init=0.02, sar_af_step=0.02, sar_af_max=0.20,
                            sar_sl_mult=1.0,
+                           # [2026-08-14] SAR 트레일링 '시작 거리' 배수를 손절폭 배수와 분리한다.
+                           # 종전에는 sar_sl_mult 하나가 두 가지를 동시에 바꿨다 —
+                           #   ① 손절폭      : _sl_limit(sar_sl_mult) = max(atr14*mult, 2.0)  [캡 적용됨]
+                           #   ② SAR 시작거리: sar.flip(fill, atr14*sar_sl_mult, ...)          [캡 미적용]
+                           # 그래서 손절폭이 물리적으로 발동 불가능한 배수(예 100)에서도 결과가 바뀌었다.
+                           # 라이브는 ②가 'ATR14 × 1.0' 하드코딩이었다. None이면 종전대로
+                           # sar_sl_mult를 따라가므로 기존 동작과 100% 동일하다.
+                           # [2026-08-14 갱신] 라이브에도 배수가 생겼다 —
+                           # era_order_manager.py 1459행 config 키 sar_init_mult(기본 1.0),
+                           # 적용 지점 1777/5108/5178행. 현재 라이브 설정은 2.0이므로
+                           # 라이브와 맞추려면 여기도 2.0을 넘겨야 한다.
+                           # 근거: 선물_SAR_트레일링폭_최적화_20260814.md
+                           sar_init_mult=None,
                            # [2026-08-12] 라이브 정합용 틱 단위 SAR.
                            #   False(기본) = 기존 봉 단위(on_bar) — 동작 100% 동일, 골든 대조로 검증됨.
                            #   True        = era_order_manager.py의 _sar_tick(on_tick)과 같은 cadence.
@@ -53,6 +66,12 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                            squeeze_window=100, squeeze_quantile=0.25, use_squeeze_filter=True,
                            entry_target_mode='kalman_band', breakout_k=0.2,
                            use_intraday_atr_for_sl=False, sl_hard_cap_pt=None,
+                           # [2026-08-14] 변동성 비례(동적) 손절 캡. 라이브 kalman 경로가 이미 쓰는
+                           # _effective_sl_hard_cap() = clamp(mult*std_error, min, max) 와 동일한 형태.
+                           # dyn_cap_mult=None(기본)이면 이 블록은 통째로 비활성이고 기존 동작과 100% 동일.
+                           # std_error는 '진입 시점 스냅샷'을 쓴다 — 라이브가 보유 중 재추정으로 손절선이
+                           # 흔들리는 것을 막으려고 진입 스냅샷을 쓰는 것과 같은 이유(무한루프 버그 수정 이력).
+                           dyn_cap_mult=None, dyn_cap_min=None, dyn_cap_max=None,
                            ma_filter_period=None, allow_overnight=False,
                            daily_loss_limit_pt=None,
                            ma_slope_min=None, ma_slope_lookback=40,
@@ -138,6 +157,14 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
         v = max(base * mult_, 2.0)
         if sl_hard_cap_pt is not None:
             v = min(v, sl_hard_cap_pt)
+        # [2026-08-14] 동적 캡. 고정 캡과 동시 지정 시 둘 다 적용(더 좁은 쪽이 이김).
+        if dyn_cap_mult is not None:
+            _c = dyn_cap_mult * entry_std_error
+            if dyn_cap_min is not None:
+                _c = max(_c, dyn_cap_min)
+            if dyn_cap_max is not None:
+                _c = min(_c, dyn_cap_max)
+            v = min(v, _c)
         return v
 
     # [2026-08-12] 봉 하나를 O→H→L→C 경로의 합성 틱으로 편다. sar_tick_mode 전용.
@@ -156,6 +183,8 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
     equity, pnls, wins = [cap], [], 0
     pos, entry_price, peak_price = 0, 0.0, 0.0
     entry_time = None
+    entry_std_error = 0.5      # [2026-08-14] 진입 시점 std_error 스냅샷 (동적 캡 전용)
+    entry_atr14 = 2.0          # [2026-08-14] 진입 시점 atr14 스냅샷 (진단 전용)
     trade_log = []
     day_high, day_low, cur_day = -np.inf, np.inf, None
     last_long_exit, last_short_exit = 0.0, 0.0
@@ -430,7 +459,11 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                                        'direction': 'LONG' if pos == 1 else 'SHORT',
                                        'entry_price': entry_price, 'exit_price': exit_price,
                                        'pnl_pt': raw_pnl - exit_slip, 'is_force': is_force,
-                                       'reason': exit_reason})
+                                       'reason': exit_reason,
+                                       # [2026-08-14] 진단용 — 캡이 무엇에 걸리는지 사후 분석하려면
+                                       # 진입 시점의 두 변동성 지표가 필요하다. 손익 계산엔 안 쓰인다.
+                                       'entry_std_error': float(entry_std_error),
+                                       'entry_atr14': float(entry_atr14)})
                 pos, entry_price, peak_price = 0, 0.0, 0.0
             continue
 
@@ -480,11 +513,14 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                 _dir = -1 if reverse_entry else 1
                 fill = _lvl + SLIP_ENTRY * _dir      # 사면 비싸게, 팔면 싸게
                 pos, entry_price, peak_price = _dir, fill, fill
+                entry_std_error = std_error   # [2026-08-14] 동적 캡용 진입 스냅샷
+                entry_atr14 = atr14           # [2026-08-14] 진단용 진입 스냅샷
                 entry_time = dt_index[i]
                 if strategy == 'sar':
                     # [2026-08-12] flip: sar = fill ∓ atr, ep = fill, af = af_init, bull = _dir>0.
                     # 종전 'fill - atr14*sar_sl_mult*_dir'과 부호까지 동일하다.
-                    sar.flip(fill, atr14 * sar_sl_mult, _dir > 0)
+                    sar.flip(fill, atr14 * (sar_sl_mult if sar_init_mult is None else sar_init_mult),
+                             _dir > 0)
         elif c_low <= target_short:
             if ma_line is not None and i >= 1 and not np.isnan(ma_line[i - 1]):
                 _below = closes[i - 1] <= ma_line[i - 1]
@@ -511,9 +547,12 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                 _dir = 1 if reverse_entry else -1
                 fill = _lvl + SLIP_ENTRY * _dir
                 pos, entry_price, peak_price = _dir, fill, fill
+                entry_std_error = std_error   # [2026-08-14] 동적 캡용 진입 스냅샷
+                entry_atr14 = atr14           # [2026-08-14] 진단용 진입 스냅샷
                 entry_time = dt_index[i]
                 if strategy == 'sar':
-                    sar.flip(fill, atr14 * sar_sl_mult, _dir > 0)   # [2026-08-12] LONG쪽과 동일
+                    sar.flip(fill, atr14 * (sar_sl_mult if sar_init_mult is None else sar_init_mult),
+                             _dir > 0)   # [2026-08-12] LONG쪽과 동일
 
     total = len(pnls)
     if total == 0:
