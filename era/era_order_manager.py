@@ -1395,6 +1395,14 @@ class ERAOrderManager:
             self.futures_consecutive_loss_limit = int(futures_settings.get("consecutive_loss_limit", 5))
             self.futures_min_std_error_entry = float(futures_settings.get("min_std_error_entry", 0.0))
             self.futures_daily_loss_limit_pct = float(futures_settings.get("daily_loss_limit_pct", 0.03))
+            # (2026-08-14) 증거금 격리 캡을 futures_settings에서도 읽는다. 종전엔
+            # active_strategy.json의 margin_cap 하나뿐이었는데, 그 파일은 BQA가 주기적으로
+            # 다시 쓰므로 수동 설정을 두기에 안전하지 않다. 값이 없으면 503행 기본 0.30 유지.
+            # active_strategy.json에 margin_cap이 있으면 아래 1487행에서 그쪽이 이긴다
+            # (기존 우선순위 유지 — BQA 최적화 결과가 수동값을 덮는 설계).
+            _mc = futures_settings.get("margin_cap", None)
+            if _mc is not None:
+                self.futures_margin_cap_ratio = float(_mc)
             # ── (2026-07-30 도입) 레짐필터 + 이익보전 (샹들리에 전용) ──────────────────────
             # 백테스트(bqa 30,950봉, 레짐+이익보전+진입임계1.5): 승률 56%→82%, PF 4.2→13.6,
             # MDD 27.7%→8.6%, 최악단일손실 -77.7pt→-28.6pt. 표준코스피200·최근장에서도 동일 방향 개선.
