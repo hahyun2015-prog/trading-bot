@@ -77,6 +77,16 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                            ma_slope_min=None, ma_slope_lookback=40,
                            reverse_entry=False, ma_filter_invert=False,
                            entry_anchor='open', entry_width_basis='prev_range',
+                           # [2026-08-14] 진입 기준점(anchor)·폭 기준·갱신 주기 검증용 가산 파라미터.
+                           # 전부 기본값에서 비활성이며 종전 경로를 그대로 탄다(골든 대조로 확인).
+                           #   entry_refresh   'session'(기본,세션 1회 고정) | 'bar'(5분봉 경계마다)
+                           #                   | 'session_times'(지정 시각마다) | 'until_fill'(첫 체결 전까지만)
+                           #   entry_refresh_anchor  갱신 시 앵커 정의(미래참조 금지 — 전부 완결봉만 참조)
+                           #                   'prev_close_bar' 직전 완결봉 종가
+                           #                   'prev_open_bar'  직전 완결봉 시가
+                           #                   'rolling_mid'    최근 M개 완결봉 (고가최대+저가최소)/2
+                           entry_refresh='session', entry_refresh_anchor='prev_close_bar',
+                           entry_refresh_lookback=6, entry_refresh_times=(900, 1000, 1300),
                            regime_filter_enabled=False,
                            time_stop_enabled=False, time_stop_minutes=10.0, time_stop_mfe_pt=4.0,
                            return_trades=False):
@@ -123,6 +133,112 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
             intraday_atr_map[dkey] = float(vr) if pd.notna(vr) and vr > 0 else 2.0
             prev_range_map[dkey] = float(daily['range'].iloc[i - 1])
             prev_close_map[dkey] = float(daily['close'].iloc[i - 1])
+
+    # ------------------------------------------------------------------
+    # [2026-08-14] 진입 기준점 축 검증용 사전계산 (측정 전용, 기본값에선 전부 None).
+    # 미래참조 방지 원칙: 봉 i에서 쓸 수 있는 값은 (a) 봉 i의 '시가'와
+    # (b) 봉 i-1까지의 완결봉 정보뿐이다. 봉 i의 고가/저가/종가는 절대 안 쓴다.
+    # 값을 아직 알 수 없는 봉은 NaN으로 두고, 그 봉에서는 진입 자체를 막는다.
+    # ------------------------------------------------------------------
+    _hm_arr = (df.index.hour * 100 + df.index.minute).values.astype(int)
+    _newday = np.empty(n, dtype=bool)
+    _newday[0] = True
+    if n > 1:
+        _newday[1:] = day_keys[1:] != day_keys[:-1]
+    _daystart = np.maximum.accumulate(np.where(_newday, np.arange(n), 0))
+
+    _anchor_arr = None
+    _NEW_ANCHORS = ('open900', 'preopen_vwap', 'preopen_mid')
+    if entry_anchor in _NEW_ANCHORS or entry_refresh != 'session':
+        _anchor_arr = np.full(n, np.nan)
+        _dayopen_v = opens[_daystart]
+        if entry_refresh == 'session':
+            # 세션 1회 고정 앵커인데 값이 09:00 이후에야 확정되는 경우들
+            if entry_anchor == 'open900':
+                _a = np.full(n, np.nan)
+                for s in np.flatnonzero(_newday):
+                    e = n if s == _daystart[-1] else int(np.flatnonzero(_daystart > s)[0])
+                    m = np.flatnonzero(_hm_arr[s:e] == 900)
+                    if len(m):
+                        j = s + int(m[0])
+                        _a[j:e] = opens[j]
+                _anchor_arr = _a
+            else:   # preopen_vwap / preopen_mid — 08:45~08:55 구간에서 산출, 09:00부터 사용
+                _vol = df['volume'].values.astype(float) if 'volume' in df.columns else np.ones(n)
+                _a = np.full(n, np.nan)
+                for s in np.flatnonzero(_newday):
+                    e = n if s == _daystart[-1] else int(np.flatnonzero(_daystart > s)[0])
+                    pre = np.flatnonzero(_hm_arr[s:e] < 900) + s
+                    reg = np.flatnonzero(_hm_arr[s:e] >= 900) + s
+                    if len(pre) == 0 or len(reg) == 0:
+                        continue
+                    j = int(reg[0])
+                    if entry_anchor == 'preopen_vwap':
+                        vv = _vol[pre].sum()
+                        val = float((closes[pre] * _vol[pre]).sum() / vv) if vv > 0 else float(closes[pre].mean())
+                    else:
+                        val = float((highs[pre].max() + lows[pre].min()) / 2.0)
+                    _a[j:e] = val
+                _anchor_arr = _a
+        elif entry_refresh in ('bar', 'until_fill'):
+            if entry_refresh_anchor == 'prev_open_bar':
+                _a = np.concatenate([[np.nan], opens[:-1]])
+            elif entry_refresh_anchor == 'rolling_mid':
+                M = int(entry_refresh_lookback)
+                _a = np.full(n, np.nan)
+                for i2 in range(n):
+                    s = _daystart[i2]
+                    if i2 - s < M:
+                        continue
+                    _a[i2] = (highs[i2 - M:i2].max() + lows[i2 - M:i2].min()) / 2.0
+            elif entry_refresh_anchor == 'LEAK_same_bar_close':
+                # [진단 전용] 당봉 종가를 앵커로 쓴다 = 명백한 미래참조.
+                # 하네스가 앵커를 실제로 갈아끼우는지 확인하는 양성 대조군이며,
+                # 판정에는 절대 쓰지 않는다.
+                _a = closes.copy()
+            elif entry_refresh_anchor == 'LEAK_mirror_future':
+                # [진단 전용] 3봉 뒤 종가를 거울반사한 앵커. 미래에 오르면 앵커가 내려가
+                # 롱 타점이 쉽게 맞는다 = '이익이 나는 방향'의 미래참조. 양성 대조군.
+                _f = np.concatenate([closes[3:], np.repeat(closes[-1], 3)])
+                _a = 2.0 * closes - _f
+            else:                                    # prev_close_bar (기본)
+                _a = np.concatenate([[np.nan], closes[:-1]])
+            if entry_refresh_anchor != 'rolling_mid':
+                _a[_newday] = np.nan                 # 일 경계 넘어 참조 금지
+            _a = np.where(np.isnan(_a), _dayopen_v, _a)   # 확정 전에는 당일 시가(=현행)
+            _anchor_arr = _a
+        elif entry_refresh == 'session_times':
+            _times = tuple(int(x) for x in entry_refresh_times)
+            _a = _dayopen_v.astype(float).copy()
+            for s in np.flatnonzero(_newday):
+                e = n if s == _daystart[-1] else int(np.flatnonzero(_daystart > s)[0])
+                for tt in _times:
+                    m = np.flatnonzero(_hm_arr[s:e] == tt)
+                    if len(m):
+                        j = s + int(m[0])
+                        _a[j:e] = opens[j]
+            _anchor_arr = _a
+
+    _width_arr = None
+    if entry_width_basis.startswith('range_avg'):
+        Nd = int(entry_width_basis.replace('range_avg', ''))
+        _rm = daily['range'].rolling(Nd).mean().shift(1)      # 전일까지만
+        _wmap = {d: (float(v) if pd.notna(v) else 0.0) for d, v in zip(day_list, _rm.tolist())}
+        _width_arr = np.array([_wmap.get(d, 0.0) for d in day_keys], dtype=float)
+    elif entry_width_basis.startswith('realized'):
+        mins = int(entry_width_basis.replace('realized', ''))
+        _width_arr = np.full(n, np.nan)
+        for s in np.flatnonzero(_newday):
+            e = n if s == _daystart[-1] else int(np.flatnonzero(_daystart > s)[0])
+            t0 = _hm_arr[s]
+            cut = (t0 // 100) * 60 + (t0 % 100) + mins
+            hh, mm = cut // 60, cut % 60
+            cut_hm = hh * 100 + mm
+            k = np.flatnonzero(_hm_arr[s:e] >= cut_hm)
+            if len(k) == 0:
+                continue
+            j = s + int(k[0])                                 # j봉 시작 시점엔 [s, j) 가 완결
+            _width_arr[j:e] = highs[s:j].max() - lows[s:j].min()
 
     bucket60 = (df.index.astype('datetime64[ns]').astype(np.int64) // 10**9 // (trend_bar_minutes * 60))
 
@@ -195,6 +311,8 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
     day_high, day_low, cur_day = -np.inf, np.inf, None
     last_long_exit, last_short_exit = 0.0, 0.0
     target_long, target_short = np.inf, -np.inf
+    _uf_frozen = None          # [2026-08-14] entry_refresh='until_fill' 전용 상태
+    continue_targets = True
     std_error, trend, atr14, prev_range = 0.5, "NEUTRAL", 2.0, 0.0
     prev_close_px = 0.0
     consec_losses = 0
@@ -234,6 +352,7 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
             consec_losses = 0
             daily_loss_pt = 0.0          # 당일 누적 손실(pt, 양수=손실)
             last_long_exit, last_short_exit = 0.0, 0.0
+            _uf_frozen = None            # [2026-08-14] 일 경계에서 해제
         else:
             day_high = max(day_high, highs[i])
             day_low = min(day_low, lows[i])
@@ -276,10 +395,34 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                     _w = std_error
                 else:
                     _w = prev_range
+                # [2026-08-14] 축 검증용 앵커/폭 덮어쓰기. 기본값에선 두 배열 모두 None이라
+                # 이 블록은 통째로 건너뛴다.
+                _blocked = False
+                if _width_arr is not None:
+                    _wv = _width_arr[i]
+                    if not np.isfinite(_wv) or _wv <= 0:
+                        _blocked = True
+                    else:
+                        _w = float(_wv)
+                if _anchor_arr is not None and not _blocked:
+                    if entry_refresh == 'until_fill' and _uf_frozen is not None:
+                        _anchor = _uf_frozen          # 첫 체결 후 그날 고정
+                    else:
+                        _av = _anchor_arr[i]
+                        if not np.isfinite(_av):
+                            _blocked = True
+                        else:
+                            _anchor = float(_av)
+                if _blocked:
+                    target_long, target_short = np.inf, -np.inf
+                    continue_targets = False
+                else:
+                    continue_targets = True
                 # 실거래(era_order_manager.py:4065)가 SAR에 실제로 쓰던 타점.
                 # 시초가에서 전일 Range의 K배만큼 떨어진 고정 가격이라, 칼만 밴드와 달리
                 # 장중에 움직이지 않는다. std_error는 필터용으로만 계속 계산한다.
-                target_long, target_short = I.breakout_targets(_anchor, _w, breakout_k)
+                if continue_targets:
+                    target_long, target_short = I.breakout_targets(_anchor, _w, breakout_k)
             else:
                 target_long, target_short = I.kalman_band_targets(kf_price, std_error, mult)
 
@@ -528,6 +671,8 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                 _lvl = max(c_open, target_long) if realistic_gap_fill else target_long
                 _dir = -1 if reverse_entry else 1
                 fill = _lvl + SLIP_ENTRY * _dir      # 사면 비싸게, 팔면 싸게
+                if entry_refresh == 'until_fill' and _uf_frozen is None:
+                    _uf_frozen = _anchor      # [2026-08-14] 첫 체결 시점 앵커로 고정
                 pos, entry_price, peak_price = _dir, fill, fill
                 trough_price, entry_idx = fill, i   # [2026-08-14] MFE/MAE 계측 전용
                 entry_std_error = std_error   # [2026-08-14] 동적 캡용 진입 스냅샷
@@ -563,6 +708,8 @@ def run_sar_or_bb_replica(df, strategy, Q=0.00005, R=1.0, mult=0.6, atr_cutoff=0
                 _lvl = min(c_open, target_short) if realistic_gap_fill else target_short
                 _dir = 1 if reverse_entry else -1
                 fill = _lvl + SLIP_ENTRY * _dir
+                if entry_refresh == 'until_fill' and _uf_frozen is None:
+                    _uf_frozen = _anchor      # [2026-08-14] 첫 체결 시점 앵커로 고정
                 pos, entry_price, peak_price = _dir, fill, fill
                 trough_price, entry_idx = fill, i   # [2026-08-14] MFE/MAE 계측 전용
                 entry_std_error = std_error   # [2026-08-14] 동적 캡용 진입 스냅샷
