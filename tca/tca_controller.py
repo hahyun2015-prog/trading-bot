@@ -11,7 +11,33 @@ import subprocess
 import os
 import sys
 import json
+import re
 from datetime import datetime
+
+# requests가 던지는 예외 메시지에는 요청 URL이 통째로 들어간다. 텔레그램 API URL은
+# 경로에 봇 토큰을 담고 있어서, 전송 실패를 그대로 print하면 토큰이 로그에 평문으로
+# 남는다. notifier.py 는 2026-08-10 동일 사고 뒤 마스킹을 넣었으나 TCA 에는 마스킹
+# 함수 자체가 없었다(2026-08-18 확인). 로직은 notifier.py 와 동일하게 맞춘다.
+_BOT_URL_RE = re.compile(r"(/bot)(\d+:)?[A-Za-z0-9_\-]{20,}")
+_MASK_TOKENS = set()          # 인스턴스가 자기 봇 토큰을 여기에 등록한다
+
+
+def _mask_secrets(msg):
+    """예외·로그 문자열에서 봇 토큰을 가린다. 어떤 봇인지는 남겨 추적은 가능하게 둔다."""
+    try:
+        text = str(msg)
+        text = _BOT_URL_RE.sub(lambda m: f"{m.group(1)}{m.group(2) or ''}<masked>", text)
+        for token in _MASK_TOKENS:
+            if not token:
+                continue
+            text = text.replace(token, "<masked>")
+            # 봇ID:시크릿 형태에서 시크릿만 별도로 노출되는 경우까지 덮는다
+            if ":" in token:
+                text = text.replace(token.split(":", 1)[1], "<masked>")
+        return text
+    except Exception:
+        # 마스킹이 실패하면 원문 대신 안전한 자리표시자를 준다(토큰 유출 방지 우선).
+        return "<로그 마스킹 실패 — 원문 생략>"
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 log_file = os.path.join(current_dir, "tca_controller.log")
@@ -93,6 +119,7 @@ class TCAController:
 
         self.load_config()
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
+        _MASK_TOKENS.add(self.bot_token)   # 예외 로그 마스킹 등록
         self.scheduler_state_path = os.path.join(workspace_root, "tca", "scheduler_state.json")
         self._bqa_check_timer = 0     # BQA 검사 주기 조절용
 
@@ -295,7 +322,7 @@ class TCAController:
             try:
                 requests.post(url, json=payload, timeout=5)
             except Exception as e:
-                print(f"[TCA Send Message Error] {e}")
+                print(f"[TCA Send Message Error] {_mask_secrets(e)}")
 
     def _set_system_stopped(self, stopped):
         """워치독 정지 플래그를 켜고 끈다.
@@ -1033,17 +1060,14 @@ class TCAController:
                 self.send_message(f"❌ 재연동 시퀀스 처리 중 오류: {e}")
         elif cmd_text == "!컴퓨터재부팅":
             self.send_message("🚨 <b>[원격 재부팅 명령 수신]</b>\n\n5초 후 Windows 시스템을 강제로 재부팅합니다. 재부팅 완료 후 자동 로그인 설정을 통해 시스템이 순차적으로 자동 재기동됩니다." + self._open_positions_warning())
-            import time
             time.sleep(2)
             os.system("shutdown /r /t 5 /f")
         elif cmd_text == "!컴퓨터종료":
             self.send_message("🔌 <b>[원격 일반 종료 명령 수신]</b>\n\n윈도우 시작 메뉴의 시스템 종료와 동일한 방식으로 컴퓨터를 안전하게 종료합니다. (저장되지 않은 파일이 있으면 대기하거나 취소될 수 있습니다.)" + self._open_positions_warning())
-            import time
             time.sleep(2)
             os.system("shutdown /s /t 5")
         elif cmd_text == "!컴퓨터강제종료":
             self.send_message("🚨 <b>[원격 강제 종료 명령 수신]</b>\n\n열려 있는 모든 프로그램을 강제로 닫고 즉시 컴퓨터를 종료합니다." + self._open_positions_warning())
-            import time
             time.sleep(2)
             os.system("shutdown /s /t 5 /f")
             
@@ -1109,7 +1133,6 @@ class TCAController:
         elif cmd_text in ["!선물매수", "!선물매도", "!선물청산"]:
             try:
                 import sqlite3
-                from datetime import datetime
                 db_path = os.path.join(self.workspace_root, "futures_data.db")
                 conn = sqlite3.connect(db_path, timeout=30)
                 conn.execute("PRAGMA journal_mode=WAL;")
@@ -1187,16 +1210,34 @@ class TCAController:
             for path in [self.smb_path, self.gdrive_path]:
                 if path and path not in flag_targets and os.path.exists(path):
                     flag_targets.append(path)
+            flag_ok = []
+            flag_fail = []
             for target in flag_targets:
                 try:
                     flag_path = os.path.join(target, "emergency_kill.flag")
                     with open(flag_path, "w") as f:
                         f.write(datetime.now().isoformat())
                     print(f"[TCA] 긴급정지 플래그 생성: {flag_path}")
+                    flag_ok.append(target)
                 except Exception as e:
                     print(f"[TCA] 플래그 생성 실패 ({target}): {e}")
+                    flag_fail.append(target)
 
-            self.send_message("✅ 긴급정지 플래그가 전송되었습니다.\nERA가 1초 이내에 자동 감지하여 전량 청산 후 종료합니다.")
+            # (2026-08-18) 종전에는 권한·네트워크 문제로 단 한 곳도 쓰지 못했을 때조차
+            # "전송되었습니다"를 무조건 보냈다. 긴급정지가 실패한 상황에서 성공 통지가
+            # 나가는 것이 가장 위험한 오보라, 실제 성공 개수로 문구를 나눈다.
+            if flag_ok:
+                _kill_msg = (f"✅ 긴급정지 플래그 생성 {len(flag_ok)}/{len(flag_targets)}곳 성공.\n"
+                             f"ERA가 1초 이내에 자동 감지하여 전량 청산 후 종료합니다.")
+                if flag_fail:
+                    _kill_msg += (f"\n⚠️ {len(flag_fail)}곳 실패 — 원격 ERA에는 전달되지 "
+                                  f"않았을 수 있습니다. 해당 PC를 직접 확인하세요.")
+            else:
+                _kill_msg = (f"🚨 <b>긴급정지 플래그 생성에 전부 실패했습니다 "
+                             f"({len(flag_targets)}곳 모두).</b>\n"
+                             f"ERA가 플래그를 감지할 수 없습니다. 영웅문4에서 즉시 수동 청산하거나 "
+                             f"<code>!전량매도</code>를 시도하세요.")
+            self.send_message(_kill_msg)
 
             # ERA 플래그 감지 후 10초 내 자체 종료 → 비동기 PID 정리 (루프 블로킹 방지)
             import threading
@@ -1917,7 +1958,7 @@ class TCAController:
                         print(f"[TCA 경고] 409 Conflict 감지 - 다른 봇 인스턴스와 충돌. 3초 후 재시도...")
                         time.sleep(3)
                 except Exception as ex:
-                    print(f"[TCA] 백로그 청소 실패: {ex}")
+                    print(f"[TCA] 백로그 청소 실패: {_mask_secrets(ex)}")
                 first_run = False
                 continue
 
@@ -1982,12 +2023,12 @@ class TCAController:
                                 offset = max(r["update_id"] for r in rdata["result"]) + 1
                                 print(f"[TCA] 409 복구 완료. New Offset: {offset}")
                         except Exception as ex:
-                            print(f"[TCA] 409 복구 중 백로그 청소 실패: {ex}")
+                            print(f"[TCA] 409 복구 중 백로그 청소 실패: {_mask_secrets(ex)}")
                     else:
                         time.sleep(10)
                             
             except Exception as e:
-                print(f"Exception: {e}")
+                print(f"Exception: {_mask_secrets(e)}")
                 fail_count += 1
                 if fail_count >= 5:
                     print(f"[TCA] 5회 연속 통신 실패. HTTP 세션을 재생성합니다...")

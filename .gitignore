@@ -64,3 +64,11 @@ kis/*.pid
 kis/*.mst
 kis/*.mst.zip
 kis/__pycache__/
+
+# (2026-08-18) 어느 경로에 있든 설정 사본을 제외한다.
+# 리플레이 하네스가 scratch/**/config/config.json 으로 실제 토큰이 든 사본을
+# 만들어 두는데, 위의 경로 고정 패턴(config/config.json)에는 걸리지 않아
+# git add . 한 번이면 토큰이 원격으로 올라간다(2026-08-18 3개 발견).
+**/config.json
+**/config_local.json
+!config/config.example.json
